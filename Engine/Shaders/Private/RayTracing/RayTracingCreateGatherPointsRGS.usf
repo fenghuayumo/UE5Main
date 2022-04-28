@@ -52,6 +52,7 @@ RWStructuredBuffer<FGatherPoints> RWGatherPointsBuffer;
 // Material buffer and tile size are used for sorted materials.
 RWStructuredBuffer<FDeferredMaterialPayload> MaterialBuffer;
 
+RWTexture2D<float4> RWGlobalIlluminationUAV;
 uint DispatchThreadIdToLinearIndex(uint2 DispatchThreadId)
 {
 	return DispatchThreadId.y * GatherPointsResolution.x + DispatchThreadId.x;
@@ -127,6 +128,14 @@ bool ShouldTraceRay(uint2 DispatchThreadId, FGBufferData GBufferData)
 	return bTraceRay;
 }
 
+void ReconstructWorldPosition(float2 UV, float SceneDepth, out float3 OutWorldPosition, out float3 OutCameraDirection)
+{
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * SceneDepth, SceneDepth, 1), LWCHackToFloat(PrimaryView.ScreenToWorld));
+	OutWorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+	OutCameraDirection = normalize(OutWorldPosition - LWCHackToFloat(PrimaryView.WorldCameraOrigin));
+}
+
 RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsTraceRGS)
 {
 	uint2 DispatchThreadId = DispatchRaysIndex().xy + uint2(View.ViewRectMin.xy) + uint2(RenderTileOffsetX, RenderTileOffsetY);
@@ -163,6 +172,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsTraceRGS)
 	float3 TranslatedWorldPosition;
 	float3 CameraDirection;
 	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+	
+	// float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+	// TranslatedWorldPosition = ReconstructWorldPositionFromDepth(UV, SceneDepth);
+	// CameraDirection = normalize(TranslatedWorldPosition - LWCHackToFloat(PrimaryView.WorldCameraOrigin));
 	float3 WorldNormal = GBufferData.WorldNormal;
 
 	// Determine blue-noise coordinate, based on the local neighborhood
@@ -272,6 +285,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 	float3 TranslatedWorldPosition;
 	float3 CameraDirection;
 	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+	// float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+	// TranslatedWorldPosition = ReconstructWorldPositionFromDepth(UV, SceneDepth);
+	// CameraDirection = normalize(TranslatedWorldPosition - LWCHackToFloat(PrimaryView.WorldCameraOrigin));
+
 	float3 WorldNormal = GBufferData.WorldNormal;
 
 	// Determine blue-noise coordinate, based on the local neighborhood
@@ -441,8 +458,8 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 						}
 
 						// Record the contribution
-						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * SplitFactor;
-						Irradiance += select(isfinite(ExitantRadianceSample), ExitantRadianceSample, 0.0);
+						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * SplitFactor ;
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
 					}
 				}
 			}
@@ -455,5 +472,6 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 		GatherSample.Pdf = RayPdf;
 
 		WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+		RWGlobalIlluminationUAV[DispatchThreadId] = float4(Irradiance, 1);
 	}
 }

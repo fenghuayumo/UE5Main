@@ -1,5 +1,3 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
-
 #define USE_IES_TERM 0 // this shader doesn't bind the IES atlas, so disable the IES term from path tracer lights
 
 #include "../Common.ush"
@@ -39,7 +37,7 @@ uint RenderTileOffsetX;
 uint RenderTileOffsetY;
 
 void GenerateCosineNormalRay(
-	float3 TranslatedWorldPosition,
+	float3 WorldPosition,
 	float3 WorldNormal,
 	float2 RandSample,
 	out float3 RayOrigin,
@@ -53,12 +51,70 @@ void GenerateCosineNormalRay(
 	float4 Direction_Tangent = CosineSampleHemisphere(RandSample);
 	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
 
-	RayOrigin = TranslatedWorldPosition;
+	RayOrigin = WorldPosition;
 	RayDirection = Direction_World;
 	RayTMin = 0.01;
 	RayTMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
 	RayPdf = Direction_Tangent.w;
 }
+
+void ReconstructWorldPositionFromDeviceZ(uint2 PixelCoord, float DeviceZ, out float3 OutWorldPosition, out float3 OutCameraDirection)
+{
+	// float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	// TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	// // float3 WorldCameraOrigin = LWCHackToFloat(PrimaryView.WorldCameraOrigin);
+	// // OutWorldPosition = TranslatedWorldPosition.xyz + WorldCameraOrigin;
+	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
+	// float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	// float Depth = ConvertFromDeviceZ(DeviceZ);
+	// float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), LWCHackToFloat(PrimaryView.ScreenToWorld));
+	// OutWorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+
+	// OutCameraDirection = normalize(TranslatedWorldPosition.xyz - View.TranslatedWorldCameraOrigin);
+
+	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+
+	RayDesc Ray;
+	float4 NearPoint = mul(float4(ScreenPosition, 1, 1), View.ClipToTranslatedWorld);
+	float4 FarPoint  = mul(float4(ScreenPosition, 0, 1), View.ClipToTranslatedWorld);
+	OutWorldPosition = NearPoint.xyz * rcp(NearPoint.w);
+	OutCameraDirection = normalize(FarPoint.w * NearPoint.xyz - NearPoint.w * FarPoint.xyz);
+
+}
+
+
+// float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
+// {
+// 	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+// 	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), LWCHackToFloat(PrimaryView.ScreenToWorld));
+// 	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
+
+// 	return WorldPosition;
+// }
+// float3 TraceTransparentVisibilityRay(RayDesc Ray, uint2 PixelCoord, float PathRoughness, inout RandomSequence RandSequence)
+// {
+// 	const uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+// 	const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW;
+// 	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_SHADOW;
+// 	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+// 	const uint MissShaderIndex = 0;
+
+// 	FPackedPathTracingPayload PackedPayload = InitPathTracingVisibilityPayload(PixelCoord, PathRoughness);
+
+// 	// Trace the ray
+// 	TraceRay(
+// 		TLAS,
+// 		RayFlags,
+// 		InstanceInclusionMask,
+// 		RayContributionToHitGroupIndex,
+// 		MultiplierForGeometryContributionToShaderIndex,
+// 		MissShaderIndex,
+// 		Ray,
+// 		PackedPayload);
+
+// 	return (PackedPayload.IsMiss());
+// }
 
 RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 {
@@ -87,9 +143,9 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 		GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
 	}
 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
-	float3 TranslatedWorldPosition;
+	float3 WorldPosition;
 	float3 CameraDirection;
-	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
 	float3 WorldNormal = GBufferData.WorldNormal;
 	uint ShadingModelID = GBufferData.ShadingModelID;
 	if (ShadingModelID == SHADINGMODELID_UNLIT)
@@ -129,8 +185,7 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 		// Initialize ray
 		RayDesc Ray;
 		float RayPdf = 1.0;
-#if 1
-		GenerateCosineNormalRay(TranslatedWorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		GenerateCosineNormalRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
 		half3 N = WorldNormal;
 		half3 V = -CameraDirection;
 		half3 L = Ray.Direction;
@@ -138,15 +193,6 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
 		FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
 		RayThroughput *= LightingSample.Diffuse / DiffuseColor;
-#else
-		float2 RandSample = RandomSequence_GenerateSample2D(RandSequence);
-		float2 ViewportUV = (PixelCoord.xy + RandSample.xy) * View.BufferSizeAndInvSize.zw;
-		Ray.Origin = ReconstructTranslatedWorldPositionFromDepth(ViewportUV, 0.0f);
-		Ray.Direction = normalize(ReconstructTranslatedWorldPositionFromDepth(ViewportUV, 1.f) - Ray.Origin);
-		Ray.TMin = 0.0;
-		Ray.TMax = 1.0e12;
-		float3 RayThroughput = 1.0;
-#endif
 		Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
 		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
 		
@@ -203,7 +249,7 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 
 			// Update intersection
 			Ray.Origin += Ray.Direction * Payload.HitT;
-
+			// Ray.Origin = Payload.TranslatedWorldPos;
 			// Create faux GBuffer to use with EvaluateBxDF
 			FGBufferData GBufferData = (FGBufferData)0;
 			GBufferData.Depth = 1.f; // Do not use depth
@@ -256,7 +302,7 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 
 					// Trace visibility ray
 					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
-					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;//RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW;
 
 #if !ENABLE_TWO_SIDED_GEOMETRY
 					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
@@ -275,11 +321,7 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 						// Evaluate material
 						float3 MaterialThroughput;
 						float MaterialEvalPdf = 0.0;
-#if USE_PATHTRACING_MATERIALS
-						float3 MaterialWeight = 0;
-						EvalMaterial(Ray.Direction, LightRay.Direction, Payload, MaterialWeight, MaterialEvalPdf);
-						MaterialThroughput = MaterialWeight * MaterialEvalPdf;
-#else
+
 						half3 N = Payload.WorldNormal;
 						half3 V = -Ray.Direction;
 						half3 L = LightRay.Direction;
@@ -292,8 +334,6 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 							MaterialThroughput += LightingSample.Transmission;
 						}
 						MaterialEvalPdf = 1.0;
-#endif
-
 						// Record the contribution
 						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * RayThroughput * SplitFactor / RayPdf;
 
@@ -303,7 +343,7 @@ RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 							ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
 						}
 
-						Irradiance += select(isfinite(ExitantRadianceSample), ExitantRadianceSample, 0.0);
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
 					}
 				}
 			}

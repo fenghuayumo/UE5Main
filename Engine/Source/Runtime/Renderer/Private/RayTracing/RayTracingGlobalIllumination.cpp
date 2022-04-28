@@ -32,7 +32,9 @@ static TAutoConsoleVariable<int32> CVarRayTracingGlobalIllumination(
 	TEXT("-1: Value driven by postprocess volume (default) \n")
 	TEXT(" 0: ray tracing global illumination off \n")
 	TEXT(" 1: ray tracing global illumination enabled (brute force) \n")
-	TEXT(" 2: ray tracing global illumination enabled (final gather)"),
+	TEXT(" 2: ray tracing global illumination enabled (final gather)")
+	TEXT(" 3: ray tracing restir global illumination off \n")
+	TEXT(" 4: ray tracing fusionGI\n"),
 	ECVF_RenderThreadSafe | ECVF_Scalability
 );
 
@@ -44,28 +46,28 @@ static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationSamplesPerPixel(
 	ECVF_RenderThreadSafe
 );
 
-static float GRayTracingGlobalIlluminationMaxRayDistance = 1.0e27;
+float GRayTracingGlobalIlluminationMaxRayDistance = 1.0e27;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationMaxRayDistance(
 	TEXT("r.RayTracing.GlobalIllumination.MaxRayDistance"),
 	GRayTracingGlobalIlluminationMaxRayDistance,
 	TEXT("Max ray distance (default = 1.0e27)")
 );
 
-static float GRayTracingGlobalIlluminationMaxShadowDistance = -1.0;
+float GRayTracingGlobalIlluminationMaxShadowDistance = -1.0;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationMaxShadowDistance(
 	TEXT("r.RayTracing.GlobalIllumination.MaxShadowDistance"),
 	GRayTracingGlobalIlluminationMaxShadowDistance,
 	TEXT("Max shadow distance (default = -1.0, distance adjusted automatically so shadow rays do not hit the sky sphere) ")
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationMaxBounces(
+TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationMaxBounces(
 	TEXT("r.RayTracing.GlobalIllumination.MaxBounces"),
 	-1,
 	TEXT("Max bounces (default = -1 (driven by postprocesing volume))"),
 	ECVF_RenderThreadSafe
 );
 
-static int32 GRayTracingGlobalIlluminationNextEventEstimationSamples = 2;
+int32 GRayTracingGlobalIlluminationNextEventEstimationSamples = 2;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationNextEventEstimationSamples(
 	TEXT("r.RayTracing.GlobalIllumination.NextEventEstimationSamples"),
 	GRayTracingGlobalIlluminationNextEventEstimationSamples,
@@ -73,7 +75,7 @@ static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationNextEventEstimati
 	TEXT("NOTE: This parameter is experimental")
 );
 
-static float GRayTracingGlobalIlluminationDiffuseThreshold = 0.01;
+float GRayTracingGlobalIlluminationDiffuseThreshold = 0.01;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationDiffuseThreshold(
 	TEXT("r.RayTracing.GlobalIllumination.DiffuseThreshold"),
 	GRayTracingGlobalIlluminationDiffuseThreshold,
@@ -88,7 +90,7 @@ static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationDenoiser(
 	TEXT("Denoising options (default = 1)")
 );
 
-static int32 GRayTracingGlobalIlluminationEvalSkyLight = 0;
+int32 GRayTracingGlobalIlluminationEvalSkyLight = 0;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationEvalSkyLight(
 	TEXT("r.RayTracing.GlobalIllumination.EvalSkyLight"),
 	GRayTracingGlobalIlluminationEvalSkyLight,
@@ -96,7 +98,7 @@ static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationEvalSkyLight(
 	TEXT("NOTE: This parameter is experimental")
 );
 
-static int32 GRayTracingGlobalIlluminationUseRussianRoulette = 0;
+int32 GRayTracingGlobalIlluminationUseRussianRoulette = 0;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationUseRussianRoulette(
 	TEXT("r.RayTracing.GlobalIllumination.UseRussianRoulette"),
 	GRayTracingGlobalIlluminationUseRussianRoulette,
@@ -111,14 +113,14 @@ static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationScreenPercentage(
 	TEXT("Screen percentage for ray tracing global illumination (default = 50)")
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationEnableTwoSidedGeometry(
+TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationEnableTwoSidedGeometry(
 	TEXT("r.RayTracing.GlobalIllumination.EnableTwoSidedGeometry"),
 	1,
 	TEXT("Enables two-sided geometry when tracing GI rays (default = 1)"),
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationEnableTransmission(
+TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationEnableTransmission(
 	TEXT("r.RayTracing.GlobalIllumination.EnableTransmission"),
 	1,
 	TEXT("Enables transmission when tracing GI rays (default = 1)"),
@@ -139,7 +141,7 @@ static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationMaxLightCount
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationFireflySuppression(
+TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationFireflySuppression(
 	TEXT("r.RayTracing.GlobalIllumination.FireflySuppression"),
 	0,
 	TEXT("Applies tonemap operator to suppress potential fireflies (default = 0). "),
@@ -245,7 +247,7 @@ DECLARE_GPU_STAT_NAMED(RayTracingGIBruteForce, TEXT("Ray Tracing GI: Brute Force
 DECLARE_GPU_STAT_NAMED(RayTracingGIFinalGather, TEXT("Ray Tracing GI: Final Gather"));
 DECLARE_GPU_STAT_NAMED(RayTracingGICreateGatherPoints, TEXT("Ray Tracing GI: Create Gather Points"));
 
-static void SetupLightParameters(
+void SetupLightParameters(
 	FScene* Scene,
 	const FViewInfo& View, FRDGBuilder& GraphBuilder,
 	FRDGBufferSRV** OutLightBuffer, uint32* OutLightCount, FPathTracingSkylight* SkylightParameters)
@@ -261,6 +263,7 @@ static void SetupLightParameters(
 	const bool bSkylightEnabled = SkyLight && SkyLight->bAffectGlobalIllumination && CVarRayTracingGlobalIlluminationSkyLight.GetValueOnRenderThread() != 0;
 
 	// Prepend SkyLight to light buffer (if it is active)
+	const float Inf = std::numeric_limits<float>::infinity();
 	if (PrepareSkyTexture(GraphBuilder, Scene, View, bSkylightEnabled, bUseMISCompensation, SkylightParameters))
 	{
 		FPathTracingLight& DestLight = Lights[LightCount];
@@ -273,12 +276,66 @@ static void SetupLightParameters(
 
 		LightCount++;
 	}
+	
+	for (auto Light : Scene->Lights)
+	{
+		ELightComponentType LightComponentType = (ELightComponentType)Light.LightSceneInfo->Proxy->GetLightType();
 
+		if (LightComponentType != LightType_Directional)
+		{
+			continue;
+		}
+
+		FLightRenderParameters LightParameters;
+		Light.LightSceneInfo->Proxy->GetLightShaderParameters(LightParameters);
+
+		if (FVector3f(LightParameters.Color).IsZero())
+		{
+			continue;
+		}
+
+		FPathTracingLight& DestLight = Lights[LightCount++];
+		uint32 Transmission = Light.LightSceneInfo->Proxy->Transmission();
+		uint8 LightingChannelMask = Light.LightSceneInfo->Proxy->GetLightingChannelMask();
+
+		DestLight.Flags = Transmission ? PATHTRACER_FLAG_TRANSMISSION_MASK : 0;
+		DestLight.Flags |= LightingChannelMask & PATHTRACER_FLAG_LIGHTING_CHANNEL_MASK;
+		DestLight.Flags |= Light.LightSceneInfo->Proxy->CastsDynamicShadow() ? PATHTRACER_FLAG_CAST_SHADOW_MASK : 0;
+		DestLight.Flags |= Light.LightSceneInfo->Proxy->CastsVolumetricShadow() ? PATHTRACER_FLAG_CAST_VOL_SHADOW_MASK : 0;
+		DestLight.IESTextureSlice = -1;
+		//DestLight.RectLightTextureIndex = -1;
+
+		// these mean roughly the same thing across all light types
+		DestLight.Color = FVector3f(LightParameters.Color);
+		DestLight.TranslatedWorldPosition = FVector3f(LightParameters.WorldPosition + View.ViewMatrices.GetPreViewTranslation());
+		DestLight.Normal = -LightParameters.Direction;
+		DestLight.dPdu = FVector3f::CrossProduct(LightParameters.Tangent, LightParameters.Direction);
+		DestLight.dPdv = LightParameters.Tangent;
+		DestLight.Attenuation = LightParameters.InvRadius;
+		DestLight.FalloffExponent = 0;
+
+		DestLight.VolumetricScatteringIntensity = Light.LightSceneInfo->Proxy->GetVolumetricScatteringIntensity();
+		DestLight.RectLightAtlasUVOffset = 0;
+		DestLight.RectLightAtlasUVScale = 0;
+
+		DestLight.Normal = LightParameters.Direction;
+		DestLight.Dimensions = FVector2f(LightParameters.SourceRadius, 0.0f);
+		DestLight.Flags |= PATHTRACING_LIGHT_DIRECTIONAL;
+
+		DestLight.TranslatedBoundMin = FVector(-Inf, -Inf, -Inf);
+		DestLight.TranslatedBoundMax = FVector(Inf, Inf, Inf);
+	}
+
+	uint32 InfiniteLights = LightCount;
 	
 	const uint32 MaxLightCount = FMath::Min(CVarRayTracingGlobalIlluminationMaxLightCount.GetValueOnRenderThread(), RAY_TRACING_LIGHT_COUNT_MAXIMUM);
 	for (auto Light : Scene->Lights)
 	{
 		if (LightCount >= MaxLightCount) break;
+		
+		ELightComponentType LightComponentType = (ELightComponentType)Light.LightSceneInfo->Proxy->GetLightType();
+		if ((LightComponentType == LightType_Directional) /* already handled by the loop above */)
+			continue;
 
 		if (Light.LightSceneInfo->Proxy->HasStaticLighting() && Light.LightSceneInfo->IsPrecomputedLightingValid()) continue;
 		if (!Light.LightSceneInfo->Proxy->AffectGlobalIllumination()) continue;
@@ -298,18 +355,8 @@ static void SetupLightParameters(
 		DestLight.Attenuation = LightShaderParameters.InvRadius;
 		DestLight.IESTextureSlice = -1; // not used by this path at the moment
 
-		ELightComponentType LightComponentType = (ELightComponentType)Light.LightSceneInfo->Proxy->GetLightType();
 		switch (LightComponentType)
 		{
-		case LightType_Directional:
-		{
-			if (CVarRayTracingGlobalIlluminationDirectionalLight.GetValueOnRenderThread() == 0) continue;
-
-			DestLight.Normal = LightShaderParameters.Direction;
-			DestLight.Color = FVector3f(LightShaderParameters.Color);
-			DestLight.Flags |= PATHTRACING_LIGHT_DIRECTIONAL;
-			break;
-		}
 		case LightType_Rect:
 		{
 			if (CVarRayTracingGlobalIlluminationRectLight.GetValueOnRenderThread() == 0) continue;
@@ -395,7 +442,7 @@ bool ShouldRenderRayTracingGlobalIllumination(const FViewInfo& View)
 		? CVarRayTracingGlobalIlluminationValue > 0
 		: View.FinalPostProcessSettings.RayTracingGIType > ERayTracingGlobalIlluminationType::Disabled;
 
-	return ShouldRenderRayTracingEffect(bEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline, &View);
+	return ShouldRenderRayTracingEffect(bEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline);
 }
 
 bool IsFinalGatherEnabled(const FViewInfo& View)
@@ -530,6 +577,7 @@ class FRayTracingGlobalIlluminationCreateGatherPointsRGS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GatherPoints>, RWGatherPointsBuffer)
 		// Optional indirection buffer used for sorted materials
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FDeferredMaterialPayload>, MaterialBuffer)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWGlobalIlluminationUAV)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -751,6 +799,28 @@ void FDeferredShadingSceneRenderer::PrepareRayTracingGlobalIlluminationDeferredM
 
 #endif // RHI_RAYTRACING
 
+//bool IsRestirGIEnabled(const FViewInfo& View)
+//{
+//	int32 CVarRayTracingGlobalIlluminationValue = CVarRayTracingGlobalIllumination.GetValueOnRenderThread();
+//	if (CVarRayTracingGlobalIlluminationValue >= 0)
+//	{
+//		return CVarRayTracingGlobalIlluminationValue == 3;
+//	}
+//
+//	return View.FinalPostProcessSettings.RayTracingGIType == ERayTracingGlobalIlluminationType::RestirGI;
+//}
+//
+//bool IsFusionGIEnabled(const FViewInfo& View)
+//{
+//	int32 CVarRayTracingGlobalIlluminationValue = CVarRayTracingGlobalIllumination.GetValueOnRenderThread();
+//	if (CVarRayTracingGlobalIlluminationValue >= 0)
+//	{
+//		return CVarRayTracingGlobalIlluminationValue == 4;
+//	}
+//
+//	return View.FinalPostProcessSettings.RayTracingGIType == ERayTracingGlobalIlluminationType::FusionGI;
+//}
+
 bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 	FRDGBuilder& GraphBuilder, 
 	FSceneTextureParameters& SceneTextures,
@@ -793,6 +863,14 @@ bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 	{
 		RenderRayTracingGlobalIlluminationFinalGather(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
 	}
+	//else if (IsRestirGIEnabled(View))
+	//{
+	//	RenderRestirGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
+	//}
+	//else if (IsFusionGIEnabled(View))
+	//{
+	//	FusionGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
+	//}
 	else
 	{
 		RenderRayTracingGlobalIlluminationBruteForce(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
@@ -945,6 +1023,17 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 	SetupLightParameters(Scene, View, GraphBuilder, &PassParameters->SceneLights, &PassParameters->SceneLightCount, &PassParameters->SkylightParameters);
 	PassParameters->SceneTextures = SceneTextures;
 
+	{
+		FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+			SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactor,
+			PF_FloatRGBA,
+			FClearValueBinding::None,
+			TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+
+		auto GatherTex = GraphBuilder.CreateTexture(Desc, TEXT("GatherDiffuseIndirect"));
+		PassParameters->RWGlobalIlluminationUAV = GraphBuilder.CreateUAV(GatherTex);
+	}
+	//
 	// Output
 	FIntPoint DispatchResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
 	FIntVector LocalGatherPointsResolution(DispatchResolution.X, DispatchResolution.Y, GatherSamples);
@@ -968,12 +1057,6 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 	if (!bSortMaterials)
 	{
 		FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters* GatherPassParameters = PassParameters;
-		//if (GatherPointIteration != 0)
-		if (false)
-		{
-			GatherPassParameters = GraphBuilder.AllocParameters<FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters>();
-			CopyGatherPassParameters(*PassParameters, GatherPassParameters);
-		}
 
 		FRayTracingGlobalIlluminationCreateGatherPointsRGS::FPermutationDomain PermutationVector;
 		PermutationVector.Set<FRayTracingGlobalIlluminationCreateGatherPointsRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingGlobalIlluminationEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
@@ -1039,7 +1122,7 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 				RHICmdList.RayTraceDispatch(Pipeline, RayGenerationShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, TileAlignedResolution.X, TileAlignedResolution.Y);
 			});
 		}
-
+		
 		// Sort by hit-shader ID
 		const uint32 SortSize = CVarRayTracingGlobalIlluminationFinalGatherSortSize.GetValueOnRenderThread();
 		SortDeferredMaterials(GraphBuilder, View, SortSize, DeferredMaterialBufferNumElements, DeferredMaterialBuffer);
@@ -1047,12 +1130,6 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 		// Shade pass
 		{
 			FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters* GatherPassParameters = PassParameters;
-			//if (GatherPointIteration != 0)
-			if (false)
-			{
-				GatherPassParameters = GraphBuilder.AllocParameters<FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters>();
-				CopyGatherPassParameters(*PassParameters, GatherPassParameters);
-			}
 
 			GatherPassParameters->MaterialBuffer = GraphBuilder.CreateUAV(DeferredMaterialBuffer);
 
