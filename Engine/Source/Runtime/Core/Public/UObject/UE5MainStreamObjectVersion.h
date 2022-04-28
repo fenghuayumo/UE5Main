@@ -1,0 +1,229 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "CoreTypes.h"
+#include "Misc/Guid.h"
+#include "UObject/DevObjectVersion.h"
+
+// Custom serialization version for changes made in //UE5/Main stream
+struct CORE_API FUE5MainStreamObjectVersion
+{
+	enum Type
+	{
+		// Before any version changes were made
+		BeforeCustomVersionWasAdded = 0,
+
+		// Nanite data added to Chaos geometry collections
+		GeometryCollectionNaniteData,
+
+		// Nanite Geometry Collection data moved to DDC
+		GeometryCollectionNaniteDDC,
+		
+		// Removing SourceAnimationData, animation layering is now applied during compression
+		RemovingSourceAnimationData,
+
+		// New MeshDescription format.
+		// This is the correct versioning for MeshDescription changes which were added to ReleaseObjectVersion.
+		MeshDescriptionNewFormat,
+
+		// Serialize GridGuid in PartitionActorDesc
+		PartitionActorDescSerializeGridGuid,
+
+		// Set PKG_ContainsMapData on external actor packages
+		ExternalActorsMapDataPackageFlag,
+
+		// Added a new configurable BlendProfileMode that the user can setup to control the behavior of blend profiles.
+		AnimationAddedBlendProfileModes,
+
+		// Serialize DataLayers in WorldPartitionActorDesc
+		WorldPartitionActorDescSerializeDataLayers,
+
+		// Renaming UAnimSequence::NumFrames to NumberOfKeys, as that what is actually contains.
+		RenamingAnimationNumFrames,
+
+		// Serialize HLODLayer in WorldPartition HLODActorDesc
+		WorldPartitionHLODActorDescSerializeHLODLayer,
+
+		// Fixed Nanite Geometry Collection cooked data
+		GeometryCollectionNaniteCooked,
+			
+		// Added bCooked to UFontFace assets
+		AddedCookedBoolFontFaceAssets,
+
+		// Serialize CellHash in WorldPartition HLODActorDesc
+		WorldPartitionHLODActorDescSerializeCellHash,
+
+		// Nanite data is now transient in Geometry Collection similar to how RenderData is transient in StaticMesh.
+		GeometryCollectionNaniteTransient,
+
+		// Added FLandscapeSplineActorDesc
+		AddedLandscapeSplineActorDesc,
+
+		// Added support for per-object collision constraint flag. [Chaos]
+		AddCollisionConstraintFlag,
+
+		// Initial Mantle Serialize Version
+		MantleDbSerialize,
+
+		// Animation sync groups explicitly specify sync method
+		AnimSyncGroupsExplicitSyncMethod,
+
+		// Fixup FLandscapeActorDesc Grid indices
+		FLandscapeActorDescFixupGridIndices,
+
+		// FoliageType with HLOD support
+		FoliageTypeIncludeInHLOD,
+
+		// Introducing UAnimDataModel sub-object for UAnimSequenceBase containing all animation source data
+		IntroducingAnimationDataModel,
+
+		// Serialize ActorLabel in WorldPartitionActorDesc
+		WorldPartitionActorDescSerializeActorLabel,
+
+		// Fix WorldPartitionActorDesc serialization archive not persistent
+		WorldPartitionActorDescSerializeArchivePersistent,
+
+		// Fix potentially duplicated actors when using ForceExternalActorLevelReference
+		FixForceExternalActorLevelReferenceDuplicates,
+
+		// Make UMeshDescriptionBase serializable
+		SerializeMeshDescriptionBase,
+
+		// Chaos FConvex uses array of FVec3s for vertices instead of particles
+		ConvexUsesVerticesArray,
+
+		// Serialize HLOD info in WorldPartitionActorDesc
+		WorldPartitionActorDescSerializeHLODInfo,
+
+		// Expose particle Disabled flag to the game thread
+		AddDisabledFlag,
+
+		// Moving animation custom attributes from AnimationSequence to UAnimDataModel
+		MoveCustomAttributesToDataModel,
+
+		// Use of triangulation at runtime in BlendSpace
+		BlendSpaceRuntimeTriangulation,
+
+		// Fix to the Cubic smoothing, plus introduction of new smoothing types
+		BlendSpaceSmoothingImprovements,
+
+		// Removing Tessellation parameters from Materials
+		RemovingTessellationParameters,
+
+		// Sparse class data serializes its associated structure to allow for BP types to be used
+		SparseClassDataStructSerialization,
+
+		// PackedLevelInstance bounds fix
+		PackedLevelInstanceBoundsFix,
+
+		// Initial set of anim nodes converted to use constants held in sparse class data
+		AnimNodeConstantDataRefactorPhase0,
+
+		// Explicitly serialized bSavedCachedExpressionData for Material(Instance)
+		MaterialSavedCachedData,
+
+		// Remove explicit decal blend mode
+		RemoveDecalBlendMode,
+
+		// Made directional lights be atmosphere lights by default
+		DirLightsAreAtmosphereLightsByDefault,
+
+		// Changed how world partition streaming cells are named
+		WorldPartitionStreamingCellsNamingShortened,
+
+		// Changed how actor descriptors compute their bounds
+		WorldPartitionActorDescGetStreamingBounds,
+
+		// Switch FMeshDescriptionBulkData to use virtualized bulkdata
+		MeshDescriptionVirtualization,
+		
+		// Switch FTextureSource to use virtualized bulkdata
+		TextureSourceVirtualization,
+
+		// RigVM to store more information alongside the Copy Operator
+		RigVMCopyOpStoreNumBytes,
+
+		// Expanded separate translucency into multiple passes
+		MaterialTranslucencyPass,
+
+		// Chaos FGeometryCollectionObject user defined collision shapes support
+		GeometryCollectionUserDefinedCollisionShapes,
+
+		// Removed the AtmosphericFog component with conversion to SkyAtmosphere component
+		RemovedAtmosphericFog,
+
+		// The SkyAtmosphere now light up the heightfog by default, and by default the height fog has a black color.
+		SkyAtmosphereAffectsHeightFogWithBetterDefault,
+
+		// Ordering of samples in BlendSpace
+		BlendSpaceSampleOrdering,
+
+		// No longer bake MassToLocal transform into recorded transform data in GeometryCollection caching
+		GeometryCollectionCacheRemovesMassToLocal,
+
+		// UEdGraphPin serializes SourceIndex
+		EdGraphPinSourceIndex,
+
+		// Change texture bulkdatas to have unique guids
+		VirtualizedBulkDataHaveUniqueGuids,
+
+		// Introduce RigVM Memory Class Object
+		RigVMMemoryStorageObject,
+
+		// Ray tracing shadows have three states now (Disabled, Use Project Settings, Enabled)
+		RayTracedShadowsType,
+
+		// Add bVisibleInRayTracing flag to Skeletal Mesh Sections
+		SkelMeshSectionVisibleInRayTracingFlagAdded,
+
+		// Add generic tagging of all anim graph nodes in anim blueprints
+		AnimGraphNodeTaggingAdded,
+		
+		// Add custom version to FDynamicMesh3
+		DynamicMeshCompactedSerialization,
+
+		// Remove the inline reduction bulkdata and replace it by a simple vertex and triangle count cache
+		ConvertReductionBaseSkeletalMeshBulkDataToInlineReductionCacheData,
+
+		// Added some new MeshInfo to the FSkeletalMeshLODModel class.
+		SkeletalMeshLODModelMeshInfo,
+		
+		// Add Texture DoScaleMipsForAlphaCoverage
+		TextureDoScaleMipsForAlphaCoverage,
+
+		// Fixed default value of volumetric cloud to be exact match with main view, more expenssive but we let user choosing how to lower the quality.
+		VolumetricCloudReflectionSampleCountDefaultUpdate,
+
+		// Use special BVH for TriangleMesh, instead of the AABBTree
+		UseTriangleMeshBVH,
+
+		// FDynamicMeshAttributeSet has Weight Maps. TDynamicAttributeBase serializes its name.
+		DynamicMeshAttributesWeightMapsAndNames,
+
+		// Switching FK control naming scheme to incorporate _CURVE for curve controls
+		FKControlNamingScheme,
+
+		// Fix-up for FRichCurveKey::TangentWeightMode, which were found to contain invalid value w.r.t the enum-type
+		RichCurveKeyInvalidTangentMode,
+
+		// Enforcing new automatic tangent behaviour, enforcing auto-tangents for Key0 and KeyN to be flat, for Animation Assets.
+		ForceUpdateAnimationAssetCurveTangents,
+
+		// SoundWave Update to use EditorBuildData for it's RawData
+		SoundWaveVirtualizationUpdate,
+
+		// Fix material feature level nodes to account for new SM6 input pin.
+		MaterialFeatureLevelNodeFixForSM6,
+
+		// -----<new versions can be added above this line>-------------------------------------------------
+		VersionPlusOne,
+		LatestVersion = VersionPlusOne - 1
+	};
+
+	// The GUID for this custom version number
+	const static FGuid GUID;
+
+	static TMap<FGuid, FGuid> GetSystemGuids();
+
+	FUE5MainStreamObjectVersion() = delete;
+};
