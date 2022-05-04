@@ -322,8 +322,8 @@ void SetupLightParameters(
 		DestLight.Dimensions = FVector2f(LightParameters.SourceRadius, 0.0f);
 		DestLight.Flags |= PATHTRACING_LIGHT_DIRECTIONAL;
 
-		DestLight.TranslatedBoundMin = FVector(-Inf, -Inf, -Inf);
-		DestLight.TranslatedBoundMax = FVector(Inf, Inf, Inf);
+		DestLight.TranslatedBoundMin = FVector3f(-Inf, -Inf, -Inf);
+		DestLight.TranslatedBoundMax = FVector3f(Inf, Inf, Inf);
 	}
 
 	uint32 InfiniteLights = LightCount;
@@ -442,7 +442,7 @@ bool ShouldRenderRayTracingGlobalIllumination(const FViewInfo& View)
 		? CVarRayTracingGlobalIlluminationValue > 0
 		: View.FinalPostProcessSettings.RayTracingGIType > ERayTracingGlobalIlluminationType::Disabled;
 
-	return ShouldRenderRayTracingEffect(bEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline);
+	return ShouldRenderRayTracingEffect(bEnabled, ERayTracingPipelineCompatibilityFlags::FullPipeline, &View);
 }
 
 bool IsFinalGatherEnabled(const FViewInfo& View)
@@ -799,16 +799,17 @@ void FDeferredShadingSceneRenderer::PrepareRayTracingGlobalIlluminationDeferredM
 
 #endif // RHI_RAYTRACING
 
-//bool IsRestirGIEnabled(const FViewInfo& View)
-//{
-//	int32 CVarRayTracingGlobalIlluminationValue = CVarRayTracingGlobalIllumination.GetValueOnRenderThread();
-//	if (CVarRayTracingGlobalIlluminationValue >= 0)
-//	{
-//		return CVarRayTracingGlobalIlluminationValue == 3;
-//	}
-//
-//	return View.FinalPostProcessSettings.RayTracingGIType == ERayTracingGlobalIlluminationType::RestirGI;
-//}
+bool IsRestirGIEnabled(const FViewInfo& View)
+{
+	int32 CVarRayTracingGlobalIlluminationValue = CVarRayTracingGlobalIllumination.GetValueOnRenderThread();
+	if (CVarRayTracingGlobalIlluminationValue >= 0)
+	{
+		return CVarRayTracingGlobalIlluminationValue == 3;
+	}
+
+	//return View.FinalPostProcessSettings.RayTracingGIType == ERayTracingGlobalIlluminationType::RestirGI;
+	return false;
+}
 //
 //bool IsFusionGIEnabled(const FViewInfo& View)
 //{
@@ -863,10 +864,10 @@ bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 	{
 		RenderRayTracingGlobalIlluminationFinalGather(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
 	}
-	//else if (IsRestirGIEnabled(View))
-	//{
-	//	RenderRestirGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
-	//}
+	else if (IsRestirGIEnabled(View))
+	{
+		RenderFusionRestirGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
+	}
 	//else if (IsFusionGIEnabled(View))
 	//{
 	//	FusionGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
