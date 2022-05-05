@@ -20,8 +20,9 @@
 #define USE_PATHTRACING_MATERIALS 0
 
 RaytracingAccelerationStructure TLAS;
-RWTexture2D<float2> RWRayDistanceUAV;
-RWTexture2D<float4> RWDebugDiffuseUAV;
+RWTexture2D<float4> RWGlobalIlluminationUAV;
+RWTexture2D<float2> RWGlobalIlluminationRayDistanceUAV;
+
 int     HistoryReservoir;
 int     InitialCandidates;
 int     OutputSlice;
@@ -78,7 +79,7 @@ void GenerateCosineNormalRay(
 	RayPdf = Direction_Tangent.w;
 }
 
-void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 WorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXGI_Reservoir state)
+void ProduceInitialSample(uint2 DispatchId,uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 WorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXGI_Reservoir state)
 {
 	const uint2 TileSize = uint2(64,32);
 	const uint2 TiledIndex = uint2(PixelCoord.x / TileSize.x, PixelCoord.y / TileSize.y);
@@ -93,10 +94,9 @@ void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData
 
 	float3 DiffuseColor = GBuffer.DiffuseColor;
 	float3 WorldNormal = GBuffer.WorldNormal;
-    
-    float HitDistance = 0.0;
+
+	float HitDistance = 0.0;
 	float HitCount = 0.0;
-	// float AmbientOcclusion = 0.0;
 
 	for (uint SampleIndex = 0; SampleIndex < NumSamples; SampleIndex++)
 	{
@@ -176,14 +176,9 @@ void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData
 				sampleRef.CreationNormal = WorldNormal;
 				sampleRef.Position = HitPos;
 				sampleRef.Normal = Payload.WorldNormal;
-                
-                HitDistance += Payload.HitT;
+				
+				HitDistance += Payload.HitT;
 				HitCount += 1.0;
-				// if (Payload.HitT < MaxRayDistanceForAO)
-				// {
-				// 	AmbientOcclusion += 1.0;
-				// }
-
 			}
 			if (Payload.HitT > MaxRayDistanceForGI) break;
 
@@ -358,7 +353,8 @@ void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData
 		}
 	
 		sampleRef.Irradiance = Irradiance;
-
+		// float pdfScale = 1.0;
+		// float weight = Luminance(sampleRef.Irradiance);
 		float targetPdf = GetTargetPdf(sampleRef.Irradiance, sampleRef.CreationPoint,sampleRef.CreationNormal, sampleRef.Position);	
 		float invSourcePdf = 1.0;
 		float risRnd = RandContext.GenerateSample1D();
@@ -368,9 +364,8 @@ void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData
 	LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
 	LocalReservoir.M = 1;
 
+	// state = RTXGI_Reservoir::Empty();
 	state = LocalReservoir;
-
-    
 	if (HitCount > 0.0)
 	{
 		HitDistance /= HitCount;
@@ -379,13 +374,8 @@ void ProduceInitialSample(uint2 DispatchThreadId, uint2 PixelCoord, FGBufferData
 	{
 		HitDistance = -1.0;
 	}
-    // AmbientOcclusion /= NumSamples;
-	// AmbientOcclusion = saturate(AmbientOcclusion);
-
-    RWRayDistanceUAV[DispatchThreadId] = float2(HitDistance, NumSamples);
-    RWDebugDiffuseUAV[DispatchThreadId] = float4(LocalReservoir.sampleRef.Irradiance,1.0);
+	RWGlobalIlluminationRayDistanceUAV[DispatchId] = float2(HitDistance, NumSamples);
 }
-
 
 /***************************************************************************************************
  *
@@ -422,7 +412,7 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
 
 	if (bIsValidPixel)
 	{
-		ProduceInitialSample(DispatchThreadId, PixelCoord, GBuffer, DeviceZ, WorldPosition, CameraDirection, RandContext, state);
+		ProduceInitialSample(DispatchThreadId,PixelCoord, GBuffer, DeviceZ, WorldPosition, CameraDirection, RandContext, state);
 	}
 
 	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());

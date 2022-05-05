@@ -155,7 +155,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 	float3 DiffuseExitantRadiance = 0.0;
 	if (bIsValidPixel)
 	{
-        for (uint SampleIndex = 0; SampleIndex < SpatialSamples; ++SampleIndex) 
+        // for (uint SampleIndex = 0; SampleIndex < SpatialSamples; ++SampleIndex) 
 		{
 			RTXGI_Reservoir risSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice + 0));
 
@@ -171,12 +171,12 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 				Ray.TMax = length(Direction) - 1e-1;
 				Ray.TMax = min(Ray.TMax, MaxShadowDistance);
 
-				float3 BiasNormal = GBuffer.WorldNormal;
-				if ( dot(BiasNormal, Ray.Direction) < 0.0)
-				{
-					BiasNormal = -BiasNormal;
-				}
-				ApplyPositionBias(Ray, BiasNormal, MaxNormalBias);
+				// float3 BiasNormal = GBuffer.WorldNormal;
+				// if ( dot(BiasNormal, Ray.Direction) < 0.0)
+				// {
+				// 	BiasNormal = -BiasNormal;
+				// }
+				// ApplyPositionBias(Ray, BiasNormal, MaxNormalBias);
 
 				// uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
 				// RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
@@ -219,7 +219,6 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
     }
 
 
-	RWDiffuseUAV[DispatchThreadId].rgb = DiffuseExitantRadiance;
-	RWDiffuseUAV[DispatchThreadId].a = 1.0;
+	RWDiffuseUAV[DispatchThreadId] = float4(DiffuseExitantRadiance,1.0);
 	// RWRayDistanceUAV[DispatchThreadId] = float2(RayDistance, NumReservoirs);
 }
