@@ -1050,7 +1050,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
 
 	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
 	float3 DiffuseColor = GBuffer.DiffuseColor;
-	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsDepthValid = DeviceZ > 0.0 && DeviceZ < 0.999;
 	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
 
 	if (bIsValidPixel)
@@ -1089,9 +1089,6 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 
 	RTXGI_Reservoir risSample = RTXGI_Reservoir::Empty();
 	float3 DiffuseExitantRadiance = 0.0;
-	float RayDistance = 0.0;
-	float HitCount = 0.0;
-
 	if (bIsValidPixel)
 	{
 		//for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
@@ -1117,18 +1114,18 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 				}
 				ApplyPositionBias(Ray, BiasNormal, MaxNormalBias);
 
-				// uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
-				// RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
-				// RayFlags |= VisibilityFaceCull == 2 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
-				// const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+				uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+				RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
+				RayFlags |= VisibilityFaceCull == 2 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+				const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
 
-				// FLightFunctionPayload LightPayload = TraceLightFunctionRay(
-				// 	TLAS,
-				// 	RayFlags,
-				// 	InstanceInclusionMask,
-				// 	PixelCoord,
-				// 	Ray);
-				//if (!LightPayload.IsHit() )
+				FLightFunctionPayload LightPayload = TraceLightFunctionRay(
+					TLAS,
+					RayFlags,
+					InstanceInclusionMask,
+					PixelCoord,
+					Ray);
+				if (!LightPayload.IsHit() )
 				{
 						
 					half3 N = GBuffer.WorldNormal;
@@ -1141,36 +1138,28 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 					float GeoTerm= 2.0 * NoL;
 					// when use uniformhemisphere sampling, the pdf is 1.0 / 2pi, where brdf is nol / pi  
 					DiffuseExitantRadiance +=  risSample.sampleRef.Irradiance * risSample.weightSum * GeoTerm ;
-					RayDistance += Ray.TMax;
-					HitCount += 1.0f;
 				}
-				// else
-				// {
-				// 	HitCount += 1.0f;
-				// 	RayDistance += LightPayload.HitT;
-				// 	if (FeedbackVisibility)
-				// 	{
-				// 		risSample.weightSum = 0.0f;
-				// 		risSample.targetPdf = 0.0f;
-                //         risSample.M = 0;
-				// 	}
-				// }
+				else
+				{
+					if (FeedbackVisibility)
+					{
+						risSample.weightSum = 0.0f;
+						risSample.targetPdf = 0.0f;
+                        risSample.M = 0;
+					}
+				}
 			}
-			// else
-			// {
-			// 	// sample occluded, kill it for the history
-			// 	risSample = RTXGI_Reservoir::Empty();
-			// }
+			else
+			{
+				// sample occluded, kill it for the history
+				risSample = RTXGI_Reservoir::Empty();
+			}
 			// if (UseFireflySuppression)
 			// {
 			// 	DiffuseExitantRadiance *= rcp(1.0 + Luminance(DiffuseExitantRadiance));
 			// }
-			//WriteReservoirHistoryData(DispatchThreadId, Reservoir, risSample.Store());
+			WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
 		}
-
-		//DiffuseExitantRadiance /= float(NumReservoirs);
-
-		RayDistance /= max(HitCount, 1.0);
 
 		// Apply the pre-exposure scale to the resulting shaded value
 #if USE_PREEXPOSURE
@@ -1179,16 +1168,15 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 
 		DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance);
 	}
-	// else
-	// {
-	// 	// Invalid pixel, write empty reservoir
+	else
+	{
+		// Invalid pixel, write empty reservoir
 		//for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
 			WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, InputSlice + 0));
 		}
-	// }
+	}
 
-	RWDiffuseUAV[DispatchThreadId].rgb = DiffuseExitantRadiance;
-	RWDiffuseUAV[DispatchThreadId].a = 1.0;
+	RWDiffuseUAV[DispatchThreadId] = float4(DiffuseExitantRadiance,1.0);
 	// RWRayDistanceUAV[DispatchThreadId] = float2(RayDistance, NumReservoirs);
 }

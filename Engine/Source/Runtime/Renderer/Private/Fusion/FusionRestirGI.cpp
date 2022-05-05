@@ -117,11 +117,6 @@
     	TEXT("Apply an approximate visibility test on sample selected during reprojection"),
     	ECVF_RenderThreadSafe);
 
-    static TAutoConsoleVariable<int32> CVarRestirGIDemodulateMaterials(
-    	TEXT("r.Fusion.ResrirGI.DemodulateMaterials"), 1,
-    	TEXT("Whether to demodulate the material contributiuon from the signal for denoising"),
-    	ECVF_RenderThreadSafe);
-
     static TAutoConsoleVariable<int32> CVarRestirGIFaceCull(
     	TEXT("r.Fusion.ResrirGI.FaceCull"), 0,
     	TEXT("Face culling to use for visibility tests\n")
@@ -154,7 +149,7 @@
 
     static TAutoConsoleVariable<int32> CVarRayTracingRestirGIFeedbackVisibility(
     	TEXT("r.Fusion.ResrirGI.FeedbackVisibility"),
-    	1,
+    	0,
     	TEXT("Whether to feedback the final visibility result to the history (default = 1)"),
     	ECVF_RenderThreadSafe);
 
@@ -262,7 +257,7 @@
     	END_SHADER_PARAMETER_STRUCT()
     };
 
-    IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesRGS, "/Engine/Private/RestirGI/RestirGITrace.usf", "GenerateInitialSamplesRGS", SF_RayGen);
+    IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesRGS, "/Engine/Private/RestirGI/RayTracingRestirGILighting.usf", "GenerateInitialSamplesRGS", SF_RayGen);
 
 
     class FRestirGITemporalResampling : public FGlobalShader
@@ -354,7 +349,7 @@
     		END_SHADER_PARAMETER_STRUCT()
     };
 
-    IMPLEMENT_GLOBAL_SHADER(FEvaluateRestirGIRGS, "/Engine/Private/RestirGI/RestirGIResolve.usf", "EvaluateRestirGILightingRGS", SF_RayGen);
+    IMPLEMENT_GLOBAL_SHADER(FEvaluateRestirGIRGS, "/Engine/Private/RestirGI/RayTracingRestirGILighting.usf", "EvaluateRestirGILightingRGS", SF_RayGen);
 
     class FRestirGISpatialResampling : public FGlobalShader
     {
@@ -831,17 +826,12 @@
 
     		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
     		PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-    		//PassParameters->SSProfilesTexture = GraphBuilder.RegisterExternalTexture(View.RayTracingSubSurfaceProfileTexture);
 
-    		//PassParameters->RWDiffuseUAV = GraphBuilder.CreateUAV(Diffuse);
-    		//PassParameters->RWRayDistanceUAV = GraphBuilder.CreateUAV(RayHitDistance);
     		PassParameters->RWDiffuseUAV = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
     		PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
     		PassParameters->RWGIReservoirHistoryUAV = GraphBuilder.CreateUAV(GIReservoirsHistory);
     		PassParameters->InputSlice = InitialSlice;
     		PassParameters->NumReservoirs = NumReservoirs;
-    		PassParameters->DemodulateMaterials = CVarRestirGIDemodulateMaterials.GetValueOnRenderThread();
-    		//PassParameters->DebugOutput = CVarRayTracingRestirGIDebugMode.GetValueOnRenderThread();
     		PassParameters->FeedbackVisibility = CVarRayTracingRestirGIFeedbackVisibility.GetValueOnRenderThread();
     		PassParameters->RestirGICommonParameters = CommonParameters;
 			
