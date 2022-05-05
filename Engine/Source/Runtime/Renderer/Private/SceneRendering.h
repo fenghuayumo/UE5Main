@@ -959,6 +959,63 @@ struct FGTAOTAAHistory
 	}
 };
 
+struct FRestirGIHistory
+{
+	// Buffer holding a light reservoirs
+	TRefCountPtr<FRDGPooledBuffer> GIReservoirs;
+	//TRefCountPtr<FRDGPooledBuffer> GatherBuffer;
+	FIntVector ReservoirDimensions;
+
+	void SafeRelease()
+	{
+		GIReservoirs.SafeRelease();
+		//GatherBuffer.SafeRelease();
+	}
+
+	bool IsValid() const
+	{
+		return GIReservoirs.IsValid();
+	}
+};
+
+struct FGridRestirHistory
+{
+	// Buffer holding a light reservoirs
+	TRefCountPtr<FRDGPooledBuffer>	Reservoirs;
+	//TRefCountPtr<FRDGPooledBuffer> GatherBuffer;
+	FIntVector ReservoirDimensions;
+
+	void SafeRelease()
+	{
+		Reservoirs.SafeRelease();
+		//GatherBuffer.SafeRelease();
+	}
+
+	bool IsValid() const
+	{
+		return Reservoirs.IsValid();
+	}
+};
+
+struct FRestirReflectionHistory
+{
+	// Buffer holding a light reservoirs
+	TRefCountPtr<FRDGPooledBuffer>	Reservoirs;
+	//TRefCountPtr<FRDGPooledBuffer> GatherBuffer;
+	FIntVector ReservoirDimensions;
+
+	void SafeRelease()
+	{
+		Reservoirs.SafeRelease();
+		//GatherBuffer.SafeRelease();
+	}
+
+	bool IsValid() const
+	{
+		return Reservoirs.IsValid();
+	}
+};
+
 
 // Plugins can derive from this and use it for their own purposes
 class RENDERER_API ICustomTemporalAAHistory : public IRefCountedObject
@@ -1071,6 +1128,10 @@ struct FPreviousViewInfo
 	// Scene color used for reprojecting next frame to verify the motion vector reprojects correctly.
 	TRefCountPtr<IPooledRenderTarget> VisualizeMotionVectors;
 	FIntRect VisualizeMotionVectorsRect;
+
+	FRestirGIHistory			RestirGIHistory;
+	FRestirReflectionHistory	RestirReflectionHistory;
+	FGridRestirHistory			GridRestirHistory;
 };
 
 class FViewCommands

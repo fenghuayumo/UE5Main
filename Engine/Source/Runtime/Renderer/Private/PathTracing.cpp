@@ -554,18 +554,6 @@ class FPathTracingSkylightMISCompensationCS : public FGlobalShader
 };
 IMPLEMENT_SHADER_TYPE(, FPathTracingSkylightMISCompensationCS, TEXT("/Engine/Private/PathTracing/PathTracingSkylightMISCompensation.usf"), TEXT("PathTracingSkylightMISCompensationCS"), SF_Compute);
 
-// this struct holds a light grid for both building or rendering
-BEGIN_SHADER_PARAMETER_STRUCT(FPathTracingLightGrid, RENDERER_API)
-	SHADER_PARAMETER(uint32, SceneInfiniteLightCount)
-	SHADER_PARAMETER(FVector3f, SceneLightsTranslatedBoundMin)
-	SHADER_PARAMETER(FVector3f, SceneLightsTranslatedBoundMax)
-	SHADER_PARAMETER_RDG_TEXTURE(Texture2D, LightGrid)
-	SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint>, LightGridData)
-	SHADER_PARAMETER(unsigned, LightGridResolution)
-	SHADER_PARAMETER(unsigned, LightGridMaxCount)
-	SHADER_PARAMETER(int, LightGridAxis)
-END_SHADER_PARAMETER_STRUCT()
-
 class FPathTracingBuildLightGridCS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FPathTracingBuildLightGridCS)

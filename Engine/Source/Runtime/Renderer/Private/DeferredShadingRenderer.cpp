@@ -1465,6 +1465,11 @@ bool FDeferredShadingSceneRenderer::SetupRayTracingPipelineStates(FRHICommandLis
 					PrepareRayTracingGlobalIlluminationPlugin(View, RayGenShaders);
 					PrepareRayTracingTranslucency(View, RayGenShaders);
 
+					// PrepareRayTracingSampledDirectLighting(View, RayGenShaders);
+					PrepareFusionRestirGI(View, RayGenShaders);
+					// PrepareFusionSurfelGI(View, RayGenShaders);
+					// PrepareFusionWRCGI(View, RayGenShaders);
+
 					if (DoesPlatformSupportLumenGI(ShaderPlatform) && Lumen::UseHardwareRayTracing(*ActiveViewFamily))
 					{
 						PrepareLumenHardwareRayTracingScreenProbeGather(View, RayGenShaders);

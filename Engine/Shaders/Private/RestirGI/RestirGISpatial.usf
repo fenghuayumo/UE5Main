@@ -1,0 +1,125 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingReflectionsCommon.ush"
+#include "../RayTracing/RayTracingDeferredReflections.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+Texture2D<float4>   SSAOTex;
+
+float   DiffuseThreshold;
+uint    UpscaleFactor;
+uint    SpatialSamples;
+uint    SpatialPassIdx;
+int     MaxTemporalHistory;
+
+float   SpatialDepthRejectionThreshold;
+float   SpatialNormalRejectionThreshold;
+int     InputSlice;
+int     OutputSlice;
+int     HistoryReservoir;
+
+[numthreads(8, 8, 1)]
+void SpatialResamplingCS(uint2 DispatchThreadID : SV_DispatchThreadID) 
+{
+    uint2 DispatchThreadId = DispatchThreadID.xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	if (any(PixelCoord >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+    const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+	float3 TranslatedWorldPosition = ReconstructTranslatedWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+    
+    float3 WorldNormal = GBuffer.WorldNormal;
+    uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+    
+	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0 && DeviceZ < 0.999 ;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+    if (bIsValidPixel)
+    {
+        float SampleRadiusOffset = RandContext.GenerateSample1D();
+        const float CenterSSAO = SSAOTex[PixelCoord].r;
+        RTXGI_Reservoir centerSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
+        state.CombineReservoirs(centerSample, /* random = */ 0.5f, centerSample.targetPdf);
+       
+        // Don't be picky at low contribution counts. SSAO weighing
+        // in those circumstances results in boiling near edges.
+        const float SSAOFactor = smoothstep(5.0, 10.0, centerSample.M);
+        float KernelRadius = lerp(2.0, 16.0, lerp(1, CenterSSAO, SSAOFactor));
+
+        if (SpatialPassIdx == 1) 
+        {
+            KernelRadius = lerp(2.0, 32.0, lerp(1, CenterSSAO, SSAOFactor));
+        }
+
+        const uint TARGET_M = 512;
+        float AngleOffset = RandContext.GenerateSample1D() * PI * 2;
+
+        for (uint SampleIndex = 1; SampleIndex < SpatialSamples && state.M < TARGET_M; ++SampleIndex) 
+        {
+            //float ang = M_PI / 2;
+            float Angle = (SampleIndex + AngleOffset) * GOLDEN_ANGLE;
+            float Radius =  float(SampleIndex + SampleRadiusOffset) * (KernelRadius / SpatialSamples);
+            int2  RpxOffset = float2(cos(Angle), sin(Angle)) * Radius;
+            const int2 SampleCoord = DispatchThreadId + RpxOffset;
+            const float2 SampleUV = (SampleCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+            // Read adjacent GBuffer data
+            FGBufferData AdjGBuffer = GetGBufferDataFromSceneTextures(SampleUV);
+            float AdjDeviceZ = SceneDepthTexture.Load(int3(SampleCoord, 0)).r;
+            float3 AdjWorldPosition;
+            float3 AdjCameraDirection;
+            ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(SampleCoord, AdjDeviceZ, AdjWorldPosition, AdjCameraDirection);
+
+            // TODO: refine sample rejection tests
+            if (dot(GBuffer.WorldNormal, AdjGBuffer.WorldNormal) < SpatialNormalRejectionThreshold)
+            {
+                continue;
+            }
+
+            if (abs(GBuffer.Depth - AdjGBuffer.Depth) / GBuffer.Depth > SpatialDepthRejectionThreshold)
+            {
+                continue;
+            }
+
+            if (GBuffer.ShadingModelID != AdjGBuffer.ShadingModelID)
+            {
+                continue;
+            }
+            uint2 samplePosID = clamp(SampleCoord , uint2(0,0), ReservoirBufferDim.xy - 1);
+            RTXGI_Reservoir r = RTXGI_Reservoir::Load(ReadReservoirData(samplePosID, InputSlice));
+            r.M = min(500, r.M);
+            if (r.sampleRef.IsValid())
+            {			
+                //ToDo - does this need to be a permutation?
+                bool Visible = true;
+                float pNewTN = GetTargetPdf(r.sampleRef.Irradiance, WorldNormal, TranslatedWorldPosition, r.sampleRef.Position);
+                float neighborWeight = Visible ?  pNewTN  : 0;
+                state.CombineReservoirs(r, RandContext.GenerateSample1D(), neighborWeight);
+            }
+        }
+    }
+    	
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
+}

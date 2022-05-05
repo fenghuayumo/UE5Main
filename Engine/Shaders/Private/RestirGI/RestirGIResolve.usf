@@ -1,0 +1,225 @@
+
+#include "../Common.ush"
+#ifndef USE_PREEXPOSURE
+#define USE_PREEXPOSURE 1
+#endif
+
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "../RayTracing/RayTracingHitGroupCommon.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+Texture2D<float4>   SSAOTex;
+RWTexture2D<float4> RWDiffuseUAV;
+
+uint    SpatialSamples;
+uint    UpscaleFactor;
+float   DiffuseThreshold;
+int     InputSlice;
+int     NumReservoirs;
+
+float MaxRayDistanceForGI;
+float MaxRayDistanceForAO;
+float MaxShadowDistance;
+float MaxNormalBias;
+
+static float GGXNdfUnNorm(float a2, float cos_theta) 
+{
+	float denom_sqrt = cos_theta * cos_theta * (a2 - 1.0) + 1.0;
+	return a2 / (denom_sqrt * denom_sqrt);
+}
+
+
+// [numthreads(8, 8, 1)]
+// void RestirGIResolveCS(uint2 PixelCoord : SV_DispatchThreadID) 
+// {
+//     // uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);  
+
+// 	// Get G-Buffer surface data
+//     const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+// 	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+
+// 	float Depth = GBuffer.Depth;
+// 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+// 	float3 WorldPosition;
+// 	float3 CameraDirection;
+// 	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+// 	float3 DiffuseColor = GBuffer.DiffuseColor;
+// 	const bool bIsDepthValid = DeviceZ > 0.0;
+// 	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+//     float InvFraction = 1.0 / UpscaleFactor;
+//     half3 CenterNormal = GBuffer.WorldNormal;
+//     float3 CenterNormalVS = normalize(mul(CenterNormal, (float3x3)View.TranslatedWorldToView));
+//     const float CenterDepth = DeviceZ;
+
+//     const uint UpscaleFactorPow2 = UpscaleFactor * UpscaleFactor;
+// 	const uint SubPixelId = View.StateFrameIndex & (UpscaleFactorPow2 - 1);
+//     uint LinearIndex = CalcLinearIndex(PixelCoord);
+// 	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex);
+
+//     float3 WeightedIrradiance = 0;
+//     float WeightSum = 0;
+
+// 	if (bIsValidPixel)
+//     {
+//         for (uint SampleIndex = 0; SampleIndex < SpatialSamples; ++SampleIndex) 
+//         {
+//             float3 IrradianceSum = 0;
+
+//             const float Angle = (SampleIndex + RandContext.GenerateSample1D() ) * GOLDEN_ANGLE + (SubPixelId / UpscaleFactorPow2) * 2 * PI;
+//             const float Radius = pow(float(SampleIndex), 0.666) * 1.0 + 0.4;
+//             const float2 RpxOffset = float2(cos(Angle), sin(Angle)) * Radius;
+//             const int2 Rpx = int2(floor(float2(PixelCoord) * InvFraction + RpxOffset));
+//             RTXGI_Reservoir risSample = RTXGI_Reservoir::Load(ReadReservoirData(Rpx, InputSlice));
+
+//             if (risSample.sampleRef.IsValid())
+//             {
+//                 float3 LightPosition = risSample.sampleRef.Position;
+//                 float3 L = normalize(LightPosition - WorldPosition);
+//                 float NoL = dot(CenterNormal, L);
+//                 float GTerm = max(0.0, NoL) * 2.0;
+
+//                 IrradianceSum += risSample.sampleRef.Irradiance * risSample.weightSum * GTerm;
+
+//                 const uint2  hRpx = GetPixelCoord(Rpx, UpscaleFactor);
+//                 const float3 SampledNormal = normalize(DecodeNormal(GBufferATexture[hRpx].xyz));
+//                 const float SampledDepth = SceneDepthTexture[hRpx].r;
+
+//                 float Weight = 1;
+//                 float Ndot = dot(SampledNormal, CenterNormal);
+//                 Weight *= GGXNdfUnNorm(0.01, saturate(Ndot));
+//                 Weight *= exp2(-200.0 * abs( CenterNormalVS.z * (CenterDepth / SampledDepth - 1.0)));
+
+//                 #if USE_SSAO_STEERING
+//                     const float SampledSSAO = SSAOTex[hRpx].r;
+//                     Weight *= exp2(-10.0 * abs(SampledSSAO - CenterSSAO));
+//                 #endif
+
+//                 WeightedIrradiance += IrradianceSum * Weight;
+//                 WeightSum += Weight;
+
+//             }
+//         }
+//     }
+//     WeightedIrradiance /= max(1e-20, WeightSum);
+// #if USE_PREEXPOSURE
+// 	WeightedIrradiance *= View.PreExposure;
+// #endif
+
+// 	WeightedIrradiance = ClampToHalfFloatRange(WeightedIrradiance);
+//     WriteReservoirHistoryData(PixelCoord, 0, ReadReservoirData(PixelCoord, InputSlice));
+//     RWGlobalIlluminationUAV[PixelCoord] = float4(WeightedIrradiance,1.0);
+// }
+
+
+/***************************************************************************************************
+ *
+ *  EvaluateRestirGILighting
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
+{
+
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex);
+
+	// Get G-Buffer surface data
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+	float Depth = GBuffer.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0 && DeviceZ < 0.999;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+	float3 DiffuseExitantRadiance = 0.0;
+	if (bIsValidPixel)
+	{
+        for (uint SampleIndex = 0; SampleIndex < SpatialSamples; ++SampleIndex) 
+		{
+			RTXGI_Reservoir risSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice + 0));
+
+			if (risSample.sampleRef.IsValid())
+			{
+				float3 LightPosition = risSample.sampleRef.Position;
+				float3 Direction = (LightPosition - WorldPosition);
+				
+				RayDesc Ray;	
+				Ray.Origin = WorldPosition;
+				Ray.Direction = normalize(Direction);
+				Ray.TMin = 0;
+				Ray.TMax = length(Direction) - 1e-1;
+				Ray.TMax = min(Ray.TMax, MaxShadowDistance);
+
+				float3 BiasNormal = GBuffer.WorldNormal;
+				if ( dot(BiasNormal, Ray.Direction) < 0.0)
+				{
+					BiasNormal = -BiasNormal;
+				}
+				ApplyPositionBias(Ray, BiasNormal, MaxNormalBias);
+
+				// uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+				// RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
+				// RayFlags |= VisibilityFaceCull == 2 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+				// const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+				// FLightFunctionPayload LightPayload = TraceLightFunctionRay(
+				// 	TLAS,
+				// 	RayFlags,
+				// 	InstanceInclusionMask,
+				// 	PixelCoord,
+				// 	Ray);
+				//if (!LightPayload.IsHit() )
+				{
+						
+					half3 N = GBuffer.WorldNormal;
+					half3 V = -CameraDirection;
+					half3 L = Ray.Direction;
+					float NoL = saturate(dot(N, L));
+					// FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+					// FDirectLighting LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
+					// float3 RayThroughput = LightingSample.Diffuse / DiffuseColor;
+					float GeoTerm= 2.0 * NoL;
+					// when use uniformhemisphere sampling, the pdf is 1.0 / 2pi, where brdf is nol / pi  
+					DiffuseExitantRadiance +=  risSample.sampleRef.Irradiance * risSample.weightSum * GeoTerm ;
+				}
+			}
+
+		}
+		// Apply the pre-exposure scale to the resulting shaded value
+#if USE_PREEXPOSURE
+		DiffuseExitantRadiance *= View.PreExposure;
+#endif
+
+		DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance);
+	}
+
+    {
+        WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, InputSlice + 0));
+    }
+
+
+	RWDiffuseUAV[DispatchThreadId].rgb = DiffuseExitantRadiance;
+	RWDiffuseUAV[DispatchThreadId].a = 1.0;
+	// RWRayDistanceUAV[DispatchThreadId] = float2(RayDistance, NumReservoirs);
+}

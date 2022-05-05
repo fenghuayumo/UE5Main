@@ -173,6 +173,35 @@ public:
 	FRDGTextureRef LightingChannelsTexture;
 };
 
+
+struct FSurfelBufResources
+{
+	FRDGBufferRef SurfelMetaBuf;
+	FRDGBufferRef SurfelGridMetaBuf;
+	FRDGBufferRef SurfelEntryCellBuf;
+	FRDGBufferRef SurfelPoolBuf;
+	FRDGBufferRef SurfelLifeBuf;
+	FRDGBufferRef SurfelVertexBuf;
+	FRDGBufferRef SurfelIrradianceBuf;
+	FRDGBufferRef SurfelRePositionBuf;
+	FRDGBufferRef SurfelRePositionCountBuf;
+
+	FRDGBufferRef SurfelAuxiBuf;
+};
+
+struct FRadianceVolumeProbeConfigs
+{
+	FVector 	ProbeGridSpacing;
+	FVector  	VolumeProbeOrigin;
+	int32       NumRaysPerProbe;
+	FVector4    VolumeProbeRotation;
+	float	    ProbeMaxRayDistance;
+	FIntVector  ProbeGridCounts;
+	uint32 		ProbeDim;
+	uint32		AtlasProbeCount;
+	TRefCountPtr<IPooledRenderTarget> ProbesRadiance;
+};
+
 /**
  * Delegate callback used by global illumination plugins
  */
@@ -946,6 +975,57 @@ private:
 		const FSceneTextureParameters& SceneTextures,
 		FRDGTextureRef* OutAmbientOcclusionTexture);
 	
+	void RenderFusionRestirGI(
+		FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		// Output
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FSurfelBufResources* SurfelResource = nullptr,
+		FRadianceVolumeProbeConfigs* ProbeConfig = nullptr);
+
+	void RenderRayTracingDeferedGI(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs);
+
+	void AllocateSurfels(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		FSurfelBufResources& SurfelRes);
+
+	void WRCTrace(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View);
+
+	void RenderWRC(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FRadianceVolumeProbeConfigs& ProbeConfig);
+
+	bool SurfelTrace(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FSurfelBufResources& SurfelRes);
+
+	bool SurfelGI(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FSurfelBufResources& SurfelResource);
+
 
 #if RHI_RAYTRACING
 	template <int TextureImportanceSampling>
@@ -1016,6 +1096,15 @@ private:
 	FRayTracingPipelineState* BindRayTracingDeferredMaterialGatherPipeline(FRHICommandList& RHICmdList, const FViewInfo& View, const TArrayView<FRHIRayTracingShader*>& RayGenShaderTable);
 	FRayTracingPipelineState* BindLumenHardwareRayTracingMaterialPipeline(FRHICommandList& RHICmdList, const FViewInfo& View, const TArrayView<FRHIRayTracingShader*>& RayGenShaderTable, FRHIBuffer* OutHitGroupDataBuffer);
 	void SetupLumenHardwareRayTracingHitGroupBuffer(FViewInfo& View);
+
+	//
+	static void PrepareFusionRestirGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
+	static void PrepareFusionSurfelGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
+	static void PrepareFusionWRCGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
+	static void PrepareFusionDeferedGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
+	static void PrepareFusionReflections(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
+	// Versions for setting up the deferred material pipeline
+	static void PrepareFusionReflectionsDeferredMaterial(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 
 	// #dxr_todo: UE-72565: refactor ray tracing effects to not be member functions of DeferredShadingRenderer. Register each effect at startup and just loop over them automatically
 	static void PrepareRayTracingReflections(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);

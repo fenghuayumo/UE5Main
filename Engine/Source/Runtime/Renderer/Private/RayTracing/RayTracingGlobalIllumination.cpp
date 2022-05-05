@@ -247,10 +247,13 @@ DECLARE_GPU_STAT_NAMED(RayTracingGIBruteForce, TEXT("Ray Tracing GI: Brute Force
 DECLARE_GPU_STAT_NAMED(RayTracingGIFinalGather, TEXT("Ray Tracing GI: Final Gather"));
 DECLARE_GPU_STAT_NAMED(RayTracingGICreateGatherPoints, TEXT("Ray Tracing GI: Create Gather Points"));
 
+extern void PrepareLightGrid(FRDGBuilder& GraphBuilder, FPathTracingLightGrid* LightGridParameters, const FPathTracingLight* Lights, uint32 NumLights, uint32 NumInfiniteLights, FRDGBufferSRV* LightsSRV);
+
 void SetupLightParameters(
 	FScene* Scene,
 	const FViewInfo& View, FRDGBuilder& GraphBuilder,
-	FRDGBufferSRV** OutLightBuffer, uint32* OutLightCount, FPathTracingSkylight* SkylightParameters)
+	FRDGBufferSRV** OutLightBuffer, uint32* OutLightCount, FPathTracingSkylight* SkylightParameters,
+	FPathTracingLightGrid* LightGridParameters = nullptr)
 {
 	FPathTracingLight Lights[RAY_TRACING_LIGHT_COUNT_MAXIMUM];
 	unsigned LightCount = 0;
@@ -412,6 +415,8 @@ void SetupLightParameters(
 		*OutLightBuffer = GraphBuilder.CreateSRV(FRDGBufferSRVDesc(CreateStructuredBuffer(GraphBuilder, TEXT("RTGILightsBuffer"), sizeof(FPathTracingLight), FMath::Max(LightCount, 1u), Lights, DataSize)));
 		*OutLightCount = LightCount;
 	}
+	if(LightGridParameters)
+		PrepareLightGrid(GraphBuilder, LightGridParameters, Lights, LightCount, InfiniteLights, *OutLightBuffer);
 }
 
 int32 GetRayTracingGlobalIlluminationSamplesPerPixel(const FViewInfo& View)
