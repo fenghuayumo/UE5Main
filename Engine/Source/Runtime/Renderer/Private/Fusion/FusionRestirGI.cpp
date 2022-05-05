@@ -290,6 +290,8 @@
     		SHADER_PARAMETER(float, TemporalNormalRejectionThreshold)
     		SHADER_PARAMETER(int32, ApplyApproximateVisibilityTest)
     		SHADER_PARAMETER(int32, InitialCandidates)
+			SHADER_PARAMETER(FVector4f, HistoryScreenPositionScaleBias)
+			
     		//SHADER_PARAMETER(int32, InitialSampleVisibility)
 
     		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
@@ -339,9 +341,6 @@
     		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<RTXGI_PackedReservoir>, RWGIReservoirHistoryUAV)
     		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 
-    		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HairCategorizationTexture)
-    		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HairLightChannelMaskTexture)
-
     		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
 
     		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualVoxelParameters, VirtualVoxel)
@@ -390,8 +389,8 @@
     		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
 
     		SHADER_PARAMETER_SRV(Buffer<float2>, NeighborOffsets)
-
-    		END_SHADER_PARAMETER_STRUCT()
+			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSAOTex)
+    	END_SHADER_PARAMETER_STRUCT()
     };
 
     IMPLEMENT_GLOBAL_SHADER(FRestirGISpatialResampling, "/Engine/Private/RestirGI/RayTracingRestirGILighting.usf", "ApplySpatialResamplingRGS", SF_RayGen);
@@ -695,6 +694,19 @@
 		{
 			/*	RDG_GPU_STAT_SCOPE(GraphBuilder, RestirTemporalResampling);
 			RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: TemporalResampling");*/
+			FIntPoint ViewportOffset = View.ViewRect.Min;
+			FIntPoint ViewportExtent = View.ViewRect.Size();
+			FIntPoint BufferSize     = SceneTextures.SceneDepthTexture->Desc.Extent;
+
+			FVector2D InvBufferSize(1.0f / float(BufferSize.X), 1.0f / float(BufferSize.Y));
+
+			FVector4f HistoryScreenPositionScaleBias = FVector4f(
+					ViewportExtent.X * 0.5f * InvBufferSize.X,
+					-ViewportExtent.Y * 0.5f * InvBufferSize.Y,
+					(ViewportExtent.X * 0.5f + ViewportOffset.X) * InvBufferSize.X,
+					(ViewportExtent.Y * 0.5f + ViewportOffset.Y) * InvBufferSize.Y);
+
+
 			{
 				FRestirGITemporalResampling::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGITemporalResampling::FParameters>();
 
@@ -709,8 +721,7 @@
 				PassParameters->TemporalDepthRejectionThreshold = FMath::Clamp(CVarRestirGITemporalDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
 				PassParameters->TemporalNormalRejectionThreshold = FMath::Clamp(CVarRestirGITemporalNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
 				PassParameters->ApplyApproximateVisibilityTest = CVarRestirGITemporalApplyApproxVisibility.GetValueOnAnyThread();
-				// PassParameters->InitialCandidates = FMath::Max(1, InitialCandidates);
-				//PassParameters->InitialSampleVisibility = CVarRayTracingRestirGITestInitialVisibility.GetValueOnRenderThread();
+				PassParameters->HistoryScreenPositionScaleBias = HistoryScreenPositionScaleBias;
 
 				PassParameters->GIReservoirHistory = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(View.PrevViewInfo.RestirGIHistory.GIReservoirs));
 				PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
@@ -792,7 +803,7 @@
 				PassParameters->NeighborOffsets = GRestiGIDiscSampleBuffer.DiscSampleBufferSRV;
 
 				PassParameters->RestirGICommonParameters = CommonParameters;
-
+				PassParameters->SSAOTex = GetActiveSceneTextures().ScreenSpaceAO;
 				FRestirGISpatialResampling::FPermutationDomain PermutationVector;
 				PermutationVector.Set<FRestirGISpatialResampling::FFUseRestirBiasDim>(CVarRayTracingRestirGIEnableSpatialBias.GetValueOnRenderThread());
 

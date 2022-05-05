@@ -93,7 +93,8 @@ float TemporalNormalRejectionThreshold;
 
 uint NeighborOffsetMask;
 Buffer<float2> NeighborOffsets;
-
+Texture2D		SSAOTex;
+float4 			HistoryScreenPositionScaleBias;
 #if USE_SURFEL
 #include "../SurfelGI/SurfelCommon.ush"
 ByteAddressBuffer SurfelMetaBuf;
@@ -602,6 +603,39 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
 	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
 }
 
+float2 GetReprojectedBufferUV(float2 ScreenPos, float SceneDepth, float4 EncodedVelocity)
+{
+	float DeviceZ = ConvertToDeviceZ(SceneDepth);
+	float4 ThisClip = float4(ScreenPos, DeviceZ, 1);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+	float2 PrevScreenPos = PrevClip.xy / PrevClip.w;
+	if (EncodedVelocity.x > 0.0)
+	{
+		// #yuriy_todo: use full 3D velocity when it's available
+		PrevScreenPos = ThisClip.xy - DecodeVelocityFromTexture(EncodedVelocity).xy;
+	}
+
+	PrevScreenPos.xy = clamp(PrevScreenPos.xy, (float2)-1, (float2)1);
+
+	return PrevScreenPos.xy * HistoryScreenPositionScaleBias.xy + HistoryScreenPositionScaleBias.zw;
+}
+
+bool DisocclusionHeuristic(float2 ScreenPos, float DeviceZ, float2 HistoryUV)
+{
+	float PrevDeviceZ = DepthHistory.SampleLevel(GlobalPointClampedSampler, HistoryUV, 0).r;
+	float4 ThisClip = float4(ScreenPos, DeviceZ, 1);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+	float3 PrevExpectedDeviceZ = PrevClip.z / PrevClip.w;
+
+	float3 CameraVelocity = LWCToFloat(LWCSubtract(PrimaryView.WorldViewOrigin, PrimaryView.PrevWorldViewOrigin));
+
+	float CompensatedPrevDeviceZ = ConvertToDeviceZ(ConvertFromDeviceZ(PrevDeviceZ) + length(CameraVelocity));
+
+	// Empirically chosen threshold to balance between aliasing/noise from false positives and ghosting from false negatives
+	float DisocclusionMaxDeviceZ = 0.001;
+
+	return and(PrevDeviceZ - DeviceZ > DisocclusionMaxDeviceZ, CompensatedPrevDeviceZ - PrevExpectedDeviceZ > DisocclusionMaxDeviceZ);
+}
 /***************************************************************************************************
  *
  *  ApplyTemporalResampling
@@ -628,10 +662,16 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
 
 	float3 DiffuseColor = GBuffer.DiffuseColor;
-	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsDepthValid = DeviceZ > 0.0 && DeviceZ < 0.999;
 	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
 
 	float3 WorldNormal = GBuffer.WorldNormal;
+
+	float2 BufferUV = (float2(PixelCoord) + 0.5) * View.ViewSizeAndInvSize.zw;
+	const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+
 	if (bIsValidPixel)
 	{
 		RTXGI_Reservoir curSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
@@ -646,9 +686,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 		int2 prevPos = PixelCoord;
 		float ExpectedPrevLinearDepth = GBuffer.Depth;
 
-		float2 ViewUV = (float2(PixelCoord) + 0.5) * View.ViewSizeAndInvSize.zw;
-		float4 NDC = float4(ViewUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
-
+		float4 NDC = float4(BufferUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
 #if GBUFFER_HAS_VELOCITY && 0
 		// Some objects can get marked as not having velocities, which leads to DecodeGBuffer zeroing them
 		// This appears to be errant under some conditions, so overriding the rejection produces better results
@@ -672,12 +710,14 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
 		}
 
+		// float4 EncodedVelocity = Texture2DSampleLevel(GBufferVelocityTexture, GlobalPointClampedSampler, BufferUV, 0);
+		// float2 PrevUV = GetReprojectedBufferUV(ScreenPos, SceneDepth, EncodedVelocity);
+		// prevPos =   PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
 
 		//ToDo - full GBuffer not available for last frame, so we're going to need to approximate using current + channels we have
 		// could make a better approximation than what is used here
-		FGBufferData PrevGBuffer = GBuffer;
-		bool foundNeighbor = false;
-		const float radius = 4;
+		bool foundNeighbor = false;//DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), PrevUV);
+		const float radius = 3;
 
 		// Try to find a matching surface in the neighborhood of the reprojected pixel
 		for (int i = 0; i < 9; i++)
@@ -702,10 +742,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			{
 				continue;
 			}
-
-			PrevGBuffer.WorldNormal = PrevWorldNormal;
-			PrevGBuffer.Depth = PrevDepth;
-
 			prevPos = idx;
 			foundNeighbor = true;
 			break;
@@ -719,7 +755,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 		{
 			// Resample the previous frame sample into the current reservoir, but reduce the gisample's weight
 			// according to the bilinear weight of the current pixel
-			const uint2 prePosId = clamp(uint2(prevPos / float(UpscaleFactor)), uint2(0,0), ReservoirBufferDim.xy - 1);
+			const uint2 prePosId = clamp(floor(prevPos / float(UpscaleFactor) ), uint2(0,0), ReservoirBufferDim.xy - 1);
 
 			RTXGI_Reservoir prevSample = RTXGI_Reservoir::Load(ReadReservoirHistoryData(prePosId, HistoryReservoir));
 			prevSample.M = min(prevSample.M, historyLimit);
@@ -863,8 +899,11 @@ void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuf
 	NumSamples = min(NumSamples, 32);
 	// NumSamples = min(NumSamples, 300);
 #endif
-
-	for (int i = 0; i < NumSamples; ++i)
+	// const float SSAOFactor = smoothstep(5.0, 10.0, centerSample.M);
+    // float KernelRadius = lerp(SpatialSamplingRadius, 32, lerp(1, SSAOTex[PixelCoord].r, SSAOFactor));
+	// const float AngleOffset = 2 * PI * RandContext.GenerateSample1D();
+	const int TARGET_M = 512;
+	for (int i = 0; i < NumSamples && state.M < TARGET_M; ++i)
 	{
 
 #if !USE_LDS_FOR_SPATIAL_RESAMPLE
