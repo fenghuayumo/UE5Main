@@ -95,6 +95,7 @@ DECLARE_GPU_STAT(SkyLightDiffuse);
 int GetReflectionEnvironmentCVar();
 bool IsAmbientCubemapPassRequired(const FSceneView& View);
 
+extern bool IsRestirGIDenoiserEnabled(const FViewInfo& View);
 class FDiffuseIndirectCompositePS : public FGlobalShader
 {
 	DECLARE_GLOBAL_SHADER(FDiffuseIndirectCompositePS)
@@ -920,7 +921,7 @@ void FDeferredShadingSceneRenderer::RenderDiffuseIndirectAndAmbientOcclusion(
 		{
 			// NOP
 		}
-		else if (ViewPipelineState.DiffuseIndirectDenoiser == IScreenSpaceDenoiser::EMode::Disabled)
+		else if (ViewPipelineState.DiffuseIndirectDenoiser == IScreenSpaceDenoiser::EMode::Disabled || IsRestirGIDenoiserEnabled(View))
 		{
 			DenoiserOutputs.Textures[0] = DenoiserInputs.Color;
 			DenoiserOutputs.Textures[1] = SystemTextures.White;
@@ -937,7 +938,7 @@ void FDeferredShadingSceneRenderer::RenderDiffuseIndirectAndAmbientOcclusion(
 				DenoiserToUse->GetDebugName(),
 				View.ViewRect.Width(), View.ViewRect.Height());
 
-			if (ViewPipelineState.DiffuseIndirectMethod == EDiffuseIndirectMethod::RTGI)
+			if (ViewPipelineState.DiffuseIndirectMethod == EDiffuseIndirectMethod::RTGI )
 			{
 				DenoiserOutputs = DenoiserToUse->DenoiseDiffuseIndirect(
 					GraphBuilder,

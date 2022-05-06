@@ -734,6 +734,18 @@ public:
 	/** Number of consecutive frames the camera is static */
 	uint32 NumCameraStaticFrames;
 	int32 RayTracingNumIterations;
+
+	//Surfel
+	TRefCountPtr<FRDGPooledBuffer> SurfelMetaBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelGridMetaBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelEntryCellBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelPoolBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelLifeBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelVertexBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelIrradianceBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelRePositionBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelRePositionCountBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelAuxiBuf;
 #endif
 
 	// A counter incremented once each time this view is rendered.

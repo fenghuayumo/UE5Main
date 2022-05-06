@@ -159,11 +159,52 @@
     	TEXT("Whether to Use Surfel"),
     	ECVF_RenderThreadSafe);
 
+	static TAutoConsoleVariable<float> CVarRestirPlaneDistanceRejectionThreshold(
+	TEXT("r.Fusion.Temporal.PlaneDistanceRejectionThreshold"), 50.0f,
+	TEXT("Rejection threshold for rejecting samples based on plane distance differences (default 50.0)"),
+	ECVF_RenderThreadSafe);
+
+TAutoConsoleVariable<int32> CVarRestirGIDenoiser(
+	TEXT("r.Fusion.RestirGI.Denoiser"), 1,
+	TEXT("Whether to apply RestirGI Denoiser"),
+	ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<int32> CVarRestirGIDenoiserSpatialUseSSAO(
+	TEXT("r.Fusion.RestirGI.Denoiser.UseSSAO"), 0,
+	TEXT("whether use ssao to strength detail default(0)."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRestirGIDenoiserSpatialEnabled(
+	TEXT("r.Fusion.RestirGI.Denoiser.Spatial"), 1,
+	TEXT("whether use spatial filter."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRestirGIDenoiserTemporalEnabled(
+	TEXT("r.Fusion.RestirGI.Denoiser.Temporal"), 1,
+	TEXT("whether use Temporal filter."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRestirGIUseScreenReprojection(
+	TEXT("r.Fusion.RestirGI.UseScreenReprojection"), 0,
+	TEXT("whether use Screen Reprojection GI."),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
+	TEXT("r.Fusion.RestirGI.Denioser.Spatial.ReconstructSampleCount"), 4,
+	TEXT("ReconstructSampleCount (default 4)"),
+	ECVF_RenderThreadSafe);
+
+
     DECLARE_GPU_STAT_NAMED(RayTracingGIRestir, TEXT("Ray Tracing GI: Restir"));
     DECLARE_GPU_STAT_NAMED(RestirGenerateSample, TEXT("Ray Tracing GI: GenerateSample"));
     DECLARE_GPU_STAT_NAMED(RestirTemporalResampling, TEXT("Ray Tracing GI: TemporalResampling"));
     DECLARE_GPU_STAT_NAMED(RestirSpatioalResampling, TEXT("Ray Tracing GI: SpatioalResampling"));
     DECLARE_GPU_STAT_NAMED(RestirEvaluateGI, TEXT("Ray Tracing GI: EvaluateGI"));
+	DECLARE_GPU_STAT_NAMED(RestirGIDenoiser, TEXT("RestirGI: Denoise"));
+
+	bool IsRestirGIDenoiserEnabled(const FViewInfo& View)
+	{
+		return CVarRestirGIDenoiser.GetValueOnRenderThread() == 1 && IsRestirGIEnabled(View);
+	}
 
     struct RTXGI_PackedReservoir
     {
@@ -171,6 +212,7 @@
     	FIntVector4		CreationGeometry;
     	FIntVector4		HitGeometry;
     	FIntVector4		LightInfo;
+		// FIntVector4		ExtraInfo;
     };
 
     BEGIN_SHADER_PARAMETER_STRUCT(FRestirGICommonParameters, )
@@ -542,6 +584,471 @@
     	}
     }
     #endif
+	
+
+class FReprojectionMapCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FReprojectionMapCS)
+	SHADER_USE_PARAMETER_STRUCT(FReprojectionMapCS, FGlobalShader)
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		//OutEnvironment.CompilerFlags.Add(CFLAG_WarningsAsErrors);
+		OutEnvironment.CompilerFlags.Add(CFLAG_AllowTypedUAVLoads);
+		OutEnvironment.CompilerFlags.Add(CFLAG_ForceDXC);
+		OutEnvironment.SetDefine(TEXT("THREAD_BLOCK_SIZE"), GetThreadBlockSize());
+	}
+
+	static uint32 GetThreadBlockSize()
+	{
+		return 8;
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+      
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VelocityTexture)
+
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthHistory)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalHistory)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWReprojectionTex)
+
+		SHADER_PARAMETER_SAMPLER(SamplerState, PointClampSampler)
+		SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
+		SHADER_PARAMETER(FVector4f, BufferTexSize)
+        SHADER_PARAMETER(float, TemporalNormalRejectionThreshold)
+        SHADER_PARAMETER(float, TemporalDepthRejectionThreshold)
+        SHADER_PARAMETER(float, PlaneDistanceRejectionThrehold)
+        
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FReprojectionMapCS, "/Engine/Private/RestirGI/ReprojectionMap.usf", "ReprojectionMapCS", SF_Compute);
+
+void CalculateProjectionMap(FRDGBuilder& GraphBuilder, FViewInfo& View,  const FSceneTextureParameters& SceneTextures)
+{
+    FRDGTextureRef GBufferATexture = SceneTextures.GBufferATexture;
+    FRDGTextureRef GBufferBTexture = SceneTextures.GBufferBTexture;
+    FRDGTextureRef GBufferCTexture = SceneTextures.GBufferCTexture;
+    FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+    FRDGTextureRef SceneVelocityTexture = SceneTextures.GBufferVelocityTexture;
+
+	FIntPoint TexSize = SceneTextures.SceneDepthTexture->Desc.Extent;
+	//FIntPoint TexSize = FIntPoint(SceneTextures.SceneDepthTexture->Desc.Extent.X* Config.ResolutionFraction, SceneTextures.SceneDepthTexture->Desc.Extent.Y * Config.ResolutionFraction);
+	FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+
+    FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+        SceneTextures.SceneDepthTexture->Desc.Extent,
+        PF_FloatRGBA,
+        FClearValueBinding::None,
+        TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+	auto ReprojectionTex =  GraphBuilder.CreateTexture(Desc, TEXT("ReprojectionTex"));
+
+	FReprojectionMapCS::FPermutationDomain PermutationVector;
+	TShaderMapRef<FReprojectionMapCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+	FReprojectionMapCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FReprojectionMapCS::FParameters>();
+	
+	PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+	PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+
+	PassParameters->NormalTexture = GBufferATexture;
+	PassParameters->DepthTexture = SceneDepthTexture;
+	PassParameters->VelocityTexture = SceneVelocityTexture;
+	PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+	PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+	PassParameters->TemporalNormalRejectionThreshold = CVarRestirGISpatialNormalRejectionThreshold.GetValueOnRenderThread();
+	PassParameters->TemporalDepthRejectionThreshold = CVarRestirGISpatialDepthRejectionThreshold.GetValueOnRenderThread();
+	PassParameters->PlaneDistanceRejectionThrehold = CVarRestirPlaneDistanceRejectionThreshold.GetValueOnRenderThread();
+	PassParameters->RWReprojectionTex = GraphBuilder.CreateUAV(ReprojectionTex);
+	PassParameters->BufferTexSize = BufferTexSize;
+	ClearUnusedGraphResources(ComputeShader, PassParameters);
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("ReprojectionMapCS"),
+		ComputeShader,
+		PassParameters,
+		FComputeShaderUtils::GetGroupCount(TexSize, FReprojectionMapCS::GetThreadBlockSize()));
+	View.ProjectionMapTexture = ReprojectionTex;
+}
+
+
+///
+/// RestirGI Denoiser
+///
+enum class ERestirGITemporalFilterStage
+{
+    ResetHistory = 0,
+    ReprojectHistory = 1,
+    TemporalAccum = 2,
+	MAX
+};
+
+class FRestirGITemporalFilterCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FRestirGITemporalFilterCS)
+	SHADER_USE_PARAMETER_STRUCT(FRestirGITemporalFilterCS, FGlobalShader)
+
+    // class FResetHistoryDim : SHADER_PERMUTATION_BOOL("RESET_HISTORY");
+    // class FReprojectHistoryDim : SHADER_PERMUTATION_BOOL("REPROJECT_HISTORY");
+	// using FPermutationDomain = TShaderPermutationDomain<FResetHistoryDim, FReprojectHistoryDim>;
+	class FStageDim : SHADER_PERMUTATION_ENUM_CLASS("DIM_STAGE", ERestirGITemporalFilterStage);
+    using FPermutationDomain = TShaderPermutationDomain<FStageDim>;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		//OutEnvironment.CompilerFlags.Add(CFLAG_WarningsAsErrors);
+		OutEnvironment.CompilerFlags.Add(CFLAG_AllowTypedUAVLoads);
+		OutEnvironment.CompilerFlags.Add(CFLAG_ForceDXC);
+		OutEnvironment.SetDefine(TEXT("THREAD_BLOCK_SIZE"), GetThreadBlockSize());
+	}
+
+	static uint32 GetThreadBlockSize()
+	{
+		return 8;
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTex)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, HistoryTex)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VarianceHistoryTex)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWOutputTex)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWHistoryTex)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWVarianceTex)
+
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, VelocityTexture)
+         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ReprojectionTex)
+
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthHistory)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalHistory)
+
+		SHADER_PARAMETER_SAMPLER(SamplerState, PointClampSampler)
+		SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
+		SHADER_PARAMETER(FVector4f, BufferTexSize)
+        SHADER_PARAMETER(float, TemporalNormalRejectionThreshold)
+        SHADER_PARAMETER(float, TemporalDepthRejectionThreshold)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FRestirGITemporalFilterCS, "/Engine/Private/RestirGI/TemporalFilter.usf", "TemporalFilter", SF_Compute);
+
+enum class ERestirGISpatialFilterStage
+{
+    PreConvolution = 0,
+    PostFiltering = 1,
+    MAX
+};
+
+class FRestirGISpatialFilterCS : public FGlobalShader
+{
+	DECLARE_GLOBAL_SHADER(FRestirGISpatialFilterCS)
+	SHADER_USE_PARAMETER_STRUCT(FRestirGISpatialFilterCS, FGlobalShader)
+	class FUseSSAODim : SHADER_PERMUTATION_BOOL("USE_SSAO_STEERING");
+	class FStageDim : SHADER_PERMUTATION_ENUM_CLASS("DIM_STAGE", ERestirGISpatialFilterStage);
+	using FPermutationDomain = TShaderPermutationDomain<FUseSSAODim, FStageDim>;
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		//OutEnvironment.CompilerFlags.Add(CFLAG_WarningsAsErrors);
+		OutEnvironment.CompilerFlags.Add(CFLAG_AllowTypedUAVLoads);
+		OutEnvironment.CompilerFlags.Add(CFLAG_ForceDXC);
+		OutEnvironment.SetDefine(TEXT("THREAD_BLOCK_SIZE"), GetThreadBlockSize());
+	}
+
+	static uint32 GetThreadBlockSize()
+	{
+		return 8;
+	}
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSAOTex)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTex)
+        SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWFilteredTex)
+        
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTexture)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthTexture)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, BaseColorTexture)
+
+		SHADER_PARAMETER_SAMPLER(SamplerState, PointClampSampler)
+		SHADER_PARAMETER_SAMPLER(SamplerState, LinearClampSampler)
+		SHADER_PARAMETER(FVector4f, BufferTexSize)
+        SHADER_PARAMETER(int, UpscaleFactor)
+		SHADER_PARAMETER(int, ReconstructSampleCount)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+
+	END_SHADER_PARAMETER_STRUCT()
+};
+IMPLEMENT_GLOBAL_SHADER(FRestirGISpatialFilterCS, "/Engine/Private/RestirGI/SpatialFilter.usf", "SpatialFilter", SF_Compute);
+
+
+void PrefilterRestirGI(FRDGBuilder& GraphBuilder,
+	const FViewInfo& View,
+	FPreviousViewInfo* PreviousViewInfos,
+	const FSceneTextureParameters& SceneTextures,
+	IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+	const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& Config)
+{
+
+	FRDGTextureRef GBufferATexture = SceneTextures.GBufferATexture;
+	FRDGTextureRef GBufferBTexture = SceneTextures.GBufferBTexture;
+	FRDGTextureRef GBufferCTexture = SceneTextures.GBufferCTexture;
+	FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+	FRDGTextureRef SceneVelocityTexture = SceneTextures.GBufferVelocityTexture;
+
+	FIntPoint TexSize = SceneTextures.SceneDepthTexture->Desc.Extent;
+	FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+
+	FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+		SceneTextures.SceneDepthTexture->Desc.Extent,
+		PF_FloatRGBA,
+		FClearValueBinding::None,
+		TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+	auto PreOutputTex = GraphBuilder.CreateTexture(Desc, TEXT("DiffuseIndirectPreConvolution0"));
+	uint32 IterationCount = 1;
+	uint32 SequenceCount = 1;
+	uint32 DimensionCount = 24;
+
+	FRestirGISpatialFilterCS::FParameters CommonParameters;
+
+	{
+		FRestirGISpatialFilterCS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FRestirGISpatialFilterCS::FUseSSAODim>(CVarRestirGIDenoiserSpatialUseSSAO.GetValueOnRenderThread() > 0);
+		PermutationVector.Set<FRestirGISpatialFilterCS::FStageDim>(ERestirGISpatialFilterStage::PreConvolution);
+		TShaderMapRef<FRestirGISpatialFilterCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+		FRestirGISpatialFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGISpatialFilterCS::FParameters>();
+		*PassParameters = CommonParameters;
+		PassParameters->InputTex = OutDenoiserInputs->Color;
+		PassParameters->RWFilteredTex = GraphBuilder.CreateUAV(PreOutputTex);
+		PassParameters->SSAOTex = View.ScreenSpaceAO;
+		PassParameters->NormalTexture = GBufferATexture;
+		PassParameters->DepthTexture = SceneDepthTexture;
+
+		PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+
+		FIntPoint HalfTexSize = FIntPoint(TexSize.X * Config.ResolutionFraction, TexSize.Y * Config.ResolutionFraction);
+		PassParameters->BufferTexSize = FVector4f(HalfTexSize.X, HalfTexSize.Y, 1.0 / HalfTexSize.X, 1.0 / HalfTexSize.Y);
+		PassParameters->UpscaleFactor = int32(1.0 / Config.ResolutionFraction);
+		PassParameters->ReconstructSampleCount = CVarFusionReconstructSampleCount.GetValueOnRenderThread(); 
+		ClearUnusedGraphResources(ComputeShader, PassParameters);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("DiffuseIndirect Pre SpatioalFilter"),
+			ComputeShader,
+			PassParameters,
+			FComputeShaderUtils::GetGroupCount(TexSize, FRestirGISpatialFilterCS::GetThreadBlockSize()));
+	}
+	OutDenoiserInputs->Color = PreOutputTex;
+}
+
+void ReprojectRestirGI(FRDGBuilder& GraphBuilder, 
+	FViewInfo& View, 
+	FPreviousViewInfo* PreviousViewInfos, 
+	const FSceneTextureParameters& SceneTextures, 
+	IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs, 
+	const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& Config)
+{
+    FRDGTextureRef GBufferATexture = SceneTextures.GBufferATexture;
+    FRDGTextureRef GBufferBTexture = SceneTextures.GBufferBTexture;
+    FRDGTextureRef GBufferCTexture = SceneTextures.GBufferCTexture;
+    FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+    FRDGTextureRef SceneVelocityTexture = SceneTextures.GBufferVelocityTexture;
+
+	FIntPoint TexSize = SceneTextures.SceneDepthTexture->Desc.Extent;
+    FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+
+	FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+	SceneTextures.SceneDepthTexture->Desc.Extent,
+	PF_FloatRGBA,
+	FClearValueBinding::None,
+	TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+	auto ReprojectedHistoryTex =  GraphBuilder.CreateTexture(Desc, TEXT("DiffuseIndirectReprojected"));
+
+	if( !PreviousViewInfos->FusionDiffuseIndirectHistory.RT[0] )
+	{
+		uint32 ClearValues[4] = { 0, 0, 0, 0 };
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ReprojectedHistoryTex), ClearValues);
+		//PreviousViewInfos->ProjectedRestirGITexture = GSystemTextures.BlackDummy;
+	}
+	else
+	{
+		FRestirGITemporalFilterCS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FRestirGITemporalFilterCS::FStageDim>(ERestirGITemporalFilterStage::ReprojectHistory);
+		TShaderMapRef<FRestirGITemporalFilterCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+		FRestirGITemporalFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGITemporalFilterCS::FParameters>();
+		PassParameters->HistoryTex = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionDiffuseIndirectHistory.RT[0]);
+		PassParameters->RWHistoryTex = GraphBuilder.CreateUAV(ReprojectedHistoryTex);
+		PassParameters->ReprojectionTex = View.ProjectionMapTexture;
+		PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+
+		PassParameters->BufferTexSize = BufferTexSize;
+		ClearUnusedGraphResources(ComputeShader, PassParameters);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("ReprojectRestirGI"),
+			ComputeShader,
+			PassParameters,
+			FComputeShaderUtils::GetGroupCount(TexSize, FRestirGITemporalFilterCS::GetThreadBlockSize()));
+
+	}
+	//  PreviousViewInfos->ProjectedRestirGITexture = ReprojectedHistoryTex;
+	View.ProjectedRestirGITexture = ReprojectedHistoryTex;
+}
+
+void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs, const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& Config)
+{
+    RDG_GPU_STAT_SCOPE(GraphBuilder, RestirGIDenoiser);
+	RDG_EVENT_SCOPE(GraphBuilder, "RestirGIDenoiser");
+	PrefilterRestirGI(GraphBuilder, View, PreviousViewInfos, SceneTextures, OutDenoiserInputs, Config);
+
+
+    FRDGTextureRef GBufferATexture = SceneTextures.GBufferATexture;
+    FRDGTextureRef GBufferBTexture = SceneTextures.GBufferBTexture;
+    FRDGTextureRef GBufferCTexture = SceneTextures.GBufferCTexture;
+    FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+    FRDGTextureRef SceneVelocityTexture = SceneTextures.GBufferVelocityTexture;
+
+	FIntPoint TexSize = SceneTextures.SceneDepthTexture->Desc.Extent;
+    FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+
+    FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
+        SceneTextures.SceneDepthTexture->Desc.Extent,
+        PF_FloatRGBA,
+        FClearValueBinding::None,
+        TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+    
+    auto OutputTex =  GraphBuilder.CreateTexture(Desc, TEXT("DenoisedDiffuse"));
+    auto TemporalOutTex =  GraphBuilder.CreateTexture(Desc, TEXT("DiffuseIndirectTemporalAccumulation0"));
+    Desc.Format = PF_G32R32F;
+    auto VarianceTex = GraphBuilder.CreateTexture(Desc, TEXT("DiffuseVariance"));
+    FRDGTextureRef TemporalHistTex = nullptr, VarianceHistTex = nullptr;
+    bool ResetHistory = !PreviousViewInfos->FusionDiffuseIndirectHistory.RT[0];
+    FRDGTextureRef OutputSignal = OutDenoiserInputs->Color;
+   
+    if( CVarRestirGIDenoiserTemporalEnabled.GetValueOnRenderThread() > 0)
+    {
+        if( ResetHistory )
+        {
+            FRestirGITemporalFilterCS::FPermutationDomain PermutationVector;
+            PermutationVector.Set<FRestirGITemporalFilterCS::FStageDim>(ERestirGITemporalFilterStage::ResetHistory);
+            TShaderMapRef<FRestirGITemporalFilterCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+            FRestirGITemporalFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGITemporalFilterCS::FParameters>();
+            PassParameters->InputTex = OutDenoiserInputs->Color;
+            PassParameters->RWHistoryTex = GraphBuilder.CreateUAV(TemporalOutTex);
+            PassParameters->RWVarianceTex =  GraphBuilder.CreateUAV(VarianceTex);
+            ClearUnusedGraphResources(ComputeShader, PassParameters);
+            FComputeShaderUtils::AddPass(
+                GraphBuilder,
+                RDG_EVENT_NAME("FDiffuseIndirectTemporalFilter"),
+                ComputeShader,
+                PassParameters,
+                FComputeShaderUtils::GetGroupCount(TexSize, FRestirGITemporalFilterCS::GetThreadBlockSize()));
+			OutputSignal = OutputTex;
+        }
+        else
+        {
+            {
+                FRestirGITemporalFilterCS::FPermutationDomain PermutationVector;
+                PermutationVector.Set<FRestirGITemporalFilterCS::FStageDim>(ERestirGITemporalFilterStage::TemporalAccum);
+                TShaderMapRef<FRestirGITemporalFilterCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+                FRestirGITemporalFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGITemporalFilterCS::FParameters>();
+                PassParameters->HistoryTex = (View.ProjectedRestirGITexture);
+                PassParameters->VarianceHistoryTex = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionDiffuseIndirectHistory.RT[1]);
+            
+                PassParameters->InputTex = OutDenoiserInputs->Color;
+                PassParameters->RWHistoryTex = GraphBuilder.CreateUAV(TemporalOutTex);
+                PassParameters->RWOutputTex = GraphBuilder.CreateUAV(OutputTex);
+                PassParameters->RWVarianceTex =  GraphBuilder.CreateUAV(VarianceTex);
+            
+                PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+                PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+                PassParameters->ReprojectionTex = View.ProjectionMapTexture;
+
+                PassParameters->NormalTexture = GBufferATexture;
+                PassParameters->DepthTexture = SceneDepthTexture;
+                PassParameters->VelocityTexture = SceneVelocityTexture;
+                PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+                PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+                PassParameters->TemporalNormalRejectionThreshold = CVarRestirGITemporalNormalRejectionThreshold.GetValueOnRenderThread();
+                PassParameters->TemporalDepthRejectionThreshold = CVarRestirGITemporalDepthRejectionThreshold.GetValueOnRenderThread();
+
+                PassParameters->BufferTexSize = BufferTexSize;
+                ClearUnusedGraphResources(ComputeShader, PassParameters);
+                FComputeShaderUtils::AddPass(
+                    GraphBuilder,
+                    RDG_EVENT_NAME("FDiffuseIndirectAccum"),
+                    ComputeShader,
+                    PassParameters,
+                    FComputeShaderUtils::GetGroupCount(TexSize, FRestirGITemporalFilterCS::GetThreadBlockSize()));
+                OutputSignal = OutputTex;
+            }
+        }
+    }
+
+    if (!View.bStatePrevViewInfoIsReadOnly && CVarRestirGIDenoiserTemporalEnabled.GetValueOnRenderThread() > 0)
+	{
+		//Extract history feedback here
+		GraphBuilder.QueueTextureExtraction(TemporalOutTex, &View.ViewState->PrevFrameViewInfo.FusionDiffuseIndirectHistory.RT[0]);
+        GraphBuilder.QueueTextureExtraction(VarianceTex, &View.ViewState->PrevFrameViewInfo.FusionDiffuseIndirectHistory.RT[1]);
+	}
+
+    if( CVarRestirGIDenoiserSpatialEnabled.GetValueOnRenderThread() > 0)
+    {
+		FRestirGISpatialFilterCS::FPermutationDomain PermutationVector;
+		PermutationVector.Set<FRestirGISpatialFilterCS::FUseSSAODim>(CVarRestirGIDenoiserSpatialUseSSAO.GetValueOnRenderThread() > 0);
+        PermutationVector.Set<FRestirGISpatialFilterCS::FStageDim>(ERestirGISpatialFilterStage::PostFiltering);
+        TShaderMapRef<FRestirGISpatialFilterCS> ComputeShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+        FRestirGISpatialFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGISpatialFilterCS::FParameters>();
+        PassParameters->SSAOTex = View.ScreenSpaceAO;
+        PassParameters->NormalTexture = GBufferATexture;
+        PassParameters->DepthTexture = SceneDepthTexture;
+        PassParameters->RWFilteredTex =  GraphBuilder.CreateUAV(OutputSignal);
+        PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+
+        PassParameters->BufferTexSize = BufferTexSize;
+        PassParameters->UpscaleFactor = int32(1.0 /Config.ResolutionFraction); 
+		PassParameters->ReconstructSampleCount = CVarFusionReconstructSampleCount.GetValueOnRenderThread(); 
+        ClearUnusedGraphResources(ComputeShader, PassParameters);
+        FComputeShaderUtils::AddPass(
+            GraphBuilder,
+            RDG_EVENT_NAME("DiffuseIndirect Post SpatioalFilter"),
+            ComputeShader,
+            PassParameters,
+            FComputeShaderUtils::GetGroupCount(TexSize, FRestirGISpatialFilterCS::GetThreadBlockSize()));
+         OutputSignal = OutputTex;
+    }
+	 OutDenoiserInputs->Color = OutputSignal;
+}
+
     void  GenerateInitialSample(
         FRDGBuilder& GraphBuilder,
         FSceneTextureParameters& SceneTextures,
@@ -630,6 +1137,11 @@
     {
     	RDG_GPU_STAT_SCOPE(GraphBuilder, RayTracingGIRestir);
     	RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: Ressampling");
+
+		View.ScreenSpaceAO = GetActiveSceneTextures().ScreenSpaceAO;
+		CalculateProjectionMap(GraphBuilder, View, SceneTextures);
+		if( CVarRestirGIDenoiser.GetValueOnRenderThread() > 0)
+			ReprojectRestirGI(GraphBuilder, View, &View.PrevViewInfo, SceneTextures, OutDenoiserInputs, RayTracingConfig);
 
         float MaxShadowDistance = 1.0e27;
     	if (GRayTracingGlobalIlluminationMaxShadowDistance > 0.0)
@@ -787,7 +1299,6 @@
 
 				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-				//PassParameters->SSProfilesTexture = GraphBuilder.RegisterExternalTexture(View.RayTracingSubSurfaceProfileTexture);
 
 				PassParameters->InputSlice = Reservoir - 1;
 				PassParameters->OutputSlice = Reservoir;
@@ -871,6 +1382,13 @@
 
     		View.ViewState->PrevFrameViewInfo.RestirGIHistory.ReservoirDimensions = ReservoirHistoryBufferDim;
     	}
+
+		//denoise
+		if( CVarRestirGIDenoiser.GetValueOnRenderThread() > 0)
+		{
+			DenoiseRestirGI(GraphBuilder,View, &View.PrevViewInfo, SceneTextures, OutDenoiserInputs, RayTracingConfig);
+		}
+
     }
 
     #endif // RHI_RAYTRACING
