@@ -8,6 +8,7 @@ struct RTXGI_PackedReservoir
 	uint4 CreationGeometry;
 	uint4 HitGeometry;
 	uint4 LightInfo;
+	// uint4 ExtraInfo; 
 };
 
 RWStructuredBuffer<RTXGI_PackedReservoir> RWGIReservoirUAV;
@@ -140,6 +141,7 @@ struct RTXGI_Reservoir
 	float weightSum;
 	float targetPdf;
 	uint M;
+	// float W;
 
 	static RTXGI_Reservoir Empty()
 	{
@@ -148,6 +150,7 @@ struct RTXGI_Reservoir
 		s.targetPdf = 0;
 		s.weightSum = 0;
 		s.M = 0;
+		// s.W = 0;
 		return s;
 	}
 
@@ -168,7 +171,7 @@ struct RTXGI_Reservoir
 
 		res.weightSum = asfloat(LightInfo.z );
 		res.targetPdf = asfloat(LightInfo.w);
-
+		// res.W = asfloat(data.ExtraInfo.x);
 		// Discard reservoirs that have Inf/NaN
 		if (isinf(res.weightSum) || isnan(res.weightSum)) {
 			res = Empty();
@@ -196,6 +199,7 @@ struct RTXGI_Reservoir
 		LightInfo.w = asuint(targetPdf);
 		data.LightInfo = LightInfo;
 		
+		// data.ExtraInfo = uint4(asuint(W), 0,0,0);
 		return data;
 	}
 
@@ -205,6 +209,7 @@ struct RTXGI_Reservoir
 
 		weightSum = (denominator == 0.0) ? 0.0 : (weightSum * normalizationNumerator) / denominator;
 		// weightSum = min(weightSum, RESTIR_RESERVOIR_W_CLAMP);
+		// W = (denominator == 0.0) ? 0.0 : (weightSum * normalizationNumerator) / denominator;
 	}
 
 	bool StreamSample(RTXGI_SampleRef newSampleRef, float random, float newTargetPdf, float invSourcePdf)
@@ -260,9 +265,10 @@ struct RTXGI_Reservoir
 #define COSINE_TARGET_PDF 0
 float GetTargetPdf(float3 Irradiance, float3 Normal, float3 Position, float3 SamplePosition)
 {
+	const float3 LumaVec = float3(0.299, 0.587, 0.114);
 #if COSINE_TARGET_PDF
-	return dot(Irradiance, 1) * max(0.1, dot(Normal, normalize(SamplePosition - Position)));
+	return max(1e-3, dot(Irradiance, LumaVec) * max(0.1, dot(Normal, normalize(SamplePosition - Position))));
 #else
-	return dot(Irradiance, 1);
+	return max(1e-3, dot(Irradiance, LumaVec));
 #endif
 }

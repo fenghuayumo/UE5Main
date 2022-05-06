@@ -684,7 +684,8 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 
 		// start by just using our sample position
 		int2 prevPos = PixelCoord;
-		float ExpectedPrevLinearDepth = GBuffer.Depth;
+		float SceneDepth =  GBuffer.Depth;
+		float ExpectedPrevLinearDepth = SceneDepth;
 
 		float4 NDC = float4(BufferUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
 #if GBUFFER_HAS_VELOCITY && 0
@@ -716,7 +717,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 
 		//ToDo - full GBuffer not available for last frame, so we're going to need to approximate using current + channels we have
 		// could make a better approximation than what is used here
-		bool foundNeighbor = false;//DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), PrevUV);
+		bool foundNeighbor = true;//DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), PrevUV);
 		const float radius = 3;
 
 		// Try to find a matching surface in the neighborhood of the reprojected pixel
@@ -755,10 +756,10 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 		{
 			// Resample the previous frame sample into the current reservoir, but reduce the gisample's weight
 			// according to the bilinear weight of the current pixel
-			const uint2 prePosId = clamp(floor(prevPos / float(UpscaleFactor) ), uint2(0,0), ReservoirBufferDim.xy - 1);
+			const uint2 prePosId = clamp(floor(prevPos / float(UpscaleFactor)  ), uint2(0,0), ReservoirBufferDim.xy - 1);
 
 			RTXGI_Reservoir prevSample = RTXGI_Reservoir::Load(ReadReservoirHistoryData(prePosId, HistoryReservoir));
-			prevSample.M = min(prevSample.M, historyLimit);
+			prevSample.M = min(prevSample.M, MaxTemporalHistory);
 
 			if (prevSample.sampleRef.IsValid())
 			{
