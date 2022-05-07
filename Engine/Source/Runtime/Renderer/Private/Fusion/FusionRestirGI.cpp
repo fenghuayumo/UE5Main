@@ -24,101 +24,101 @@
     #include "PathTracing.h"
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatial(
-    	TEXT("r.Fusion.ResrirGI.Spatial"), 1,
+    	TEXT("r.Fusion.RestirGI.Spatial"), 1,
     	TEXT("Whether to apply spatial resmapling"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIInitialCandidates(
-    	TEXT("r.Fusion.ResrirGI.InitialSamples"), 1,
+    	TEXT("r.Fusion.RestirGI.InitialSamples"), 1,
     	TEXT("How many lights to test sample during the initial candidate search"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIInitialCandidatesBoost(
-    	TEXT("r.Fusion.ResrirGI.InitialSamplesBoost"), 4,
+    	TEXT("r.Fusion.RestirGI.InitialSamplesBoost"), 4,
     	TEXT("How many lights to test sample during the initial candidate search when history is invalidated"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGITemporal(
-    	TEXT("r.Fusion.ResrirGI.Temporal"), 1,
+    	TEXT("r.Fusion.RestirGI.Temporal"), 1,
     	TEXT("Whether to use temporal resampling for the reserviors"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIApplyBoilingFilter(
-    	TEXT("r.Fusion.ResrirGI.ApplyBoilingFilter"), 1,
+    	TEXT("r.Fusion.RestirGI.ApplyBoilingFilter"), 1,
     	TEXT("Whether to apply boiling filter when temporally resampling"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarRestirGIBoilingFilterStrength(
-    	TEXT("r.Fusion.ResrirGI.BoilingFilterStrength"), 0.20f,
+    	TEXT("r.Fusion.RestirGI.BoilingFilterStrength"), 0.20f,
     	TEXT("Strength of Boiling filter"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRayTracingRestirGIEnableSpatialBias(
-    	TEXT("r.Fusion.ResrirGI.EnableSpatialBias"),
+    	TEXT("r.Fusion.RestirGI.EnableSpatialBias"),
     	1,
     	TEXT("Enables Bias when Spatial resampling (default = 1)"),
     	ECVF_RenderThreadSafe
     );
 
     static TAutoConsoleVariable<int32> CVarRayTracingRestirGIEnableTemporalBias(
-    	TEXT("r.Fusion.ResrirGI.EnableTemporalBias"),
+    	TEXT("r.Fusion.RestirGI.EnableTemporalBias"),
     	1,
     	TEXT("Enables Bias when Temporal resampling (default = 1)"),
     	ECVF_RenderThreadSafe
     );
 
     static TAutoConsoleVariable<float> CVarRestirGISpatialSamplingRadius(
-    	TEXT("r.Fusion.ResrirGI.Spatial.SamplingRadius"), 32.0f,
+    	TEXT("r.Fusion.RestirGI.Spatial.SamplingRadius"), 32.0f,
     	TEXT("Spatial radius for sampling in pixels (Default 32.0)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatialSamples(
-    	TEXT("r.Fusion.ResrirGI.Spatial.Samples"), 1,
+    	TEXT("r.Fusion.RestirGI.Spatial.Samples"), 1,
     	TEXT("Spatial samples per pixel"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatialSamplesBoost(
-    	TEXT("r.Fusion.ResrirGI.Spatial.SamplesBoost"), 8,
+    	TEXT("r.Fusion.RestirGI.Spatial.SamplesBoost"), 8,
     	TEXT("Spatial samples per pixel when invalid history is detected"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarRestirGISpatialNormalRejectionThreshold(
-    	TEXT("r.Fusion.ResrirGI.Spatial.NormalRejectionThreshold"), 0.5f,
+    	TEXT("r.Fusion.RestirGI.Spatial.NormalRejectionThreshold"), 0.5f,
     	TEXT("Rejection threshold for rejecting samples based on normal differences (default 0.5)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarRestirGISpatialDepthRejectionThreshold(
-    	TEXT("r.Fusion.ResrirGI.Spatial.DepthRejectionThreshold"), 0.1f,
+    	TEXT("r.Fusion.RestirGI.Spatial.DepthRejectionThreshold"), 0.1f,
     	TEXT("Rejection threshold for rejecting samples based on depth differences (default 0.1)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatialApplyApproxVisibility(
-    	TEXT("r.Fusion.ResrirGI.Spatial.ApplyApproxVisibility"), 0,
+    	TEXT("r.Fusion.RestirGI.Spatial.ApplyApproxVisibility"), 0,
     	TEXT("Apply an approximate visibility test on sample selected during spatial sampling"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGITemporalMaxHistory(
-    	TEXT("r.Fusion.ResrirGI.Temporal.MaxHistory"), 10,
+    	TEXT("r.Fusion.RestirGI.Temporal.MaxHistory"), 10,
     	TEXT("Maximum temporal history for samples (default 10)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarRestirGITemporalNormalRejectionThreshold(
-    	TEXT("r.Fusion.ResrirGI.Temporal.NormalRejectionThreshold"), 0.5f,
+    	TEXT("r.Fusion.RestirGI.Temporal.NormalRejectionThreshold"), 0.5f,
     	TEXT("Rejection threshold for rejecting samples based on normal differences (default 0.5)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<float> CVarRestirGITemporalDepthRejectionThreshold(
-    	TEXT("r.Fusion.ResrirGI.Temporal.DepthRejectionThreshold"), 0.1f,
+    	TEXT("r.Fusion.RestirGI.Temporal.DepthRejectionThreshold"), 0.1f,
     	TEXT("Rejection threshold for rejecting samples based on depth differences (default 0.1)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGITemporalApplyApproxVisibility(
-    	TEXT("r.Fusion.ResrirGI.Temporal.ApplyApproxVisibility"), 0,
+    	TEXT("r.Fusion.RestirGI.Temporal.ApplyApproxVisibility"), 0,
     	TEXT("Apply an approximate visibility test on sample selected during reprojection"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIFaceCull(
-    	TEXT("r.Fusion.ResrirGI.FaceCull"), 0,
+    	TEXT("r.Fusion.RestirGI.FaceCull"), 0,
     	TEXT("Face culling to use for visibility tests\n")
     	TEXT("  0 - none (Default)\n")
     	TEXT("  1 - front faces (equivalent to backface culling in shadow maps)\n")
@@ -127,13 +127,13 @@
 
     static float GRayTracingRestirGIMultipleBounceRatio = 0.25;
     static TAutoConsoleVariable<float> CVarRestirGILongPathRatio(
-    	TEXT("r.Fusion.ResrirGI.MultipleBounceRatio"),
+    	TEXT("r.Fusion.RestirGI.MultipleBounceRatio"),
     	GRayTracingRestirGIMultipleBounceRatio,
     	TEXT("long path ratio\n"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIApproximateVisibilityMode(
-    	TEXT("r.Fusion.ResrirGI.ApproximateVisibilityMode"), 0,
+    	TEXT("r.Fusion.RestirGI.ApproximateVisibilityMode"), 0,
     	TEXT("Visibility mode for approximate visibility tests (default 0/accurate)\n")
     	TEXT("  0 - Accurate, any hit shaders process alpha coverage\n")
     	TEXT("  1 - Force opaque, anyhit shaders ignored, alpha coverage considered 100%\n")
@@ -141,20 +141,20 @@
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGINumReservoirs(
-    	TEXT("r.Fusion.ResrirGI.NumReservoirs"), -1,
+    	TEXT("r.Fusion.RestirGI.NumReservoirs"), -1,
     	TEXT("Number of independent light reservoirs per pixel\n")
     	TEXT("  1-N - Explicit number of reservoirs\n")
     	TEXT("  -1 - Auto-select based on subsampling (default)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRayTracingRestirGIFeedbackVisibility(
-    	TEXT("r.Fusion.ResrirGI.FeedbackVisibility"),
+    	TEXT("r.Fusion.RestirGI.FeedbackVisibility"),
     	0,
     	TEXT("Whether to feedback the final visibility result to the history (default = 1)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGIUseSurfel(
-    	TEXT("r.Fusion.ResrirGI.UseSurfel"),
+    	TEXT("r.Fusion.RestirGI.UseSurfel"),
     	1,
     	TEXT("Whether to Use Surfel"),
     	ECVF_RenderThreadSafe);
@@ -193,6 +193,18 @@ static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
 	TEXT("ReconstructSampleCount (default 4)"),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarFusionApplyApproxVisibility(
+	TEXT("r.Fusion.RestirGI.Evaluate.ApplyApproxVisibility"), 1,
+	TEXT("RestirGI Evaluate ApplyApproxVisibility "),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
+	TEXT("r.Fusion.RestirGI.DebugFlag"), 0,
+	TEXT("Debug Restir Tex 0 : Irradiance (default 0)")
+	TEXT("Debug Restir Tex 1 : weightSum")
+	TEXT("Debug Restir Tex 2 : M")
+	TEXT("Debug Restir Tex 3 : targetPdf"),
+	ECVF_RenderThreadSafe);
 
     DECLARE_GPU_STAT_NAMED(RayTracingGIRestir, TEXT("Ray Tracing GI: Restir"));
     DECLARE_GPU_STAT_NAMED(RestirGenerateSample, TEXT("Ray Tracing GI: GenerateSample"));
@@ -345,8 +357,9 @@ static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
     		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 
     		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
-
-    		END_SHADER_PARAMETER_STRUCT()
+			// SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugTex)
+			// SHADER_PARAMETER(int32, DebugFlag)
+    	END_SHADER_PARAMETER_STRUCT()
     };
 
     IMPLEMENT_GLOBAL_SHADER(FRestirGITemporalResampling, "/Engine/Private/RestirGI/RayTracingRestirGILighting.usf", "ApplyTemporalResamplingRGS", SF_RayGen);
@@ -374,6 +387,8 @@ static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
     		SHADER_PARAMETER(int32, DemodulateMaterials)
     		//SHADER_PARAMETER(int32, DebugOutput)
     		SHADER_PARAMETER(int32, FeedbackVisibility)
+			SHADER_PARAMETER(int32, ApplyApproximateVisibilityTest)
+			
     		SHADER_PARAMETER(uint32, bUseHairVoxel)
     		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
 
@@ -432,6 +447,9 @@ static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
 
     		SHADER_PARAMETER_SRV(Buffer<float2>, NeighborOffsets)
 			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSAOTex)
+			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugTex)
+			SHADER_PARAMETER(int32, DebugFlag)
+
     	END_SHADER_PARAMETER_STRUCT()
     };
 
@@ -1163,6 +1181,8 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
     		FClearValueBinding::None,
     		TexCreate_ShaderResource | TexCreate_UAV);
 
+		FRDGTextureRef DebugTex = GraphBuilder.CreateTexture(Desc, TEXT("DebugDiffuse"));
+
     	FIntPoint PaddedSize = Desc.Extent;
 
     	FIntVector ReservoirBufferDim = FIntVector(PaddedSize.X, PaddedSize.Y, NumReservoirs + 1);
@@ -1224,7 +1244,6 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 
 				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-				//PassParameters->SSProfilesTexture = GraphBuilder.RegisterExternalTexture(View.RayTracingSubSurfaceProfileTexture);
 
 				PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
 				PassParameters->InputSlice = 0;
@@ -1299,6 +1318,8 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 
 				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
+				PassParameters->RWDebugTex = GraphBuilder.CreateUAV(DebugTex);
+				PassParameters->DebugFlag = CVarFusionRestirDebug.GetValueOnRenderThread(); //
 
 				PassParameters->InputSlice = Reservoir - 1;
 				PassParameters->OutputSlice = Reservoir;
@@ -1343,7 +1364,6 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
     	{
     		//RDG_GPU_STAT_SCOPE(GraphBuilder, RestirEvaluateGI);
     		//RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: EvaluateGI");
-    		const bool bUseHairLighting = false;
     		FEvaluateRestirGIRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FEvaluateRestirGIRGS::FParameters>();
 
     		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
@@ -1356,7 +1376,7 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
     		PassParameters->NumReservoirs = NumReservoirs;
     		PassParameters->FeedbackVisibility = CVarRayTracingRestirGIFeedbackVisibility.GetValueOnRenderThread();
     		PassParameters->RestirGICommonParameters = CommonParameters;
-			
+			PassParameters->ApplyApproximateVisibilityTest = CVarFusionApplyApproxVisibility.GetValueOnRenderThread();
     		FEvaluateRestirGIRGS::FPermutationDomain PermutationVector;
     		auto RayGenShader = View.ShaderMap->GetShader<FEvaluateRestirGIRGS>();
     		ClearUnusedGraphResources(RayGenShader, PassParameters);
