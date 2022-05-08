@@ -213,6 +213,9 @@ public:
 
 		// Number of rays per pixels.
 		float RayCountPerPixel = 1.0f;
+
+		//Whether use sh to dneoise for preserving better detail 
+		bool UseSphericalHarmonicsGI  = false;
 	};
 	
 

@@ -1,0 +1,44 @@
+
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "RayTracingGatherPoints.ush"
+
+uint SamplesPerPixel;
+int2 GatherPointsResolution;
+
+RWStructuredBuffer<FGatherPoints> RWReservoirBuffer0;
+RWStructuredBuffer<FGatherPoints> RWReservoirBuffer1;
+
+uint DispatchThreadIdToLinearIndex(uint2 DispatchThreadId)
+{
+	return DispatchThreadId.y * GatherPointsResolution.x + DispatchThreadId.x;
+}
+
+[numthreads(8, 8, 1)]
+void ClearReservoir(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId.xy >= GatherPointsResolution.xy))
+	{
+		return;
+	}
+
+	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
+
+	FGatherSample GatherSample;
+	GatherSample.CreationPoint = 0;
+	GatherSample.CreationNormal = float3(0, 0, 1);
+	GatherSample.Position = float3(0, 0, 1);
+	GatherSample.Normal = float3(0, 0, -1);
+	GatherSample.Irradiance = 0;
+	GatherSample.M = 0;
+	GatherSample.AvgWeight = 0;
+	GatherSample.LightRandom = 0;
+
+	for (int SampleIndex = 0; SampleIndex < SamplesPerPixel; SampleIndex++)
+	{
+		WriteGatherSample(RWReservoirBuffer0, GatherPointsIndex, SampleIndex*2, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+		WriteGatherSample(RWReservoirBuffer0, GatherPointsIndex, SampleIndex*2+1, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+		WriteGatherSample(RWReservoirBuffer1, GatherPointsIndex, SampleIndex*2, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+		WriteGatherSample(RWReservoirBuffer1, GatherPointsIndex, SampleIndex*2+1, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+	}
+}

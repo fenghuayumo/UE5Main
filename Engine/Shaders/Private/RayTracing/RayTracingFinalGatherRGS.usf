@@ -11,12 +11,16 @@
 
 #include "../PathTracing/Light/PathTracingLightSampling.ush"
 #include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
 
 #define USE_PATHTRACING_MATERIALS 0
 #define USE_REJECTION_CRITERIA 0
+#ifndef USE_RESERVOIR_RESAMPLING
+#define USE_RESERVOIR_RESAMPLING 1
+#endif
 #define USE_REPROJECTION 1
-#define USE_NEIGHBOR_SAMPLES 1
-#define USE_TEMPORAL_SAMPLES 1
+#define USE_NEIGHBOR_SAMPLES !USE_RESERVOIR_RESAMPLING
+#define USE_TEMPORAL_SAMPLES !USE_RESERVOIR_RESAMPLING
 
 
 uint SampleIndex;
@@ -33,15 +37,78 @@ uint UseFireflySuppression;
 float DepthRejectionKernel;
 float NormalRejectionKernel;
 
+// Changed_Begin : GI
+uint UseSH;
+uint TemporalSamples;
+uint SpatialSamples;
+uint ReservoirUpdateInterval;
+uint AggressiveReservoirReuse;
+uint UseUniformSampling;
+float MaxReuseWeight;
+uint NormalFromDepth;
+uint HitDistanceType;
+#define USE_MIN_HITDISTANCE 1
+
+Texture2D NormalTextureLast;
+Texture2D DepthTextureLast;
+
+// Ping-pong buffers storing gather point samples
+StructuredBuffer<FGatherPoints> ReservoirBuffer;
+RWStructuredBuffer<FGatherPoints> RWReservoirBuffer;
+
+// CHanged_End : GI
+
 RaytracingAccelerationStructure TLAS;
 
 int2 GatherPointsResolution;
-StructuredBuffer<FGatherPoints> GatherPointsBuffer;
+RWStructuredBuffer<FGatherPoints> GatherPointsBuffer;
 
 RWTexture2D<float4> RWGlobalIlluminationUAV;
 RWTexture2D<float2> RWGlobalIlluminationRayDistanceUAV;
 
+void CompressSHCoef(float3 SampleRadiance, float3 Direction, inout float4 ShY, inout float2 CoCg)
+{
+	// Support SH denoising
+	// SH denoising performs denoising on light distribution represented by SH coefficients,
+	// then reconstruct incident light using pixel normals. This approach can preserve more
+	// normal details.
+	// We first convert color to YCoCg space, where Y represents luminance value and CoCg
+	// represents color values. Only Y is represented by SH coefs. CoCg are pure scalars.
+	SampleRadiance.rgb = clamp(SampleRadiance.rgb, 0, 1e10);
 
+	float Co = SampleRadiance.r - SampleRadiance.b;
+	float t = SampleRadiance.b + Co * 0.5;
+	float Cg = SampleRadiance.g - t;
+	float Y = t + Cg * 0.5;
+
+	CoCg += float2(Co, Cg);
+
+	float L00 = 0.282095;
+	float L1_1 = 0.488603 * Direction.y;
+	float L10 = 0.488603 * Direction.z;
+	float L11 = 0.488603 * Direction.x;
+	ShY += float4(L11, L1_1, L10, L00) * Y;
+}
+
+
+float GetTargetPdf(float3 Irradiance, float3 Normal, float3 Position, float3 SamplePosition)
+{
+#define COSINE_TARGET_PDF 0
+#if COSINE_TARGET_PDF
+	return dot(Irradiance, 1) * max(0.1, dot(Normal, normalize(SamplePosition - Position)));
+#else
+	return dot(Irradiance, 1);
+#endif
+}
+
+uint2 GetPixelCoordNoOffset(uint2 DispatchThreadId)
+{
+#if 1
+	return GetPixelCoord(DispatchThreadId, UpscaleFactor);
+#else
+	return (DispatchThreadId << UpscaleFactorBits);
+#endif
+}
 
 uint DispatchThreadIdToLinearIndex(uint2 DispatchThreadId)
 {
@@ -66,7 +133,7 @@ bool ShouldBilateralReject(float2 PixelCoord, float Z, float LocalZ, float3 Worl
 
 RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 {
-	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin + uint2(RenderTileOffsetX, RenderTileOffsetY);
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + uint2(View.ViewRectMin.xy) + uint2(RenderTileOffsetX, RenderTileOffsetY);
 	RWGlobalIlluminationUAV[DispatchThreadId] = 0.0;
 	RWGlobalIlluminationRayDistanceUAV[DispatchThreadId] = float2(-1.0, 0.0);
 
@@ -108,11 +175,15 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 
 	// Construct position, normal, and view direction
 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
-	float3 WorldPosition;
+	float3 TranslatedWorldPosition;
 	float3 CameraDirection;
-	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
 	float3 WorldNormal = GBufferData.WorldNormal;
-
+	if (NormalFromDepth)
+	{
+		WorldNormal = ReconstructWorldNormalFromDeviceZ(SceneDepthTexture, PixelCoord, DeviceZ, TranslatedWorldPosition, WorldNormal);
+		GBufferData.WorldNormal = WorldNormal;
+	}
 //#if USE_REJECTION_CRITERIA
 	// Define rejection criteria and evaluate
 	bool bShouldReject[MAXIMUM_GATHER_POINTS_PER_PIXEL];
@@ -123,23 +194,358 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 	RayDesc Ray = CreatePrimaryRay(UV);
 
 	// Intersect ray differential with normal to find world-space distance
-	float d = -dot(WorldNormal, WorldPosition);
+	float d = -dot(WorldNormal, TranslatedWorldPosition);
 	float T = -(d + dot(WorldNormal, Ray.Origin)) / dot(WorldNormal, Ray.Direction);
 	float3 WorldDeltaPosition = Ray.Origin + T * Ray.Direction;
-	float RejectionDistance = length(WorldDeltaPosition - WorldPosition);
+	float RejectionDistance = length(WorldDeltaPosition - TranslatedWorldPosition);
 
 	float3 ExitantRadiance = 0.0;
 	float3 MaxExitantRadianceSample = 0.0;
+	//Changed:
 	//float HitDistance = 1.0e7;
-	float HitDistance = 0.0;
+	float4 ExitantRadianceShY = 0;
+	float2 ExitantRadianceCoCg = 0;
+	float HitDistance = (HitDistanceType == USE_MIN_HITDISTANCE) ? 1e7 : 0.0;
+	//Changed:
 	float HitCount = 0.0;
 	uint ValidSamplesPerPixel = 0;
+	//Changed_Begin: GI
+#if USE_RESERVOIR_RESAMPLING
+	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
+	RandomSequence RandSequence;
+	RandomSequence_Initialize(RandSequence, PixelCoord, 0, View.StateFrameIndex, SamplesPerPixel);
+	uint SampleIndexOffsetGSrc = 1;
+	FGatherSample GatherSample = ReadGatherSample(GatherPointsBuffer, GatherPointsIndex, SampleIndexOffsetGSrc, GatherPointsResolution.x * GatherPointsResolution.y);
 
+	// Reproject pixel position
+	UV = float2(DispatchThreadId.xy + 0.5) / GatherPointsResolution.xy;
+	float4 ThisClip = float4(UV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+	float2 PrevUV;
+	float4 VelocityData = GBufferVelocityTexture[PixelCoord];
+	if (VelocityData.x > 0.0)
+	{
+		float2 Velocity = DecodeVelocityFromTexture(VelocityData).xy;
+		float2 PrevClip = ThisClip.xy - Velocity;
+		PrevUV = (PrevClip.xy * float2(1, -1) + 1) * 0.5;
+	}
+	else
+	{
+		float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+		float3 PrevScreen = PrevClip.xyz / PrevClip.w;
+		PrevUV = PrevScreen.xy * float2(0.5, -0.5) + 0.5;
+	}
+
+	uint2 PrevID = clamp(PrevUV * GatherPointsResolution.xy, 0, GatherPointsResolution.xy - 1);
+	uint PrevIdx = DispatchThreadIdToLinearIndex(PrevID);
+
+	// Judge whether reprojection is successful
+	bool isPrevValid = all(PrevUV > 0) && all(PrevUV < 1);
+	if (isPrevValid)
+	{
+		uint2 GBufferCoord = GetPixelCoordNoOffset(PrevID); //GetPixelCoord(PrevID);
+		
+		float depthLast = DepthTextureLast.Load(int3(GBufferCoord, 0)).r;
+		float3 normalLast = DecodeNormal(NormalTextureLast.Load(int3(GBufferCoord, 0)).xyz);
+		float3 WorldPos = TranslatedWorldPosition - LWCHackToFloat(PrimaryView.PreViewTranslation);
+		float3 PrevTranslatedWorld = WorldPos + LWCHackToFloat(PrimaryView.PrevPreViewTranslation);
+		float4 PrevClip = mul(float4(PrevTranslatedWorld, 1), PrimaryView.PrevTranslatedWorldToClip);
+		
+		PrevClip.xyz /= PrevClip.w;
+
+		float depthTolerance = 0.01;
+		isPrevValid &= (abs(PrevClip.z - depthLast) < depthTolerance);
+
+		if (!NormalFromDepth && dot(normalLast, WorldNormal) < 0.5)
+		{
+			isPrevValid = false;
+		}
+		float rand = RandomSequence_GenerateSample1D(RandSequence);
+		float ViewDepth = length(TranslatedWorldPosition - View.TranslatedWorldCameraOrigin);
+		float PrevViewDepth = length(TranslatedWorldPosition - View.PrevTranslatedWorldCameraOrigin);
+		if (ViewDepth / PrevViewDepth < 0.98 && rand < 0.15)
+		{
+			isPrevValid = false;
+		}
+	}
+
+	int ResetSampleID = -1;
+	if (ReservoirUpdateInterval > 1 && View.FrameNumber % ReservoirUpdateInterval == 1 && GatherSample.M < 0)
+	{
+		ResetSampleID = View.FrameNumber / ReservoirUpdateInterval % SamplesPerPixel;
+	}
+	const int MaxTraceOperation = 16;
+	int TraceBudget = MaxTraceOperation;
+	FGatherSample GatherSampleS;
+
+	// Reservoir resampling
+	for (uint LocalSampleIndex = 0; LocalSampleIndex < SamplesPerPixel; ++LocalSampleIndex)
+	{
+		// NVCHANGE_BEGIN_YB : GI
+		bool isPrevSampleValid = isPrevValid && (ResetSampleID != LocalSampleIndex);
+		// New final gather: final gather with reservoir resampling
+		int SampleIndexOffsetBegin = 2 * LocalSampleIndex;
+		int SampleIndexOffsetTSrc = SampleIndexOffsetBegin;
+		int SampleIndexOffsetSSrc = SampleIndexOffsetBegin + 1;
+		int SampleIndexOffsetTDst = SampleIndexOffsetTSrc;
+		int SampleIndexOffsetSDst = SampleIndexOffsetSSrc;
+
+		// Read t reservoir
+		FGatherSample GatherSampleT = ReadGatherSample(ReservoirBuffer, PrevIdx, SampleIndexOffsetTSrc, GatherPointsResolution.x * GatherPointsResolution.y);
+
+		float3 Irradiance = GatherSample.Irradiance;
+		int M = max(0, GatherSampleT.M);
+		if (!isPrevSampleValid)
+		{
+			M = 0;
+		}
+		float avgWSum = max(0, GatherSampleT.AvgWeight) * M * GetTargetPdf(GatherSampleT.Irradiance, GatherSampleT.CreationNormal, GatherSampleT.CreationPoint, GatherSampleT.Position);;
+		float3 Direction = normalize(GatherSample.Position - GatherSample.CreationPoint);
+		float pNew = GetTargetPdf(Irradiance, WorldNormal, TranslatedWorldPosition, GatherSample.Position);								// The supposed probability is proportional to luminance
+		float pOld = GatherSample.AvgWeight;					// The initial probability is cosine-weighted or uniform
+		float wi = pOld == 0 ? 0 : pNew / pOld;
+		float wSum = (avgWSum + wi);
+
+		// Update t reservoir conditionally
+		float rand = RandomSequence_GenerateSample1D(RandSequence);
+		if (rand * wSum <= wi)
+		{
+			GatherSampleT.CreationPoint = GatherSample.CreationPoint;
+			GatherSampleT.CreationNormal = GatherSample.CreationNormal;
+			GatherSampleT.Position = GatherSample.Position;
+			GatherSampleT.Normal = GatherSample.Normal;
+			GatherSampleT.LightRandom = GatherSample.LightRandom;
+			GatherSampleT.Irradiance = Irradiance;
+		}
+		{
+			M += 1;
+			avgWSum = wSum / M;
+			pNew = GetTargetPdf(GatherSampleT.Irradiance, GatherSampleT.CreationNormal, GatherSampleT.CreationPoint, GatherSampleT.Position);
+			GatherSampleT.AvgWeight = pNew <= 0 ? 0 : avgWSum / pNew;
+			GatherSampleT.M = clamp(M, 0, TemporalSamples);
+		}
+		WriteGatherSample(RWReservoirBuffer, GatherPointsIndex, SampleIndexOffsetTDst, GatherPointsResolution.x * GatherPointsResolution.y, GatherSampleT);
+
+		// Read s reservoir
+		if (isPrevSampleValid)
+			GatherSampleS = ReadGatherSample(ReservoirBuffer, PrevIdx, SampleIndexOffsetSSrc, GatherPointsResolution.x * GatherPointsResolution.y);
+		else
+			GatherSampleS = GatherSampleT;
+		int MS = max(0, GatherSampleS.M);
+
+		// Add near sample to s reservoir
+		uint PrevIdx2;
+		float avgSumS = max(0, GatherSampleS.AvgWeight) * MS * GetTargetPdf(GatherSampleS.Irradiance, GatherSampleS.CreationNormal, GatherSampleS.CreationPoint, GatherSampleS.Position);
+		FGatherSample GatherSampleTNear = GatherSampleT;
+		float FastReuseThreshold = SpatialSamples * 0.5;
+		float MSRatio = saturate(pow(float(MS+1) / SpatialSamples, 0.2));
+		int maxIteration = lerp(32, 2, MSRatio);
+		float SearchRadius = max(GatherPointsResolution.x * 0.15, 100);
+		for (int i = 0; i < maxIteration && TraceBudget > 0; i++)
+		{
+			SearchRadius = clamp(SearchRadius * 0.5, GatherPointsResolution.x * 0.2, GatherPointsResolution.x * 0.5);
+			float3 randOffset = RandomSequence_GenerateSample3D(RandSequence);
+			randOffset = randOffset * 2.0 - 1;
+			int2 DispatchID2 = (isPrevSampleValid ? PrevID: DispatchThreadId.xy) + 0.5 + randOffset.xy * SearchRadius;
+			uint2 Boundary = GatherPointsResolution.xy - 1;
+			DispatchID2.x = DispatchID2.x < 0 ? -DispatchID2.x : (DispatchID2.x > Boundary.x ? 2 * Boundary.x - DispatchID2.x : DispatchID2.x);
+			DispatchID2.y = DispatchID2.y < 0 ? -DispatchID2.y : (DispatchID2.y > Boundary.y ? 2 * Boundary.y - DispatchID2.y : DispatchID2.y);
+
+			uint2 GBufferCoord = GetPixelCoordNoOffset(DispatchID2); //GetPixelCoord(DispatchID2);
+
+			float depthLast = DepthTextureLast.Load(int3(GBufferCoord, 0)).r;
+			float3 normalLast = DecodeNormal(NormalTextureLast.Load(int3(GBufferCoord, 0)).xyz);
+
+			// Discard pixels with too different geometric features
+			if (isPrevSampleValid && (dot(normalLast, WorldNormal) < 0.9 || abs(depthLast- DeviceZ) > 0.1))
+			{
+				continue;
+			}
+			PrevIdx2 = DispatchThreadIdToLinearIndex(DispatchID2);
+			bool bReuseSpatialSample = (AggressiveReservoirReuse && MS < FastReuseThreshold * 0.2 && i % 2 == 1);
+			if (isPrevSampleValid)
+			{
+				GatherSampleTNear = ReadGatherSample(ReservoirBuffer, PrevIdx2, bReuseSpatialSample ? SampleIndexOffsetSSrc :SampleIndexOffsetTSrc, GatherPointsResolution.x * GatherPointsResolution.y);
+			}
+			else
+			{
+				GatherSampleTNear = ReadGatherSample(GatherPointsBuffer, PrevIdx2, SampleIndexOffsetGSrc, GatherPointsResolution.x * GatherPointsResolution.y);
+				GatherSampleTNear.M = 1;
+				GatherSampleTNear.AvgWeight = 1 / GatherSampleTNear.AvgWeight;// UseUniformSampling ? 1 / (2 * PI) : dot(GatherSampleTNear.CreationNormal, normalize(GatherSampleTNear.Position - GatherSampleTNear.CreationPoint)) / PI;
+			}
+
+			float avgSumTN = GatherSampleTNear.AvgWeight;
+			int MTN = max(0, GatherSampleTNear.M);
+			// Discard black samples
+			if (MTN == 0)
+			{
+				continue;
+			}
+
+			float3 OffsetB = GatherSampleTNear.Position - GatherSampleTNear.CreationPoint;
+			float3 OffsetA = GatherSampleTNear.Position + LWCHackToFloat(PrimaryView.PreViewTranslation) - TranslatedWorldPosition;
+			// Discard back-face
+			if (dot(WorldNormal, OffsetA) < 0 || dot(GatherSampleTNear.CreationNormal, WorldNormal) < 0.8 || any(isnan(OffsetA)) || any(isnan(OffsetB)))
+			{
+				continue;
+			}
+
+			float pOldTN = GetTargetPdf(GatherSampleTNear.Irradiance, GatherSampleTNear.CreationNormal, GatherSampleTNear.CreationPoint, GatherSampleTNear.Position);
+			float pNewTN = GetTargetPdf(GatherSampleTNear.Irradiance, WorldNormal, TranslatedWorldPosition, GatherSampleTNear.Position);
+
+			float RB2 = dot(OffsetB, OffsetB);
+			float RA2 = dot(OffsetA, OffsetA);
+			OffsetB = normalize(OffsetB);
+			OffsetA = normalize(OffsetA);
+
+			float cosA = dot(WorldNormal, OffsetB);
+			float cosB = dot(GatherSampleTNear.CreationNormal, OffsetB);
+			float cosPhiA = -dot(OffsetA, GatherSampleTNear.Normal);
+			float cosPhiB = -dot(OffsetB, GatherSampleTNear.Normal);
+			// Discard extreme samples to prevent fireflies
+			if (cosA <= 0 || cosB <= 0 || cosPhiA <= 0 || cosPhiB <= 0 || RA2 <= 0 || RB2 <= 0)
+			{
+				continue;
+			}
+
+			RayDesc RayS;
+			float3 TranslatedLightPos = GatherSampleTNear.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+			RayS.Origin = TranslatedWorldPosition;
+			RayS.Direction = normalize( TranslatedLightPos - TranslatedWorldPosition);
+			RayS.TMin = 0.1;
+			RayS.TMax = length(TranslatedLightPos - TranslatedWorldPosition) - 0.2;
+			uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+			const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+			FMinimalPayload MinimalPayload2 = TraceVisibilityRay(TLAS, NeeRayFlags, NeeInstanceInclusionMask, PixelCoord, RayS);
+			TraceBudget--;
+			// Discard new sample if it is occluded
+			if (!MinimalPayload2.IsMiss())
+				continue;
+
+			float k = bReuseSpatialSample ? 1 : clamp(RB2 * cosPhiA / (RA2 * cosPhiB), 0, MaxReuseWeight);
+			float wiTN = pOldTN <= 0 ? 0 : clamp(avgSumTN * pNewTN * MTN * k, 0, 1e20);
+			avgSumS += wiTN;
+
+			// Conditionally update s reservoir
+			rand = RandomSequence_GenerateSample1D(RandSequence);
+			if (rand * avgSumS <= wiTN)
+			{
+				GatherSampleS.CreationPoint = GatherSampleTNear.CreationPoint;
+				GatherSampleS.CreationNormal = GatherSampleTNear.CreationNormal;
+				GatherSampleS.Position = GatherSampleTNear.Position;
+				GatherSampleS.Normal = GatherSampleTNear.Normal;
+				GatherSampleS.LightRandom = GatherSampleTNear.LightRandom;
+				GatherSampleS.Irradiance = GatherSampleTNear.Irradiance;
+			}
+			MS = MS + MTN;
+
+			SearchRadius *= 4;
+		}
+		pNew = GetTargetPdf(GatherSampleS.Irradiance, WorldNormal, TranslatedWorldPosition, GatherSampleS.Position);
+		float mWeight;
+		mWeight = pNew * MS <= 0 ? 0 : 1 / (pNew * MS);
+		float W = avgSumS * mWeight;
+		GatherSampleS.AvgWeight = clamp(W, 0, 50);
+		GatherSampleS.M = clamp(MS, 0, SpatialSamples);
+
+		// Write s reservoir
+		WriteGatherSample(RWReservoirBuffer, GatherPointsIndex, SampleIndexOffsetSDst, GatherPointsResolution.x * GatherPointsResolution.y, GatherSampleS);
+
+		// Validate samples every few frames
+		if (ReservoirUpdateInterval > 1 && (View.FrameNumber % ReservoirUpdateInterval == 0) && (View.FrameNumber / ReservoirUpdateInterval % SamplesPerPixel == LocalSampleIndex))
+		{
+			FGatherSample GatherSampleTask = GatherSampleS;
+			uint ValidationID = View.FrameNumber / ReservoirUpdateInterval % 512;
+			GatherSampleTask.M = ValidationID;
+			uint SampleIndexOffsetGDst = 0;
+			uint GatherPointsIndex2 = DispatchThreadIdToLinearIndex(DispatchThreadId);
+			WriteGatherSample(GatherPointsBuffer, GatherPointsIndex2, SampleIndexOffsetGDst, GatherPointsResolution.x * GatherPointsResolution.y, GatherSampleTask);
+		}
+#if 0
+		GatherSampleS = GatherSampleT;
+		W = GatherSampleT.AvgWeight;
+#endif
+		float3 GPPosition = GatherSampleS.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+		float3 GPIrradiance = GatherSampleS.Irradiance;
+
+		ValidSamplesPerPixel++;
+
+		// Initialize throughput based on BRDF
+		half3 N = WorldNormal;
+		half3 V = -CameraDirection;
+		half3 L = normalize(GPPosition - TranslatedWorldPosition);
+		if (any(isnan(L))) L = 0;
+		float NoL = saturate(dot(N, L));
+		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+		float3 RayThroughput = LightingSample.Diffuse / DiffuseColor;
+		float RayPdf = UseUniformSampling ? 1 / (2 * PI) : NoL / PI;
+
+		// Create ray
+		RayDesc Ray;
+		Ray.Origin = TranslatedWorldPosition;
+		Ray.Direction = normalize(GPPosition - TranslatedWorldPosition);
+		float RayLength = clamp(length(GPPosition - TranslatedWorldPosition),0,1e20);
+		// CHANGE_BEGIN_YB : GI
+		Ray.TMin = max(0.05, length(TranslatedWorldPosition) * 5e-4);
+		float MaxEpsilon = max(0.05, length(GPPosition) * 5e-4);
+		Ray.TMax = max(RayLength - MaxEpsilon, Ray.TMin);
+		// CHANGE_END_YB : GI
+
+#if 1//!USE_RESERVOIR_RESAMPLING
+		// Trace ray
+		uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			Ray);
+
+		// No hit indicates successful next-event connection
+		if (MinimalPayload.IsMiss() && RayPdf > 0.0)
+#endif
+		{
+			float3 SampleRadiance = GPIrradiance * RayThroughput * W;
+
+			// if (UseSH)
+			// {
+			// 	CompressSHCoef(SampleRadiance, L, ExitantRadianceShY, ExitantRadianceCoCg);
+			// }
+			// else
+			{
+				ExitantRadiance += SampleRadiance;
+			}
+			// Minimum distance is required by denoiser to increase occlusion details
+			HitDistance = (HitDistanceType == USE_MIN_HITDISTANCE) ? min(HitDistance, Ray.TMax) : HitDistance + Ray.TMax;
+			HitCount += 1.0;
+		}
+
+		if (SamplesPerPixel > 1 && TraceBudget <= 0)
+		{
+			for (int SampleIdx = LocalSampleIndex + 1; SampleIdx < SamplesPerPixel; SampleIdx++)
+			{
+				int SampleIndexOffsetTDst = 2 * SampleIdx;
+				int SampleIndexOffsetSDst = SampleIndexOffsetTDst + 1;
+				WriteGatherSample(RWReservoirBuffer, GatherPointsIndex, SampleIndexOffsetTDst, GatherPointsResolution.x * GatherPointsResolution.y, GatherSampleT);
+				WriteGatherSample(RWReservoirBuffer, GatherPointsIndex, SampleIndexOffsetSDst, GatherPointsResolution.x * GatherPointsResolution.y, GatherSampleS);
+			}
+			break;
+		}
+	}
+#endif
+	//CHanged_ENd:GI
+	
 	// Gather from temporal history
 #if USE_TEMPORAL_SAMPLES
 
 	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
-	FRejectionCriteria RejectionCriteria = CreateRejectionCriteria(WorldPosition, RejectionDistance);
+	FRejectionCriteria RejectionCriteria = CreateRejectionCriteria(TranslatedWorldPosition, RejectionDistance);
 #if USE_REJECTION_CRITERIA
 	CreateRejectionMask(RejectionCriteria, GatherPointsBuffer, GatherPointsIndex, 0, GatherPointsResolution.x* GatherPointsResolution.y, SamplesPerPixel, bShouldReject);
 #endif
@@ -157,7 +563,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 #endif
 
 #if USE_REPROJECTION
-		float3 WorldPos = WorldPosition - LWCHackToFloat(PrimaryView.PreViewTranslation);
+		float3 WorldPos = TranslatedWorldPosition - LWCHackToFloat(PrimaryView.PreViewTranslation);
 		float4 ScreenPositionTime = mul(float4(WorldPos, 1.0), GatherPointData.ViewMatrices[LocalSampleIndex]);
 		ScreenPositionTime.xyz /= ScreenPositionTime.w;
 		if (any(abs(ScreenPositionTime.xy) > 1.0))
@@ -176,7 +582,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 		FGatherSample GatherSample = ReadGatherSample(GatherPointsBuffer, GatherPointsIndex, LocalSampleIndex, GatherPointsResolution.x * GatherPointsResolution.y);
 
 #if USE_REPROJECTION
-		float3 GPDistance2 = RejectionCriteria.TranslatedCreationPoint - GatherSample.TranslatedCreationPoint;
+		float3 GPDistance2 = RejectionCriteria.CreationPoint - (GatherSample.CreationPoint + LWCHackToFloat(PrimaryView.PreViewTranslation));
 		if (dot(GPDistance2, GPDistance2) > RejectionCriteria.DistanceThreshold2)
 		{
 			bShouldReject[LocalSampleIndex] = true;
@@ -201,13 +607,13 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 		}
 		ValidSamplesPerPixel++;
 
-		float3 GPPosition = GatherSample.TranslatedPosition;
+		float3 GPPosition = GatherSample.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
 		float3 GPIrradiance = GatherSample.Irradiance;
 
 		// Initialize throughput based on BRDF
 		half3 N = WorldNormal;
 		half3 V = -CameraDirection;
-		half3 L = normalize(GPPosition - WorldPosition);
+		half3 L = normalize(GPPosition - TranslatedWorldPosition);
 		float NoL = dot(N, L);
 		if (NoL <= 0.0) continue;
 
@@ -217,7 +623,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 
 		float TargetPdf = NoL / PI;
 		//float TargetPdf = 1.0 / (4.0 * PI);
-		float SourcePdf = GatherSample.Pdf;
+		float SourcePdf = GatherSample.AvgWeight;
 		float Weight = TargetPdf / SourcePdf;
 		float RayPdf = TargetPdf;
 
@@ -226,10 +632,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 
 		// Create ray
 		RayDesc Ray;
-		Ray.Origin = WorldPosition;
-		Ray.Direction = normalize(GPPosition - WorldPosition);
+		Ray.Origin = TranslatedWorldPosition;
+		Ray.Direction = normalize(GPPosition - TranslatedWorldPosition);
 		Ray.TMin = 0.05;
-		float RayLength = length(GPPosition - WorldPosition);
+		float RayLength = length(GPPosition - TranslatedWorldPosition);
 		Ray.TMax = max(RayLength - 0.01, Ray.TMin);
 
 		// Trace ray
@@ -252,14 +658,21 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 		{
 			float3 ExitantRadianceSample = GPIrradiance * RayThroughput * Weight / RayPdf;
 
-			// Tonemap for firefly suppression
-			if (UseFireflySuppression)
+			// if (UseSH)
+			// {
+			// 	CompressSHCoef(ExitantRadianceSample, L, ExitantRadianceShY, ExitantRadianceCoCg);
+			// }
+			// else
 			{
-				ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
-			}
+				// Tonemap for firefly suppression
+				if (UseFireflySuppression)
+				{
+					ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+				}
 
-			ExitantRadiance += ExitantRadianceSample;
-			MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+				ExitantRadiance += ExitantRadianceSample;
+				MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+			}			
 			HitDistance += rcp(Ray.TMax);
 
 			HitCount += 1.0;
@@ -281,7 +694,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 			if (bShouldReject[ParentSampleIndex]) continue;
 
 #if USE_REPROJECTION
-			float4 ScreenPositionTime = mul(float4(WorldPosition, 1.0), GatherPointData.ViewMatrices[ParentSampleIndex]);
+			float4 ScreenPositionTime = mul(float4(TranslatedWorldPosition, 1.0), GatherPointData.ViewMatrices[ParentSampleIndex]);
 			ScreenPositionTime.xyz /= ScreenPositionTime.w;
 			float2 ScreenUVTime = ScreenPositionTime.xy * float2(0.5, -0.5) + 0.5;
 			int2 GatherPointCentroid = int2(ScreenUVTime * GatherPointsResolution + View.ViewRectMin.xy);
@@ -314,13 +727,13 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 				ValidSamplesPerPixel++;
 				uint GatherPointsIndex = DispatchThreadIdToLinearIndex(GlobalIndex);
 				FGatherSample GatherSample = ReadGatherSample(GatherPointsBuffer, GatherPointsIndex, ParentSampleIndex, GatherPointsResolution.x * GatherPointsResolution.y);
-				float3 GPPosition = GatherSample.TranslatedPosition;
+				float3 GPPosition = GatherSample.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
 				float3 GPIrradiance = GatherSample.Irradiance;
 
 				// Initialize throughput based on BRDF
 				half3 N = WorldNormal;
 				half3 V = -CameraDirection;
-				half3 L = normalize(GPPosition - WorldPosition);
+				half3 L = normalize(GPPosition - TranslatedWorldPosition);
 				float NoL = dot(N, L);
 
 				// Threshold against grazing angle, so the the pdf's don't explode
@@ -331,7 +744,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 				float3 RayThroughput = LightingSample.Diffuse / DiffuseColor;
 				float TargetPdf = NoL / PI;
 				//float TargetPdf = 1.0 / (4.0 * PI);
-				float SourcePdf = GatherSample.Pdf;
+				float SourcePdf = GatherSample.AvgWeight;
 				float Weight = TargetPdf / SourcePdf;
 				float RayPdf = TargetPdf;
 
@@ -341,10 +754,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 #if USE_NEIGHBOR_VISIBILITY_TEST
 				// Create ray
 				RayDesc Ray;
-				Ray.Origin = WorldPosition;
-				Ray.Direction = normalize(GPPosition - WorldPosition);
+				Ray.Origin = TranslatedWorldPosition;
+				Ray.Direction = normalize(GPPosition - TranslatedWorldPosition);
 				Ray.TMin = 0.01;
-				float RayLength = length(GPPosition - WorldPosition);
+				float RayLength = length(GPPosition - TranslatedWorldPosition);
 				Ray.TMax = max(RayLength - 0.01, Ray.TMin);
 
 				// Trace ray
@@ -368,14 +781,22 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 				{
 					float3 ExitantRadianceSample = GPIrradiance * RayThroughput * Weight / RayPdf;
 
-					// Tonemap for firefly suppression
-					if (UseFireflySuppression)
+					// if (UseSH)
+					// {
+					// 	CompressSHCoef(ExitantRadianceSample, L, ExitantRadianceShY, ExitantRadianceCoCg);
+					// }
+					// else
 					{
-						ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
-					}
+						// Tonemap for firefly suppression
+						if (UseFireflySuppression)
+						{
+							ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+						}
 
-					ExitantRadiance += ExitantRadianceSample;
-					MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+						ExitantRadiance += ExitantRadianceSample;
+						MaxExitantRadianceSample = Luminance(ExitantRadianceSample) > Luminance(MaxExitantRadianceSample) ? ExitantRadianceSample : MaxExitantRadianceSample;
+					}			
+
 					HitDistance += rcp(Ray.TMax);
 					HitCount += 1.0;
 				}
@@ -410,9 +831,18 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 		}
 
 		AmbientOcclusion = HitCount / ValidSamplesPerPixel;
-		HitDistance = ValidSamplesPerPixel / HitDistance;
+		// HitDistance = ValidSamplesPerPixel / HitDistance;
+		if (HitDistanceType != USE_MIN_HITDISTANCE)
+		{
+			HitDistance = ValidSamplesPerPixel / HitDistance;
+		}
+		ExitantRadianceCoCg /= ValidSamplesPerPixel;
+		ExitantRadianceShY /= ValidSamplesPerPixel;
 	}
 	ExitantRadiance *= View.PreExposure;
+	ExitantRadianceCoCg *= View.PreExposure;
+	ExitantRadianceShY *= View.PreExposure;
+
 	ExitantRadiance = ClampToHalfFloatRange(ExitantRadiance);
 #if 0
 	// Threshold against low luminance..
@@ -426,7 +856,17 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingFinalGatherRGS)
 	{
 		HitDistance = -1.0;
 	}
-
-	RWGlobalIlluminationUAV[DispatchThreadId] = float4(ExitantRadiance, AmbientOcclusion);
+	float4 Data;
+	// if (UseSH)
+	// {
+	// 	// Pack SH data into the original texture so that we don't need another one
+	// 	uint4 DataI = PackColorData(ExitantRadianceShY, ExitantRadianceCoCg, AmbientOcclusion);
+	// 	Data = asfloat(DataI);
+	// }
+	// else
+	{
+		Data = float4(ExitantRadiance, AmbientOcclusion);
+	}
+	RWGlobalIlluminationUAV[DispatchThreadId] = Data;
 	RWGlobalIlluminationRayDistanceUAV[DispatchThreadId] = float2(HitDistance, ValidSamplesPerPixel);
 }

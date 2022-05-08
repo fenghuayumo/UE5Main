@@ -58,63 +58,20 @@ void GenerateCosineNormalRay(
 	RayPdf = Direction_Tangent.w;
 }
 
-void ReconstructWorldPositionFromDeviceZ(uint2 PixelCoord, float DeviceZ, out float3 OutWorldPosition, out float3 OutCameraDirection)
+void ReconstructWorldPositionAndCameraDirectionFromDeviceZ(uint2 PixelCoord, float DeviceZ, out float3 OutWorldPosition, out float3 OutCameraDirection)
 {
-	// float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
-	// TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
-	// // float3 WorldCameraOrigin = LWCHackToFloat(PrimaryView.WorldCameraOrigin);
-	// // OutWorldPosition = TranslatedWorldPosition.xyz + WorldCameraOrigin;
-	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
-	float2 UV = (float2(PixelCoord) + 0.5) * InvBufferSize;
-	// float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
-	// float Depth = ConvertFromDeviceZ(DeviceZ);
-	// float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), LWCHackToFloat(PrimaryView.ScreenToWorld));
-	// OutWorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
-
-	// OutCameraDirection = normalize(TranslatedWorldPosition.xyz - View.TranslatedWorldCameraOrigin);
-
-	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
-
-	RayDesc Ray;
-	float4 NearPoint = mul(float4(ScreenPosition, 1, 1), View.ClipToTranslatedWorld);
-	float4 FarPoint  = mul(float4(ScreenPosition, 0, 1), View.ClipToTranslatedWorld);
-	OutWorldPosition = NearPoint.xyz * rcp(NearPoint.w);
-	OutCameraDirection = normalize(FarPoint.w * NearPoint.xyz - NearPoint.w * FarPoint.xyz);
-
+	float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	OutWorldPosition = TranslatedWorldPosition.xyz + LWCHackToFloat(PrimaryView.WorldCameraOrigin);
+	OutCameraDirection = normalize(TranslatedWorldPosition.xyz - View.TranslatedWorldCameraOrigin);
 }
 
-
-// float3 ReconstructWorldPositionFromDepth(float2 UV, float Depth)
-// {
-// 	float2 ScreenPosition = (UV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
-// 	float4 HomogeneousWorldPosition = mul(float4(ScreenPosition * Depth, Depth, 1), LWCHackToFloat(PrimaryView.ScreenToWorld));
-// 	float3 WorldPosition = HomogeneousWorldPosition.xyz / HomogeneousWorldPosition.w;
-
-// 	return WorldPosition;
-// }
-// float3 TraceTransparentVisibilityRay(RayDesc Ray, uint2 PixelCoord, float PathRoughness, inout RandomSequence RandSequence)
-// {
-// 	const uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
-// 	const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW | RAY_TRACING_MASK_THIN_SHADOW;
-// 	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_SHADOW;
-// 	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
-// 	const uint MissShaderIndex = 0;
-
-// 	FPackedPathTracingPayload PackedPayload = InitPathTracingVisibilityPayload(PixelCoord, PathRoughness);
-
-// 	// Trace the ray
-// 	TraceRay(
-// 		TLAS,
-// 		RayFlags,
-// 		InstanceInclusionMask,
-// 		RayContributionToHitGroupIndex,
-// 		MultiplierForGeometryContributionToShaderIndex,
-// 		MissShaderIndex,
-// 		Ray,
-// 		PackedPayload);
-
-// 	return (PackedPayload.IsMiss());
-// }
+float3 ReconstructWorldPositionFromDeviceZ(uint2 PixelCoord, float DeviceZ)
+{
+	float4 TranslatedWorldPosition = mul(float4(PixelCoord + 0.5, DeviceZ, 1), View.SVPositionToTranslatedWorld);
+	TranslatedWorldPosition.xyz /= TranslatedWorldPosition.w;
+	return TranslatedWorldPosition.xyz + LWCHackToFloat(PrimaryView.WorldCameraOrigin);
+}
 
 RAY_TRACING_ENTRY_RAYGEN(GlobalIlluminationRGS)
 {

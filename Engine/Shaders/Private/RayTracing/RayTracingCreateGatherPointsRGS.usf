@@ -48,6 +48,15 @@ int2 GatherPointsResolution;
 uint2 TileAlignedResolution;
 uint SortTileSize;
 
+//Change_Begin
+uint UseReservoir;
+uint UseUniformSampling;
+uint ReservoirUpdateInterval;
+uint MultiBounceInterval;
+uint NormalFromDepth;
+float ReservoirUpdateTolerance;
+//CHanged_End
+
 RWStructuredBuffer<FGatherPoints> RWGatherPointsBuffer;
 // Material buffer and tile size are used for sorted materials.
 RWStructuredBuffer<FDeferredMaterialPayload> MaterialBuffer;
@@ -91,7 +100,12 @@ void GenerateCosineNormalRay(
 )
 {
 	// Perform cosine-hemispherical sampling and convert to world-space
-	float4 Direction_Tangent = CosineSampleHemisphere(RandSample);
+	float4 Direction_Tangent; 
+	if (UseUniformSampling)
+		Direction_Tangent = UniformSampleHemisphere(RandSample);
+	else
+		Direction_Tangent = CosineSampleHemisphere(RandSample);
+
 	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
 
 	RayOrigin = TranslatedWorldPosition;
@@ -127,6 +141,15 @@ bool ShouldTraceRay(uint2 DispatchThreadId, FGBufferData GBufferData)
 
 	return bTraceRay;
 }
+
+// uint2 GetPixelCoordNoOffset(uint2 DispatchThreadId)
+// {
+// #if 1
+// 	return GetPixelCoord(DispatchThreadId, UpscaleFactor);
+// #else
+// 	return (DispatchThreadId << UpscaleFactorBits);
+// #endif
+// }
 
 void ReconstructWorldPosition(float2 UV, float SceneDepth, out float3 OutWorldPosition, out float3 OutCameraDirection)
 {
@@ -177,7 +200,10 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsTraceRGS)
 	// TranslatedWorldPosition = ReconstructWorldPositionFromDepth(UV, SceneDepth);
 	// CameraDirection = normalize(TranslatedWorldPosition - LWCHackToFloat(PrimaryView.WorldCameraOrigin));
 	float3 WorldNormal = GBufferData.WorldNormal;
-
+	if (NormalFromDepth)
+	{
+		WorldNormal = ReconstructWorldNormalFromDeviceZ(SceneDepthTexture, PixelCoord, DeviceZ, TranslatedWorldPosition, WorldNormal);
+	}
 	// Determine blue-noise coordinate, based on the local neighborhood
 	uint2 BlueNoiseCoord = PixelCoord / GatherFilterWidth;
 	uint Iteration = (PixelCoord.y % GatherFilterWidth) * GatherFilterWidth + (PixelCoord.x % GatherFilterWidth);
@@ -258,10 +284,6 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 
 	uint GatherPointsIndex = DispatchThreadIdToLinearIndex(DispatchThreadId);
 
-	// Default initialization
-	FGatherSample GatherSample = (FGatherSample)0.0;
-	WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
-
 	// Get G-Buffer surface data
 	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
 	float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
@@ -290,6 +312,13 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 	// CameraDirection = normalize(TranslatedWorldPosition - LWCHackToFloat(PrimaryView.WorldCameraOrigin));
 
 	float3 WorldNormal = GBufferData.WorldNormal;
+	
+	if (NormalFromDepth)
+	{
+		WorldNormal = ReconstructWorldNormalFromDeviceZ(SceneDepthTexture, PixelCoord, DeviceZ, TranslatedWorldPosition, WorldNormal);
+		GBufferData.WorldNormal = WorldNormal;
+	}
+
 
 	// Determine blue-noise coordinate, based on the local neighborhood
 	uint2 BlueNoiseCoord = PixelCoord / GatherFilterWidth;
@@ -301,16 +330,45 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 	FGBufferData SampleCenterGBufferData = GetGBufferDataFromSceneTexturesLoad(SampleCenterCoord);
 	float3 SampleCenterNormal = SampleCenterGBufferData.WorldNormal;
 
+	
+	// Default initialization
+	FGatherSample GatherSample = (FGatherSample)0.0;
+	//WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+	//Changed_Begin
+	GatherSample.M = -1;
+	bool bUpdateCache = UseReservoir && ReservoirUpdateInterval > 1 && View.FrameNumber % ReservoirUpdateInterval == 1 && length(View.TranslatedWorldCameraOrigin - View.PrevTranslatedWorldCameraOrigin) < 100;
+	if (bUpdateCache)
+	{
+		// Project to last frame
+		float2 UV = float2(DispatchThreadId.xy + 0.5) / GatherPointsResolution.xy;
+		float4 ThisClip = float4(UV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+		float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+		float2 PrevScreen = PrevClip.xy / PrevClip.w;
+		float2 PrevUV = PrevScreen * float2(0.5, -0.5) + 0.5;
+		bUpdateCache &= all(PrevUV > 0) && all(PrevUV < 1);
+		if (bUpdateCache)
+		{
+			uint2 PrevID = clamp(PrevUV * GatherPointsResolution.xy, 0, GatherPointsResolution.xy - 1);
+			uint PrevIdx = DispatchThreadIdToLinearIndex(PrevID);
+
+			// Read samples to validate
+			uint SampleIndexOffsetGSrc = 0;
+			GatherSample = ReadGatherSample(RWGatherPointsBuffer, PrevIdx, SampleIndexOffsetGSrc, GatherPointsResolution.x * GatherPointsResolution.y);
+		}
+		uint ValidationID = View.FrameNumber / ReservoirUpdateInterval % 512;
+		bUpdateCache &= (GatherSample.M == ValidationID);
+	}
+	else
+	{
+		WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, UseReservoir ? 1 : SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+	}
+	//Changed_End
+
 	bool bTraceRay = ShouldTraceRay(DispatchThreadId, GBufferData);
 	if (bTraceRay)
 	{
-#if 0
-		// Adaptive rejection optimization
-		{
-			float3 GPTranslatedPositionPosition = RWGatherPointsBuffer[GatherPointsIndex].CreationPoint[SampleIndex];
-			if (length(GPTranslatedPositionPosition - TranslatedWorldPosition) < 10.0) continue;
-		}
-#endif
+		uint SampleIndexOffset = SampleIndex % GatherSamplesPerPixel;
+
 		float3 Irradiance = 0;
 		float3 TranslatedPosition = 0;
 		float3 Normal = 0;
@@ -322,11 +380,27 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 		// Initialize ray
 		RayDesc Ray;
 		float RayPdf = 1.0;
-		GenerateCosineNormalRay(TranslatedWorldPosition, WorldNormal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
-		//GenerateUniformRay(TranslatedWorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
-		//GenerateCosineNormalRay(TranslatedWorldPosition, SampleCenterNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
-		// Distribution PDF is not used for gather points, only gather queries.
-		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+		if (bUpdateCache)
+		{
+			// When validation is triggered, initialize ray from samples
+			Ray.Origin = GatherSample.CreationPoint + LWCHackToFloat(PrimaryView.PreViewTranslation);
+			Ray.Direction = normalize(GatherSample.Position - GatherSample.CreationPoint);
+			Ray.TMin = 0.01;
+			Ray.TMax = MaxRayDistanceForGI;
+		}
+		else
+		{
+			// Otherwise, shoot rays randomly
+			GenerateCosineNormalRay(TranslatedWorldPosition, WorldNormal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+			// Distribution PDF is not used for gather points, only gather queries.
+			ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+		}
+
+		// GenerateCosineNormalRay(TranslatedWorldPosition, WorldNormal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		// //GenerateUniformRay(TranslatedWorldPosition, WorldNormal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		// //GenerateCosineNormalRay(TranslatedWorldPosition, SampleCenterNormal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		// // Distribution PDF is not used for gather points, only gather queries.
+		// ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
 
 			uint RayFlags = 0;
 			const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
@@ -351,7 +425,11 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 				Ray.TMax = 0;
 			}
 		}
-
+		
+		float3 Throughput = 1;
+		uint2 TileIdx = DispatchRaysIndex().xy / uint2(64, 32);
+		int TotalBounces = ((View.FrameNumber + TileIdx.y + TileIdx.x) % MultiBounceInterval == 0) ? MaxBounces : 1;
+		for (int i = 0; i < TotalBounces; ++i)
 		{
 			// Cast ray
 			const bool bDisableSkyLightContribution = false;
@@ -371,7 +449,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 			if (Payload.HitT > MaxRayDistanceForGI) return;
 
 			// Update intersection
-			Ray.Origin += Ray.Direction * Payload.HitT;
+			Ray.Origin += Ray.Direction * (Payload.IsMiss() ? 1e8 : Payload.HitT);
 
 			// Create faux GBuffer to use with EvaluateBxDF
 			FGBufferData GBufferData = (FGBufferData)0;
@@ -389,8 +467,27 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 			GBufferData.ShadingModelID = Payload.ShadingModelID;
 			GBufferData.CustomData = Payload.CustomData;
 
+			//CHanged_Begin
+			float3 Irradiance2 = 0;
+			//if (AccumulateEmissive)
+			{
+				Irradiance2 = Throughput * Payload.Radiance;
+			}
+			//Changed_End
+
 			TranslatedPosition = Ray.Origin;
 			Normal = Payload.WorldNormal;
+
+			if (i == 0)
+			{
+				GatherSample.Position = TranslatedPosition - LWCHackToFloat(PrimaryView.PreViewTranslation);;
+				GatherSample.Normal = Normal;
+			}
+			if (Payload.IsMiss())
+			{
+				Irradiance = Irradiance / (2 * PI) + Irradiance2;
+				break;
+			}
 
 			// Perform next-event estimation
 			float SplitFactor = 1.0 / NextEventEstimationSamples;
@@ -401,10 +498,26 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 				float3 LightRadianceOverPdf = 0;
 				float NeePdf = 0.0;
 
-				float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+				float4 RandSample4; 
+				if (bUpdateCache)
+				{
+					// Recover random numbers to verify original lighting result
+					uint LightRandom = GatherSample.LightRandom;
+					uint3 RandSample3I = uint3(LightRandom >> 20, LightRandom >> 10, LightRandom);
+					RandSample4 = float4(float3(RandSample3I & uint3(0xfff, 0x3ff, 0x3ff)) / float3(4096, 1024, 1024), 0.0);
+				}
+				else
+				{
+					RandSample4 = RandomSequence_GenerateSample4D(RandSequence);
+
+					// Record random number for validation
+					uint3 RandSample3I = clamp(uint3(RandSample4.xyz * float3(4096, 1024, 1024)), 0, uint3(4095, 1023, 1023));
+					GatherSample.LightRandom = (RandSample3I.x << 20) | (RandSample3I.y << 10) | (RandSample3I.z);
+				}
+
 
 				RayDesc LightRay;
-				if (SampleLight(RandSample3,
+				if (SampleLight(RandSample4.xyz,
 								TranslatedPosition,
 								Normal,
 								Payload.PrimitiveLightingChannelMask,
@@ -459,19 +572,54 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingCreateGatherPointsRGS)
 
 						// Record the contribution
 						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * SplitFactor ;
-						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+						
+						//CHanged_Begin
+						// if (IsEnvironmentLight(LightId))
+						// {
+						// 	ExitantRadianceSample *= SkyLightIndirectIntensity;
+						// 	ExitantRadianceSample *= SkyLightDirectIntensity;
+						// }
+						//Changed_End
+						
+						Irradiance2 += Throughput * (isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0);
 					}
 				}
 			}
+			Irradiance = Irradiance / (2 * PI) + Irradiance2;
+			if (i < TotalBounces - 1)
+			{
+				RandSample = RandomSequence_GenerateSample2D(RandSequence);
+				float RayPdf2 = 0;
+				GenerateCosineNormalRay(TranslatedPosition, Normal, RandSample, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf2);
+				RayPdf *= RayPdf2;
+				Throughput *= Diffuse_Lambert(Payload.DiffuseColor) * saturate(dot(Normal, Ray.Direction)) * MultiBounceInterval;
+			}
 		}
 
-		FGatherSample GatherSample = (FGatherSample)0.0;
-		GatherSample.TranslatedCreationPoint = TranslatedWorldPosition;
-		GatherSample.TranslatedPosition = TranslatedPosition;
-		GatherSample.Irradiance = Irradiance;
-		GatherSample.Pdf = RayPdf;
+		// CHANGE_BEGIN_YB : GI
+		Irradiance = ClampToHalfFloatRange(Irradiance);
+		if (!bUpdateCache)
+		{
+			GatherSample.CreationPoint = TranslatedWorldPosition - LWCHackToFloat(PrimaryView.PreViewTranslation);;
+			GatherSample.CreationNormal = WorldNormal;
+			GatherSample.Irradiance = Irradiance;
+		}
+		else
+		{
+			// Verify samples
+			float Tolerance = max(0.1, dot(GatherSample.Irradiance, 1) * ReservoirUpdateTolerance);
+			float3 DiffRadiance = Irradiance - GatherSample.Irradiance;
+			bool isValid = length(DiffRadiance) < Tolerance;
 
-		WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndex, GatherPointsResolution.x * GatherPointsResolution.y, GatherSample);
+			// Set validation result
+			GatherSample.Irradiance = 0;                       // Set irradiance to 0 so that valid reservoir will not get affected
+			GatherSample.M = isValid ? GatherSample.M : -1;    // Use M to indicate invalid samples
+		}
+		GatherSample.AvgWeight = RayPdf;
+
+		uint SampleIndexOffsetGDst = UseReservoir ? 1 : SampleIndexOffset;
+		WriteGatherSample(RWGatherPointsBuffer, GatherPointsIndex, SampleIndexOffsetGDst, GatherPointsResolution.x* GatherPointsResolution.y, GatherSample);
+		// CHANGE_END_YB : GI
 		RWGlobalIlluminationUAV[DispatchThreadId] = float4(Irradiance, 1);
 	}
 }

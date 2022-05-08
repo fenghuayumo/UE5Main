@@ -127,7 +127,7 @@ TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationEnableTransmission(
 	ECVF_RenderThreadSafe
 );
 
-static int32 GRayTracingGlobalIlluminationRenderTileSize = 0;
+int32 GRayTracingGlobalIlluminationRenderTileSize = 0;
 static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationRenderTileSize(
 	TEXT("r.RayTracing.GlobalIllumination.RenderTileSize"),
 	GRayTracingGlobalIlluminationRenderTileSize,
@@ -242,6 +242,92 @@ static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationRectLight(
 	1,
 	TEXT("Enables RectLight sampling for global illumination (default = 1)"),
 	ECVF_RenderThreadSafe);
+
+
+static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.UseReservoirResampling"),
+	1,
+	TEXT("Sets whether refected materials will be sorted before shading\n")
+	TEXT("0: Disabled\n ")
+	TEXT("1: Enabled\n"),
+	ECVF_RenderThreadSafe);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherTemporalReservoirSamples = 30;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherTemporalSamples(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.TemporalReservoirSamples"),
+	GRayTracingGlobalIlluminationFinalGatherTemporalReservoirSamples,
+	TEXT("Number of samples for temporal reuse (default = 30)")
+);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherSpatialReservoirSamples = 500;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherSpatialSamples(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.SpatialReservoirSamples"),
+	GRayTracingGlobalIlluminationFinalGatherSpatialReservoirSamples,
+	TEXT("Number of samples for Spatial reuse (default = 500)")
+);
+
+static float GRayTracingGlobalIlluminationFinalGatherReservoirUpdateTolerance = 0.1;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherReservoirUpdateTolerance(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.ReservoirUpdateTolerance"),
+	GRayTracingGlobalIlluminationFinalGatherReservoirUpdateTolerance,
+	TEXT("Tolerance for invalid samples (default = 0.1)")
+);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherAggressiveReservoirReuse = 0;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherAggressiveReservoirReuse(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.AggressiveReservoirReuse"),
+	GRayTracingGlobalIlluminationFinalGatherAggressiveReservoirReuse,
+	TEXT("Enable more aggressive reservoir reuse to improve convergence speed. Bias may be larger.")
+);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherUseUniformSampling = 1;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherUseUniformSampling(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.UseUniformSampling"),
+	GRayTracingGlobalIlluminationFinalGatherUseUniformSampling,
+	TEXT("Use uniform sampling if reservoir resampling is enabled.")
+);
+
+static float GRayTracingGlobalIlluminationFinalGatherMaxReuseWeight = 20;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherMaxReuseWeight(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.MaxReuseWeight"),
+	GRayTracingGlobalIlluminationFinalGatherMaxReuseWeight,
+	TEXT("Set maximum reuse weight to supress fireflies (default = 20)")
+);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherNormalFromDepth = 0;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherNormalFromDepth(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.NormalFromDepth"),
+	GRayTracingGlobalIlluminationFinalGatherNormalFromDepth,
+	TEXT("Use depth value to calculate normal. This configuration can produce more stable result in low resolution.")
+);
+
+static int32 GRayTracingGlobalIlluminationFinalGatherMultiBounceInterval = 4;
+static FAutoConsoleVariableRef CVarRayTracingGlobalIlluminationFinalGatherMultiBounceInterval(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.MultiBounceInterval"),
+	GRayTracingGlobalIlluminationFinalGatherMultiBounceInterval,
+	TEXT("Specify frame interval to compute multi-bounce GI (default=4).")
+);
+
+static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationFinalGatherReservoirUpdateInterval(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.ReservoirUpdateInterval"),
+	6,
+	TEXT("Average frame interval for update reservoir samples, should be > 1 (disabled = -1, default = 6)\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarRayTracingGlobalIlluminationFinalGatherSwitchCameraTolerance(
+	TEXT("r.RayTracing.GlobalIllumination.FinalGather.SwitchCameraTolerance"),
+	100,
+	TEXT("Camera switch tolerance\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRayTracingGlobalIlluminationUseSH(
+	TEXT("r.RayTracing.GIDenoise.UseSH"),
+	0,
+	TEXT("Sets whether use spherical harmonics.\n")
+	TEXT("0: Disabled\n ")
+	TEXT("1: Enabled\n"),
+	ECVF_RenderThreadSafe);
+
 
 DECLARE_GPU_STAT_NAMED(RayTracingGIBruteForce, TEXT("Ray Tracing GI: Brute Force"));
 DECLARE_GPU_STAT_NAMED(RayTracingGIFinalGather, TEXT("Ray Tracing GI: Final Gather"));
@@ -514,12 +600,16 @@ IMPLEMENT_GLOBAL_SHADER(FGlobalIlluminationRGS, "/Engine/Private/RayTracing/RayT
 
 // Note: This constant must match the definition in RayTracingGatherPoints.ush
 constexpr int32 MAXIMUM_GATHER_POINTS_PER_PIXEL = 32;
+constexpr int32 MAXIMUM_GATHER_POINTS_PER_PIXEL_RESTIR_GI = 4;
 
 struct FGatherPoint
 {
-	FVector CreationPoint;
-	FVector Position;
-	FIntPoint Irradiance;
+	// FVector CreationPoint;
+	// FVector Position;
+	// FIntPoint Irradiance;
+	FIntVector4 CreationGeometry;
+	FIntVector4 HitGeometry;
+	FIntVector4 LightInfo;
 };
 
 class FRayTracingGlobalIlluminationCreateGatherPointsRGS : public FGlobalShader
@@ -562,6 +652,14 @@ class FRayTracingGlobalIlluminationCreateGatherPointsRGS : public FGlobalShader
 		SHADER_PARAMETER(uint32, EvalSkyLight)
 		SHADER_PARAMETER(uint32, UseRussianRoulette)
 
+		//Changed:
+		SHADER_PARAMETER(uint32, ReservoirUpdateInterval)
+		SHADER_PARAMETER(float, ReservoirUpdateTolerance)
+		SHADER_PARAMETER(uint32, UseReservoir)
+		SHADER_PARAMETER(uint32, UseUniformSampling)
+		SHADER_PARAMETER(uint32, NormalFromDepth)
+		SHADER_PARAMETER(uint32, MultiBounceInterval)
+		//Changed:
 		// Scene data
 		SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
@@ -627,6 +725,10 @@ class FRayTracingGlobalIlluminationCreateGatherPointsTraceRGS : public FGlobalSh
 		SHADER_PARAMETER(float, MaxNormalBias)
 		SHADER_PARAMETER(uint32, EvalSkyLight)
 		SHADER_PARAMETER(uint32, UseRussianRoulette)
+		//Changed_begin
+		SHADER_PARAMETER(uint32, NormalFromDepth)
+		SHADER_PARAMETER(uint32, UseUniformSampling)
+		//Changed_end
 
 		// Scene data
 		SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
@@ -661,8 +763,11 @@ class FRayTracingGlobalIlluminationFinalGatherRGS : public FGlobalShader
 	class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY");
 	class FEnableNeighborVisibilityTestDim : SHADER_PERMUTATION_BOOL("USE_NEIGHBOR_VISIBILITY_TEST");
 
-	using FPermutationDomain = TShaderPermutationDomain<FEnableTwoSidedGeometryDim, FEnableNeighborVisibilityTestDim>;
+	//Changed
+	class FUseReservoirResamplingDim : SHADER_PERMUTATION_BOOL("USE_RESERVOIR_RESAMPLING");
 
+	using FPermutationDomain = TShaderPermutationDomain<FEnableTwoSidedGeometryDim, FEnableNeighborVisibilityTestDim, FUseReservoirResamplingDim>;
+	//Changed
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
 		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
@@ -683,6 +788,25 @@ class FRayTracingGlobalIlluminationFinalGatherRGS : public FGlobalShader
 		SHADER_PARAMETER(float, DepthRejectionKernel)
 		SHADER_PARAMETER(float, NormalRejectionKernel)
 
+		//Changed Begin: RestirGI
+		SHADER_PARAMETER(uint32, UseSH)
+		SHADER_PARAMETER(uint32, TemporalSamples)
+		SHADER_PARAMETER(uint32, SpatialSamples)
+		SHADER_PARAMETER(uint32, ReservoirUpdateInterval)
+		SHADER_PARAMETER(uint32, AggressiveReservoirReuse)
+		SHADER_PARAMETER(uint32, UseUniformSampling)
+		SHADER_PARAMETER(uint32, NormalFromDepth)
+		SHADER_PARAMETER(float, MaxReuseWeight)
+		SHADER_PARAMETER(uint32, HitDistanceType)
+
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GatherPoints>, ReservoirBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GatherPoints>, RWReservoirBuffer)
+
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureLast)
+		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureLast)
+
+		//Changed End: RestirGI
+
 		// Reprojection data
 		SHADER_PARAMETER_STRUCT_REF(FGatherPointData, GatherPointData)
 
@@ -694,7 +818,7 @@ class FRayTracingGlobalIlluminationFinalGatherRGS : public FGlobalShader
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
 
 		// Gather points
-		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GatherPoints>, GatherPointsBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GatherPoints>, GatherPointsBuffer)
 		SHADER_PARAMETER(FIntPoint, GatherPointsResolution)
 
 		// Output
@@ -705,14 +829,93 @@ class FRayTracingGlobalIlluminationFinalGatherRGS : public FGlobalShader
 
 IMPLEMENT_GLOBAL_SHADER(FRayTracingGlobalIlluminationFinalGatherRGS, "/Engine/Private/RayTracing/RayTracingFinalGatherRGS.usf", "RayTracingFinalGatherRGS", SF_RayGen);
 
+
+class FClearReservoir : public FGlobalShader
+{
+public:
+	DECLARE_GLOBAL_SHADER(FClearReservoir);
+	SHADER_USE_PARAMETER_STRUCT(FClearReservoir, FGlobalShader);
+
+	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+		SHADER_PARAMETER(uint32, SamplesPerPixel)
+		SHADER_PARAMETER(FIntPoint, GatherPointsResolution)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GatherPoints>, RWReservoirBuffer0)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GatherPoints>, RWReservoirBuffer1)
+	END_SHADER_PARAMETER_STRUCT()
+
+	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+	{
+		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+	}
+
+	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+	{
+		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+	}
+};
+
+IMPLEMENT_GLOBAL_SHADER(FClearReservoir, "/Engine/Private/RayTracing/RayTracingClearReservoir.usf", "ClearReservoir", SF_Compute);
+
+// Camera switch may cause the ReSTIR GI algorithm fails to reuse any sample and produce low quality output.
+// Thus special configuration is needed.
+void CheckCameraSwitch(const FViewInfo& View)
+{
+	FSceneViewState* SceneViewState = (FSceneViewState*)View.State;
+	if (!SceneViewState) return;
+
+	FVector DeltaPosition = View.ViewMatrices.GetViewOrigin() - SceneViewState->LastFrameInvViewMatrix.GetOrigin();
+	FMatrix DeltaInvView = View.ViewMatrices.GetInvViewMatrix() + SceneViewState->LastFrameInvViewMatrix * (-1);
+	FVector dX, dY, dZ;
+	DeltaInvView.GetUnitAxes(dX, dY, dZ);
+	static float AngleTolerance = 4;
+	static int CameraSwitchFrameCount = 10;
+	if (DeltaPosition.Size() > CVarRayTracingGlobalIlluminationFinalGatherSwitchCameraTolerance.GetValueOnRenderThread() ||
+		dX.SizeSquared() + dY.SizeSquared() + dZ.SizeSquared() > AngleTolerance)
+	{
+		SceneViewState->CameraSwitchFrameCount = CameraSwitchFrameCount;
+	}
+	else
+	{
+		SceneViewState->CameraSwitchFrameCount = FMath::Clamp(SceneViewState->CameraSwitchFrameCount - 1, 0, 30);
+	}
+	SceneViewState->LastFrameInvViewMatrix = View.ViewMatrices.GetInvViewMatrix();
+}
+
+bool IsCameraSwitch(const FViewInfo& View)
+{
+	FSceneViewState* SceneViewState = (FSceneViewState*)View.State;
+	if (!SceneViewState) return false;
+	return SceneViewState->CameraSwitchFrameCount > 0;
+}
+
+int32 GetValidationInterval(const FViewInfo& View)
+{
+	int32 MaxBouncesValue = CVarRayTracingGlobalIlluminationMaxBounces.GetValueOnRenderThread();
+	if (MaxBouncesValue <= -1)
+	{
+		MaxBouncesValue = View.FinalPostProcessSettings.RayTracingGIMaxBounces;
+	}
+	int32 ValidationInterval = MaxBouncesValue != 1 || IsCameraSwitch(View) ? -1 : CVarRayTracingGlobalIlluminationFinalGatherReservoirUpdateInterval.GetValueOnRenderThread();
+	return ValidationInterval;
+}
+
+bool ShouldValidateReservoir(const FViewInfo& View)
+{
+	bool bUseReservoir = CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling.GetValueOnRenderThread() != 0;
+	int32 ValidationInterval = GetValidationInterval(View);
+	return bUseReservoir && ValidationInterval > 1 && View.Family->FrameNumber % ValidationInterval == 1;
+}
+
 void FDeferredShadingSceneRenderer::PrepareRayTracingGlobalIllumination(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders)
 {
 	if (!ShouldRenderRayTracingGlobalIllumination(View))
 	{
 		return;
 	}
+	bool bValidateReservoir = ShouldValidateReservoir(View);
+	const bool bSortMaterials = CVarRayTracingGlobalIlluminationFinalGatherSortMaterials.GetValueOnRenderThread() != 0 && !bValidateReservoir;
+	const bool bReservoirResampling = CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling.GetValueOnRenderThread() != 0;
 
-	const bool bSortMaterials = CVarRayTracingGlobalIlluminationFinalGatherSortMaterials.GetValueOnRenderThread() != 0;
 	int EnableTransmission = CVarRayTracingGlobalIlluminationEnableTransmission.GetValueOnRenderThread();
 
 	// Declare all RayGen shaders that require material closest hit shaders to be bound
@@ -760,6 +963,7 @@ void FDeferredShadingSceneRenderer::PrepareRayTracingGlobalIllumination(const FV
 			FRayTracingGlobalIlluminationFinalGatherRGS::FPermutationDomain GatherPassPermutationVector;
 			GatherPassPermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FEnableTwoSidedGeometryDim>(EnableTwoSidedGeometry == 1);
 			GatherPassPermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FEnableNeighborVisibilityTestDim>(EnableNeighborVisibilityTest == 1);
+			GatherPassPermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FUseReservoirResamplingDim>(bReservoirResampling);
 			TShaderMapRef<FRayTracingGlobalIlluminationFinalGatherRGS> GatherPassRayGenerationShader(View.ShaderMap, GatherPassPermutationVector);
 			OutRayGenShaders.Add(GatherPassRayGenerationShader.GetRayTracingShader());
 		}
@@ -852,11 +1056,17 @@ bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 
 	// Allocate input for the denoiser.
 	{
+		int UseSH = false;
+		if (View.ViewState && View.ViewState->GIDenoiseType == 2 && IsFinalGatherEnabled(View))
+			UseSH = CVarRayTracingGlobalIlluminationUseSH.GetValueOnRenderThread();
+		OutRayTracingConfig->UseSphericalHarmonicsGI = bool(UseSH);
+
 		FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
 			SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactor,
-			PF_FloatRGBA,
+			UseSH ? PF_A32B32G32R32F : PF_FloatRGBA,
 			FClearValueBinding::None,
 			TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
+
 
 		OutDenoiserInputs->Color = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingDiffuseIndirect"));
 
@@ -913,6 +1123,11 @@ void CopyGatherPassParameters(
 	NewParameters->EvalSkyLight = PassParameters.EvalSkyLight;
 	NewParameters->UseRussianRoulette = PassParameters.UseRussianRoulette;
 
+	//Changed Begin:
+	NewParameters->NormalFromDepth = PassParameters.NormalFromDepth;
+	NewParameters->UseUniformSampling = PassParameters.UseUniformSampling;
+	//Changed End:
+
 	NewParameters->TLAS = PassParameters.TLAS;
 	NewParameters->ViewUniformBuffer = PassParameters.ViewUniformBuffer;
 
@@ -951,10 +1166,19 @@ void CopyGatherPassParameters(
 	NewParameters->MaxNormalBias = PassParameters.MaxNormalBias;
 	NewParameters->EvalSkyLight = PassParameters.EvalSkyLight;
 	NewParameters->UseRussianRoulette = PassParameters.UseRussianRoulette;
+	//Changed Begin:
+	NewParameters->ReservoirUpdateInterval = PassParameters.ReservoirUpdateInterval;
+	NewParameters->ReservoirUpdateTolerance = PassParameters.ReservoirUpdateTolerance;
+	NewParameters->UseReservoir = PassParameters.UseReservoir;
+	NewParameters->UseUniformSampling = PassParameters.UseUniformSampling;
+	NewParameters->NormalFromDepth = PassParameters.NormalFromDepth;
+	//Changed End
+
+	NewParameters->MultiBounceInterval = PassParameters.MultiBounceInterval;
 
 	NewParameters->TLAS = PassParameters.TLAS;
 	NewParameters->ViewUniformBuffer = PassParameters.ViewUniformBuffer;
-
+	
 	NewParameters->SceneLightCount = PassParameters.SceneLightCount;
 	NewParameters->SceneLights = PassParameters.SceneLights;
 	NewParameters->SkylightParameters = PassParameters.SkylightParameters;
@@ -983,14 +1207,18 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 {	
 	RDG_GPU_STAT_SCOPE(GraphBuilder, RayTracingGICreateGatherPoints);
 	RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: Create Gather Points");
+	const bool bUseReservoir = CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling.GetValueOnRenderThread() != 0;
+	int32 GatherSamples = bUseReservoir ? 2 : FMath::Min(GetRayTracingGlobalIlluminationSamplesPerPixel(View), MAXIMUM_GATHER_POINTS_PER_PIXEL);
+	int32 GatherPointIterations = FMath::Max(CVarRayTracingGlobalIlluminationFinalGatherIterations.GetValueOnRenderThread(), 1);
+	GatherPointIterations = bUseReservoir ? 1 : GatherPointIterations;
 
-	int32 GatherSamples = FMath::Min(GetRayTracingGlobalIlluminationSamplesPerPixel(View), MAXIMUM_GATHER_POINTS_PER_PIXEL);
 	int32 SamplesPerPixel = 1;
 
 	// Determine the local neighborhood for a shared sample sequence
 	int32 GatherFilterWidth = FMath::Max(CVarRayTracingGlobalIlluminationFinalGatherFilterWidth.GetValueOnRenderThread(), 0);
 	GatherFilterWidth = GatherFilterWidth * 2 + 1;
 
+	int32 FrameIndex = (View.ViewState->FrameIndex * GatherPointIterations + SampleIndex) % 1024;
 
 	float MaxShadowDistance = 1.0e27;
 	if (GRayTracingGlobalIlluminationMaxShadowDistance > 0.0)
@@ -1004,22 +1232,37 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 	}
 
 	FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters>();
+	int32 ValidationInterval = GetValidationInterval(View);
+	bool bValidateReservoir = ShouldValidateReservoir(View);
+	int32 MaxBouncesValue = bUseReservoir ? CVarRayTracingGlobalIlluminationMaxBounces.GetValueOnRenderThread() : 1;
+	if (MaxBouncesValue <= -1)
+	{
+		MaxBouncesValue = View.FinalPostProcessSettings.RayTracingGIMaxBounces;
+	}
+	PassParameters->MaxBounces = MaxBouncesValue;
+	//PassParameters->SampleIndex = (FrameIndex * SamplesPerPixel) % GatherSamples;
 	PassParameters->SampleIndex = SampleIndex;
 	PassParameters->GatherSamplesPerPixel = GatherSamples;
 	PassParameters->GatherPointIteration = 0;
 	PassParameters->SamplesPerPixel = SamplesPerPixel;
 	PassParameters->GatherFilterWidth = GatherFilterWidth;
-	PassParameters->MaxBounces = 1;
 	PassParameters->MaxNormalBias = GetRaytracingMaxNormalBias();
 	PassParameters->MaxRayDistanceForGI = GRayTracingGlobalIlluminationMaxRayDistance;
 	PassParameters->MaxShadowDistance = MaxShadowDistance;
 	PassParameters->EvalSkyLight = GRayTracingGlobalIlluminationEvalSkyLight != 0;
 	PassParameters->UseRussianRoulette = GRayTracingGlobalIlluminationUseRussianRoulette != 0;
 	PassParameters->DiffuseThreshold = GRayTracingGlobalIlluminationDiffuseThreshold;
-	PassParameters->NextEventEstimationSamples = GRayTracingGlobalIlluminationNextEventEstimationSamples;
+	PassParameters->NextEventEstimationSamples = bUseReservoir ? 1 : GRayTracingGlobalIlluminationNextEventEstimationSamples;
 	PassParameters->UpscaleFactor = UpscaleFactor;
 	PassParameters->RenderTileOffsetX = 0;
 	PassParameters->RenderTileOffsetY = 0;
+	//Changed:
+	PassParameters->UseReservoir = bUseReservoir;
+	PassParameters->NormalFromDepth = GRayTracingGlobalIlluminationFinalGatherNormalFromDepth;
+	PassParameters->ReservoirUpdateInterval = ValidationInterval;
+	PassParameters->UseUniformSampling = bUseReservoir && GRayTracingGlobalIlluminationFinalGatherUseUniformSampling;
+	PassParameters->MultiBounceInterval = bUseReservoir ? GRayTracingGlobalIlluminationFinalGatherMultiBounceInterval : 1;
+	PassParameters->ReservoirUpdateTolerance = GRayTracingGlobalIlluminationFinalGatherReservoirUpdateTolerance;
 
 	// Global
 	PassParameters->TLAS = View.GetRayTracingSceneViewChecked();
@@ -1059,7 +1302,7 @@ void FDeferredShadingSceneRenderer::RayTracingGlobalIlluminationCreateGatherPoin
 	// When deferred materials are used, two passes are invoked:
 	// 1) Gather ray-hit data and sort by hit-shader ID
 	// 2) Re-trace "short" ray and shade
-	const bool bSortMaterials = CVarRayTracingGlobalIlluminationFinalGatherSortMaterials.GetValueOnRenderThread() != 0;
+	const bool bSortMaterials = CVarRayTracingGlobalIlluminationFinalGatherSortMaterials.GetValueOnRenderThread() != 0 && !bValidateReservoir;
 	if (!bSortMaterials)
 	{
 		FRayTracingGlobalIlluminationCreateGatherPointsRGS::FParameters* GatherPassParameters = PassParameters;
@@ -1182,18 +1425,26 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 	int32 SamplesPerPixel = FMath::Min(GetRayTracingGlobalIlluminationSamplesPerPixel(View), MAXIMUM_GATHER_POINTS_PER_PIXEL);
 
 	int32 GatherPointIterations = FMath::Max(CVarRayTracingGlobalIlluminationFinalGatherIterations.GetValueOnRenderThread(), 1);
-	GatherPointIterations = FMath::Min(GatherPointIterations, SamplesPerPixel);
+	// CHANGE_BEGIN_YB : GI
+	const bool bUseReservoir = CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling.GetValueOnRenderThread() != 0;
+	SamplesPerPixel = bUseReservoir ? FMath::Min(SamplesPerPixel, MAXIMUM_GATHER_POINTS_PER_PIXEL_RESTIR_GI) : SamplesPerPixel;
+	GatherPointIterations = bUseReservoir ? 1 : FMath::Min(GatherPointIterations, SamplesPerPixel);
+	// CHANGE_END_YB : GI
 
 	// Generate gather points
 	FRDGBufferRef GatherPointsBuffer;
 	FSceneViewState* SceneViewState = (FSceneViewState*)View.State;
-	int32 SampleIndex = View.ViewState->FrameIndex % ((SamplesPerPixel - 1) / GatherPointIterations + 1);
-	SampleIndex *= GatherPointIterations;
+	// CHANGE_BEGIN_YB : GI
+	int32 SampleIndex = bUseReservoir ? 0 : ((View.ViewState->FrameIndex % ((SamplesPerPixel - 1) / GatherPointIterations + 1) ) * GatherPointIterations);
+	// CHANGE_END_YB : GI
 
 	int GatherPointIteration = 0;
 	do
 	{
-		int32 MultiSampleIndex = (SampleIndex + GatherPointIteration) % SamplesPerPixel;
+		// int32 MultiSampleIndex = (SampleIndex + GatherPointIteration) % SamplesPerPixel;
+		// CHANGE_BEGIN_YB : GI
+		int32 MultiSampleIndex = bUseReservoir ? 0 : (SampleIndex + GatherPointIteration) % SamplesPerPixel;
+		// CHANGE_END_YB : GI
 		RayTracingGlobalIlluminationCreateGatherPoints(GraphBuilder, SceneTextures, View, UpscaleFactor, MultiSampleIndex, GatherPointsBuffer, SceneViewState->GatherPointsResolution);
 		GatherPointIteration++;
 	} while (GatherPointIteration < GatherPointIterations);
@@ -1201,8 +1452,12 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 	// Perform gather
 	RDG_GPU_STAT_SCOPE(GraphBuilder, RayTracingGIFinalGather);
 	RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: Final Gather");
+	FRDGTextureRef DepthTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+	FRDGTextureRef NormalTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
 
 	FRayTracingGlobalIlluminationFinalGatherRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FRayTracingGlobalIlluminationFinalGatherRGS::FParameters>();
+	PassParameters->UseSH = RayTracingConfig.UseSphericalHarmonicsGI;
+
 	PassParameters->SampleIndex = SampleIndex;
 	PassParameters->SamplesPerPixel = SamplesPerPixel;
 	PassParameters->GatherPointIterations = GatherPointIterations;
@@ -1222,6 +1477,9 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 	PassParameters->RenderTileOffsetX = 0;
 	PassParameters->RenderTileOffsetY = 0;
 
+	PassParameters->DepthTextureLast = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(DepthTexLast));
+	PassParameters->NormalTextureLast = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(NormalTexLast));
+
 	// Cache current view matrix for gather point reprojection
 	for (int GatherPointIterationLocal = 0; GatherPointIterationLocal < GatherPointIterations; ++GatherPointIterationLocal)
 	{
@@ -1238,6 +1496,10 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 	}
 	PassParameters->GatherPointData = CreateUniformBufferImmediate(GatherPointData, EUniformBufferUsage::UniformBuffer_SingleDraw);
 
+	// CHANGE_BEGIN_YB : GI
+	PassParameters->HitDistanceType = (View.ViewState && View.ViewState->GIDenoiseType == 2) ? 1 : 0;
+	// CHANGE_END_YB : GI
+
 	// Scene data
 	PassParameters->TLAS = View.GetRayTracingSceneViewChecked();
 	PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
@@ -1247,19 +1509,73 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 
 	// Gather points
 	PassParameters->GatherPointsResolution = FIntPoint(SceneViewState->GatherPointsResolution.X, SceneViewState->GatherPointsResolution.Y);
-	PassParameters->GatherPointsBuffer = GraphBuilder.CreateSRV(GatherPointsBuffer);
+	PassParameters->GatherPointsBuffer = GraphBuilder.CreateUAV(GatherPointsBuffer);
+
+	// CHANGE_BEGIN_YB : GI
+	int32 ValidationInterval = GetValidationInterval(View);
+	PassParameters->ReservoirUpdateInterval = ValidationInterval;
+	PassParameters->UseUniformSampling = bUseReservoir && GRayTracingGlobalIlluminationFinalGatherUseUniformSampling;
+	PassParameters->AggressiveReservoirReuse = GRayTracingGlobalIlluminationFinalGatherAggressiveReservoirReuse;
+	PassParameters->MaxReuseWeight = FMath::Max(1.0f, GRayTracingGlobalIlluminationFinalGatherMaxReuseWeight);
+	PassParameters->NormalFromDepth = GRayTracingGlobalIlluminationFinalGatherNormalFromDepth;
+	PassParameters->TemporalSamples = GRayTracingGlobalIlluminationFinalGatherTemporalReservoirSamples;
+	PassParameters->SpatialSamples = GRayTracingGlobalIlluminationFinalGatherSpatialReservoirSamples;
+	// CHANGE_END_YB : GI
 
 	// Output
 	PassParameters->RWGlobalIlluminationUAV = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
 	PassParameters->RWGlobalIlluminationRayDistanceUAV = GraphBuilder.CreateUAV(OutDenoiserInputs->RayHitDistance);
 
+	//Changed_Begin
+	// Request reservoir buffers
+	FIntPoint RayTracingResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), FIntPoint(UpscaleFactor, UpscaleFactor));
+	FIntVector ReservoirResolution(RayTracingResolution.X, RayTracingResolution.Y, SamplesPerPixel * 2);
+	if (!bUseReservoir)
+	{
+		ReservoirResolution = FIntVector(1, 1, 1);
+	}
+	FRDGBufferRef ReservoirBuffers[2];
+	if (((FSceneViewState*)View.State)->ReservoirResolution != ReservoirResolution)
+	{
+		((FSceneViewState*)View.State)->ReservoirResolution = ReservoirResolution;
+
+		FRDGBufferDesc BufferDesc = FRDGBufferDesc::CreateStructuredDesc(sizeof(FGatherPoint), ReservoirResolution.X * ReservoirResolution.Y * ReservoirResolution.Z);
+		ReservoirBuffers[0] = GraphBuilder.CreateBuffer(BufferDesc, TEXT("ReservoirBuffer0"), ERDGBufferFlags::MultiFrame);
+		ReservoirBuffers[1] = GraphBuilder.CreateBuffer(BufferDesc, TEXT("ReservoirBuffer1"), ERDGBufferFlags::MultiFrame);
+
+		TShaderMapRef<FClearReservoir> ComputeShader(View.ShaderMap);
+		FClearReservoir::FParameters* ClearPassParameters = GraphBuilder.AllocParameters<FClearReservoir::FParameters>();
+		ClearPassParameters->GatherPointsResolution = FIntPoint(ReservoirResolution.X, ReservoirResolution.Y);
+		ClearPassParameters->SamplesPerPixel = ReservoirResolution.Z;
+		ClearPassParameters->RWReservoirBuffer0 = GraphBuilder.CreateUAV(ReservoirBuffers[0], EPixelFormat::PF_R32_UINT);
+		ClearPassParameters->RWReservoirBuffer1 = GraphBuilder.CreateUAV(ReservoirBuffers[1], EPixelFormat::PF_R32_UINT);
+		int GroupSize = 8;
+		FIntVector BlockCount((ReservoirResolution.X + GroupSize - 1) / GroupSize, (ReservoirResolution.Y + GroupSize - 1) / GroupSize, 1);
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("Clear Reservoir"),
+			ComputeShader,
+			ClearPassParameters,
+			BlockCount);
+	}
+	else
+	{
+		ReservoirBuffers[0] = GraphBuilder.RegisterExternalBuffer(((FSceneViewState*)View.State)->ReservoirBuffers[0], TEXT("ReservoirBuffer0"));
+		ReservoirBuffers[1] = GraphBuilder.RegisterExternalBuffer(((FSceneViewState*)View.State)->ReservoirBuffers[1], TEXT("ReservoirBuffer1"));
+	}
+	int SrcIndex = View.ViewState->FrameIndex % 2;
+	PassParameters->ReservoirBuffer = GraphBuilder.CreateSRV(ReservoirBuffers[SrcIndex]);
+	PassParameters->RWReservoirBuffer = GraphBuilder.CreateUAV(ReservoirBuffers[1 - SrcIndex]);
+	//Changed_End
+
 	FRayTracingGlobalIlluminationFinalGatherRGS::FPermutationDomain PermutationVector;
 	PermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingGlobalIlluminationEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
 	PermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FEnableNeighborVisibilityTestDim>(CVarRayTracingGlobalIlluminationFinalGatherEnableNeighborVisbilityTest.GetValueOnRenderThread() != 0);
+	PermutationVector.Set<FRayTracingGlobalIlluminationFinalGatherRGS::FUseReservoirResamplingDim>(bUseReservoir);
 	TShaderMapRef<FRayTracingGlobalIlluminationFinalGatherRGS> RayGenerationShader(GetGlobalShaderMap(FeatureLevel), PermutationVector);
 	ClearUnusedGraphResources(RayGenerationShader, PassParameters);
 
-	FIntPoint RayTracingResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
+	//FIntPoint RayTracingResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
 	GraphBuilder.AddPass(
 		RDG_EVENT_NAME("GlobalIlluminationRayTracing %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
 		PassParameters,
@@ -1275,6 +1591,19 @@ void FDeferredShadingSceneRenderer::RenderRayTracingGlobalIlluminationFinalGathe
 
 
 	GraphBuilder.QueueBufferExtraction(GatherPointsBuffer, &SceneViewState->GatherPointsBuffer, ERHIAccess::SRVMask);
+	//Changed_begin
+	auto&& PrevFrameViewInfo = View.ViewState->PrevFrameViewInfo;
+	if (NormalTexLast != nullptr)
+	{
+		GraphBuilder.QueueTextureExtraction(SceneTextures.GBufferATexture, &PrevFrameViewInfo.GBufferA);
+	}
+	if (DepthTexLast != nullptr)
+	{
+		GraphBuilder.QueueTextureExtraction(SceneTextures.SceneDepthTexture, &PrevFrameViewInfo.DepthBuffer);
+	}
+	GraphBuilder.QueueBufferExtraction(ReservoirBuffers[SrcIndex], &SceneViewState->ReservoirBuffers[SrcIndex], ERHIAccess::UAVMask);
+	GraphBuilder.QueueBufferExtraction(ReservoirBuffers[1 - SrcIndex], &SceneViewState->ReservoirBuffers[1 - SrcIndex], ERHIAccess::SRVMask);
+	//Changed_end
 }
 #else
 {

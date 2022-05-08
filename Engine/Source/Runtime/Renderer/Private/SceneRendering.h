@@ -959,6 +959,34 @@ struct FGTAOTAAHistory
 	}
 };
 
+struct FSampledGIHistory
+{
+	// Number of history render target to store.
+	static constexpr int32 RTCount = 5;
+
+	// Scissor of valid data in the render target;
+	FIntRect Scissor;
+
+	// Render target specific to the history.
+	TStaticArray<TRefCountPtr<IPooledRenderTarget>, RTCount> RT;
+
+	// The texture for tile classification.
+	TRefCountPtr<IPooledRenderTarget> TileClassification;
+
+
+	void SafeRelease()
+	{
+		for (int32 i = 0; i < RTCount; i++)
+			RT[i].SafeRelease();
+		TileClassification.SafeRelease();
+	}
+
+	bool IsValid() const
+	{
+		return RT[0].IsValid();
+	}
+};
+
 struct FRestirGIHistory
 {
 	// Buffer holding a light reservoirs
@@ -1146,7 +1174,7 @@ struct FPreviousViewInfo
 	// Scene color used for reprojecting next frame to verify the motion vector reprojects correctly.
 	TRefCountPtr<IPooledRenderTarget> VisualizeMotionVectors;
 	FIntRect VisualizeMotionVectorsRect;
-
+	FSampledGIHistory			SampledGIHistory;
 	FRestirGIHistory			RestirGIHistory;
 	FRestirReflectionHistory	RestirReflectionHistory;
 	FGridRestirHistory			GridRestirHistory;

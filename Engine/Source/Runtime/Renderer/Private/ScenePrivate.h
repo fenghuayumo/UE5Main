@@ -1009,6 +1009,15 @@ public:
 	TStaticArray<FMatrix, 32> GatherPointsViewHistory;
 	uint32 GatherPointsCount;
 
+	//Changed_Begin: GI
+	TRefCountPtr<FRDGPooledBuffer> ReservoirBuffers[2];
+	FIntVector ReservoirResolution;
+	FMatrix LastFrameInvViewMatrix;
+	int CameraSwitchFrameCount = 0;
+	int GIDenoiseType = 0;
+	TRefCountPtr<IPooledRenderTarget> DenoiseTexture[2];
+	//Changed_End: GI
+
 	// Last valid RTPSO is saved, so it could be used as fallback in future frames if background PSO compilation is enabled.
 	// This RTPSO can be used only if the only difference from previous PSO is the material hit shaders.
 	FRayTracingPipelineStateSignature LastRayTracingMaterialPipelineSignature;
