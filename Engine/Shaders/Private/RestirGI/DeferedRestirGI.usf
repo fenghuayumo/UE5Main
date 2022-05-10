@@ -1,0 +1,2056 @@
+#if USE_DEFERED_GI
+
+#define RAY_TRACING_DEFERRED_GI_SHADER_VERSION 0xC1669BC2  // Change to force shader compilation of this shader
+
+// EDeferredMaterialMode
+#define DEFERRED_MATERIAL_MODE_NONE   0
+#define DEFERRED_MATERIAL_MODE_GATHER 1
+#define DEFERRED_MATERIAL_MODE_SHADE  2
+
+#ifndef DIM_DEFERRED_MATERIAL_MODE
+	#define DIM_DEFERRED_MATERIAL_MODE DEFERRED_MATERIAL_MODE_NONE
+#endif
+
+#ifndef DIM_GENERATE_RAYS
+	#define DIM_GENERATE_RAYS 0
+#endif
+
+#endif
+
+#define USE_IES_TERM 0 // this shader doesn't bind the IES atlas, so disable the IES term from path tracer lights
+#include "../Common.ush"
+
+#ifndef VISIBILITY_BEFORE_COMBINE
+#define VISIBILITY_BEFORE_COMBINE 1
+#endif
+
+#ifndef MAX_SPATIAL_SAMPLES
+#define MAX_SPATIAL_SAMPLES		16
+#endif
+
+#ifndef USE_LDS_FOR_SPATIAL_RESAMPLE
+#define USE_LDS_FOR_SPATIAL_RESAMPLE	1
+#endif
+
+#define USE_SOURCE_TEXTURE_ARRAY	1
+
+#define SUPPORT_CONTACT_SHADOWS		0
+#define USE_SOURCE_TEXTURE_ARRAY	1
+
+#include "../RectLight.ush"
+//#include "../MonteCarlo.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShadingModels.ush"
+#include "../SceneTextureParameters.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "../RayTracing/RayTracingHitGroupCommon.ush"
+
+#include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+
+// #define EXPLORE_DISTANCE_TYPE
+#define LIGHT_GRID 1
+#define LIGHT_TREE 2
+#define LIGHT_CUT  3
+#define LIGHT_UNIFROM 4
+
+#define LIGHT_SAMPLING_TYPE 2
+
+#ifndef LIGHT_SAMPLING_TYPE
+#define LIGHT_SAMPLING_TYPE 0
+#endif
+
+#if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
+#define UNIFORM_LIGHT_SELECTION
+#endif
+#if LIGHT_SAMPLING_TYPE == LIGHT_GRID
+#define USE_PATH_TRACING_LIGHT_GRID 1
+#else
+#define USE_PATH_TRACING_LIGHT_GRID 0
+#endif
+
+#if TRACE_STEP
+#include "../PathTracing/Light/PathTracingLightGrid.ush"
+#include "../LightCut/LightTreeSampling.ush"
+#endif
+#include "../PathTracing/Light/PathTracingLightSampling.ush"
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+#if USE_DEFERED_GI
+#include "../RayTracing/RayTracingDeferredMaterials.ush"
+#include "../RayTracing/RayTracingGICommon.ush"
+
+uint2 RayTracingResolution;
+uint2 TileAlignedResolution;
+float TextureMipBias;
+
+// Buffer of ray intersections aquired during Gather phase and 
+// used during to reduce ray intersection overhead during Shading.
+RWStructuredBuffer<FSortedGIRay>                RayBuffer;
+RWStructuredBuffer<FDeferredMaterialPayload>    MaterialBuffer;
+RWStructuredBuffer<FRayIntersectionBookmark>    BookmarkBuffer;
+
+RWTexture2D<float4> RWDebugDiffuseUAV;
+// RWTexture2D<float2> RWDebugRayDistanceUAV;
+// #define 	USE_SCREEN_GI_REPROJECTION 1
+Texture2D	ReprojectedHistory;
+
+#endif
+
+
+#define USE_PATHTRACING_MATERIALS 0
+
+RaytracingAccelerationStructure TLAS;
+RWTexture2D<float4> RWDiffuseUAV;
+RWTexture2D<float2> RWRayDistanceUAV;
+
+Texture2D<float> DepthHistory;
+Texture2D<float4> NormalHistory;
+
+Texture2D		SSAOTex;
+
+float MaxNormalBias;
+int InputSlice;
+int OutputSlice;
+int NumReservoirs;
+int HistoryReservoir;
+int InitialCandidates;
+float SpatialSamplingRadius;
+int SpatialSamples;
+int SpatialSamplesBoost;
+int MaxTemporalHistory;
+int ApplyApproximateVisibilityTest;
+int DemodulateMaterials;
+uint UpscaleFactor;
+float LongPathRatio;
+
+float MaxRayDistanceForGI;
+float MaxRayDistanceForAO;
+float MaxShadowDistance;
+uint MaxBounces;
+float DiffuseThreshold;
+uint EvalSkyLight;
+uint UseRussianRoulette;
+uint UseFireflySuppression;
+float NextEventEstimationSamples;
+
+int SupportTranslucency;
+
+int VisibilityApproximateTestMode;
+int VisibilityFaceCull;
+int FeedbackVisibility;
+
+float SpatialDepthRejectionThreshold;
+float SpatialNormalRejectionThreshold;
+float TemporalDepthRejectionThreshold;
+float TemporalNormalRejectionThreshold;
+
+uint NeighborOffsetMask;
+Buffer<float2> NeighborOffsets;
+
+#if TRACE_STEP
+//lightcut common
+int DistanceType;
+int MaxCutNodes;
+int CutShareGroupSize;
+float ErrorLimit;
+int UseApproximateCosineBound;
+int InterleaveRate;
+//mesh light cut
+StructuredBuffer<int> MeshLightCutBuffer;
+StructuredBuffer<FLightNode> MeshLightNodesBuffer;
+int 						 MeshLightLeafStartIndex;
+
+//mesh light param
+StructuredBuffer<float3>       MeshLightVertexBuffer;
+StructuredBuffer<uint>         MeshLightIndexBuffer;
+StructuredBuffer<MeshLightInstanceTriangle>    MeshLightInstancePrimitiveBuffer;
+StructuredBuffer<MeshLightInstance>   MeshLightInstanceBuffer;
+uint 							NumLightTriangles;
+
+#if LIGHT_SAMPLING_TYPE > LIGHT_GRID
+#define MESH_LIGHT_SAMPLING     1
+#endif
+
+#endif
+
+#if USE_SURFEL
+#include "../SurfelGI/SurfelCommon.ush"
+RWByteAddressBuffer SurfelMetaBuf;
+RWByteAddressBuffer SurfelGridMetaBuf;
+
+RWStructuredBuffer<uint> SurfelLifeBuf;
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelRePositionBuf;
+RWStructuredBuffer<uint> SurfelRePositionCountBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelVertexBuf;
+RWStructuredBuffer<float4> SurfelIrradianceBuf;
+RWStructuredBuffer<uint> SurfelEntryCellBuf;
+
+#include "../SurfelGI/SurfelLookUp.ush"
+#endif
+
+#define USE_RADIANCE_CACHE	0
+#if USE_RADIANCE_CACHE
+#include "../WRC/ProbeLookup.ush"
+#endif
+
+static const float GOLDEN_ANGLE = 2.39996323;
+
+#if TRACE_STEP
+bool SampleTriangleLight(float2 RandSample,
+	float3 WorldPos,
+	float3 WorldNormal,
+	int triId,
+	float PickPdf,
+	out float3 OutDirection,
+	out float  OutDistance,
+	out float3 OutRadianceOverPdf,
+	out float OutPdf)
+{
+
+	OutDirection = 0;
+	OutDistance = 0;
+	OutRadianceOverPdf = 0;
+
+	MeshLightInstanceTriangle prim = MeshLightInstancePrimitiveBuffer[triId];
+    const float4x4 transform = MeshLightInstanceBuffer[prim.InstanceID].Transform;
+
+	// const uint v0 = MeshLightIndexBuffer[triId * 3];
+	// const uint v1 = MeshLightIndexBuffer[triId * 3 + 1];
+	// const uint v2 = MeshLightIndexBuffer[triId * 3 + 2];
+	uint v0 = MeshLightIndexBuffer[prim.IndexOffset];
+	uint v1 = MeshLightIndexBuffer[prim.IndexOffset + 1];
+	uint v2 = MeshLightIndexBuffer[prim.IndexOffset + 2];
+
+	const float3 p0 = mul(float4(MeshLightVertexBuffer[v0],1.0f), transform).xyz;
+	const float3 p1 = mul(float4(MeshLightVertexBuffer[v1],1.0f), transform).xyz;
+	const float3 p2 = mul(float4(MeshLightVertexBuffer[v2],1.0f), transform).xyz;
+	
+	float3  Emission = MeshLightInstanceBuffer[prim.InstanceID].Emission;
+
+	float3 LightN = cross(p2 - p0,p1 - p0);
+	float Area = 0.5 * length(LightN);
+	
+	//sample a point in triangle
+	float e1 = RandSample.x;
+	float e2 = RandSample.y;
+	float beta = e2 * sqrt(1 - e1);
+	float gamma = 1 - sqrt(1 - e1);
+
+	float3 SampleLightPos = p0 + beta * (p1 - p0) + gamma * (p2 - p0);
+
+	float3 Direction = (SampleLightPos - WorldPos);
+	float dSquared = max(dot(Direction, Direction), 1e-1) ;
+	float LightDist = sqrt(dSquared);
+	Direction /= LightDist;
+	// Direction = normalize(Direction);
+	// float LightDist = length(Direction);
+
+	float dDotn = abs(dot(-Direction, normalize(LightN))) + 1e-4;
+	//float Pdf = dSquared;
+	//if( Area > 1e-4)
+	float Pdf = dSquared / (Area * dDotn );
+	//if( Pdf <= 0) return false;
+	OutDirection = Direction;
+	OutDistance =  LightDist - 8e-1;
+	OutPdf = Pdf * PickPdf;
+	OutRadianceOverPdf = Emission / OutPdf;
+
+	return true;
+}
+
+bool SampleMeshLight(float3 RandSample,
+	float3 WorldPos,
+	float3 WorldNormal,
+	int NodeID,
+	out float3 OutDirection,
+	out float  OutDistance,
+	out float3 OutRadianceOverPdf,
+	out float OutPdf)
+{
+	if( NumLightTriangles == 0)
+		return false;
+#if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
+	// pick a triangle
+	int triId = min(int(floor(RandSample.x * NumLightTriangles)), NumLightTriangles - 1);
+	float LightPickPdf = 1.0 / NumLightTriangles;
+#elif LIGHT_SAMPLING_TYPE == LIGHT_TREE
+	float LightPickPdf = 1.0;
+	int triId = 0;
+	bool deadBranch = TraverseLightTree(WorldPos, WorldNormal, 1, MeshLightNodesBuffer, 
+				MeshLightLeafStartIndex, UseApproximateCosineBound, DistanceType,
+				RandSample.x,LightPickPdf,triId);
+	if( deadBranch ) return false;
+#else
+	float LightPickPdf = 1.0;
+	int triId = 0;
+	bool deadBranch = TraverseLightTree(WorldPos, WorldNormal, NodeID, MeshLightNodesBuffer, 
+				MeshLightLeafStartIndex, UseApproximateCosineBound, DistanceType,
+				RandSample.x,LightPickPdf,triId);
+	if( deadBranch ) return false;
+#endif
+	return SampleTriangleLight(
+		RandSample.yz,
+		WorldPos,
+		WorldNormal,
+		triId,
+		LightPickPdf,
+		OutDirection,
+		OutDistance,
+		OutRadianceOverPdf,
+		OutPdf
+	);
+
+}
+#endif
+
+#if USE_DEFERED_GI
+
+bool ShouldTraceRay(uint2 DispatchThreadId, FGBufferData GBufferData)
+{
+	bool bTraceRay = true;
+
+	// Cull based on shading model
+	uint ShadingModelID = GBufferData.ShadingModelID;
+	if (ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		bTraceRay = false;
+	}
+
+	// Cull based on diffuse threshold
+	float3 DiffuseColor = GBufferData.DiffuseColor;
+	if (Luminance(DiffuseColor) < DiffuseThreshold)
+	{
+		bTraceRay = false;
+	}
+
+	// Cull based on ViewRect
+	if (any(DispatchThreadId - View.ViewRectMin.xy >= RayTracingResolution))
+	{
+		bTraceRay = false;
+	}
+
+	return bTraceRay;
+}
+
+#endif
+
+//Extended trace types to support miss shader evaluation of light functions
+struct FLightFunctionPayload : FMinimalPayload
+{
+	float Attenuation;
+};
+
+uint2 GetPixelCoord2(uint2 DispatchThreadId, uint UpscaleFactor)
+{
+	uint UpscaleFactorPow2 = UpscaleFactor * UpscaleFactor;
+
+	// TODO(Denoiser): find a way to not interfer with TAA's jittering.
+	//uint SubPixelId = View.StateFrameIndex & (UpscaleFactorPow2 - 1);
+
+	return DispatchThreadId * UpscaleFactor;// + uint2(SubPixelId & (UpscaleFactor - 1), SubPixelId / UpscaleFactor);
+}
+
+#define COSINE_TARGET_PDF 0
+float GetTargetPdf(float3 Irradiance, float3 Normal, float3 Position, float3 SamplePosition)
+{
+	const float3 LumaVec = float3(0.299, 0.587, 0.114);
+#if COSINE_TARGET_PDF
+	return max(1e-3, dot(Irradiance, LumaVec) * max(0.1, dot(Normal, normalize(SamplePosition - Position))));
+#else
+	return max(1e-3, dot(Irradiance, LumaVec));
+#endif
+}
+void TraceLightFunctionRayPacked(
+	inout FPackedMaterialClosestHitPayload PackedPayload,
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in uint2 PixelCoord,
+	in RayDesc Ray)
+{
+	const uint RayContributionToHitGroupIndex = RAY_TRACING_SHADER_SLOT_SHADOW;
+	const uint MultiplierForGeometryContributionToShaderIndex = RAY_TRACING_NUM_SHADER_SLOTS;
+	const uint MissShaderIndex = 0;
+
+	// By enabling minimal payload mode all other payload information is ignored, meaning these functions need no payload inputs
+	PackedPayload.SetMinimalPayloadMode();
+	PackedPayload.HitT = 0;
+	PackedPayload.SetPixelCoord(PixelCoord);
+
+	// Trace the ray
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RayContributionToHitGroupIndex,
+		MultiplierForGeometryContributionToShaderIndex,
+		MissShaderIndex,
+		Ray,
+		PackedPayload);
+}
+
+FLightFunctionPayload TraceLightFunctionRay(
+	in RaytracingAccelerationStructure TLAS,
+	in uint RayFlags,
+	in uint InstanceInclusionMask,
+	in uint2 PixelCoord,
+	in RayDesc Ray)
+{
+	FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+
+	if (!SupportTranslucency)
+	{
+		PackedPayload.SetIgnoreTranslucentMaterials();
+	}
+
+	TraceLightFunctionRayPacked(PackedPayload, TLAS, RayFlags, InstanceInclusionMask, PixelCoord, Ray);
+
+
+	FLightFunctionPayload LightFunctionPayload = (FLightFunctionPayload)0;
+
+	LightFunctionPayload.HitT = PackedPayload.HitT;
+
+	return LightFunctionPayload;
+}
+
+
+float GetApproximateLightSampleWeight(float3 WorldPosition, float3 CameraDirection, FGBufferData GBuffer, RTXGI_SampleRef SampleRef)
+{
+	// float3 dir = normalize(SampleRef.Position - WorldPosition);
+	// float cosTheta = dot(dir, GBuffer.WorldNormal);
+	// float weight = Luminance(GBuffer.DiffuseColor * SampleRef.Li * cosTheta);
+	float weight = GetTargetPdf(SampleRef.Irradiance,GBuffer.WorldNormal, WorldPosition,  SampleRef.Position);
+	return weight;
+}
+
+bool CheckApproximateVisibility(uint2 PixelCoord, float DeviceZ, float3 WorldPosition, FGBufferData GBuffer, RTXGI_SampleRef SampleRef)
+{
+	RayDesc Ray;
+
+	Ray.Origin = WorldPosition;
+	float3 toLight = SampleRef.Position - WorldPosition;
+	float length = sqrt(dot( toLight, toLight));
+	Ray.Direction = toLight / length;
+	
+	Ray.TMin = 0.0;
+	Ray.TMax = max(0.01, length - 5e-2);
+
+	// ToDo - respect the transmissive flag on lights
+	float NoL = dot(GBuffer.WorldNormal, Ray.Direction);
+	if (NoL > 0.0)
+	{
+		// ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, GBuffer.WorldNormal, MaxNormalBias);
+		ApplyPositionBias(Ray, GBuffer.WorldNormal, MaxNormalBias);
+	}
+	else
+	{
+		ApplyPositionBias(Ray, -GBuffer.WorldNormal, MaxNormalBias);
+	}
+
+	uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+	RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
+	RayFlags |= VisibilityFaceCull == 2 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+	RayFlags |= VisibilityApproximateTestMode == 1 ? RAY_FLAG_FORCE_OPAQUE : 0;
+	RayFlags |= VisibilityApproximateTestMode == 2 ? RAY_FLAG_CULL_NON_OPAQUE : 0;
+	const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+
+	FMinimalPayload MinimalPayload = TraceVisibilityRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		PixelCoord,
+		Ray);
+
+	return !MinimalPayload.IsHit();
+}
+
+void GenerateCosineNormalRay(
+	float3 WorldPosition,
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayOrigin,
+	out float3 RayDirection,
+	out float RayTMin,
+	out float RayTMax,
+	out float RayPdf
+)
+{
+#define COSINE_SAMPLING 0
+#if COSINE_SAMPLING
+	// Perform cosine-hemispherical sampling and convert to world-space
+	float4 Direction_Tangent = CosineSampleHemisphere(RandSample);
+#else
+	float4 Direction_Tangent = UniformSampleHemisphere(RandSample);
+#endif
+	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
+
+	RayOrigin = WorldPosition;
+	RayDirection = Direction_World;
+	RayTMin = 0.01;
+	RayTMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+	RayPdf = Direction_Tangent.w;
+}
+
+void ProduceInitialSample(uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 WorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXGI_Reservoir state)
+{
+	const uint2 TileSize = uint2(64,32);
+	const uint2 TiledIndex = uint2(PixelCoord.x / TileSize.x, PixelCoord.y / TileSize.y);
+	const uint2 TileDim = uint2( ( View.ViewSizeAndInvSize.x +TileSize.x -1) / TileSize.x, ( View.ViewSizeAndInvSize.y +TileSize.y -1) / TileSize.y);
+	const uint TileLinearIndex = TiledIndex.y * TileDim.x + TiledIndex.x;
+	FRandomContext RandGen = FRandomContext::Create(TileLinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+	const bool bRussian = RandGen.GenerateSample1D() < (1 - LongPathRatio);
+
+	const int NumSamples = InitialCandidates;
+
+	RTXGI_Reservoir LocalReservoir = RTXGI_Reservoir::Empty();
+
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	float3 WorldNormal = GBuffer.WorldNormal;
+	for (uint SampleIndex = 0; SampleIndex < NumSamples; SampleIndex++)
+	{
+		RandomSequence RandSequence;
+		RandomSequence_Initialize(RandSequence, PixelCoord, SampleIndex, View.StateFrameIndex, NumSamples);
+		float3 RayThroughput = 1.0;
+		float3 RandSample = RandomSequence_GenerateSample3D(RandSequence);
+
+		RTXGI_SampleRef sampleRef;
+
+		// Initialize ray
+		RayDesc Ray;
+		float3 Irradiance = 0;
+		float RayPdf = 1.0;
+		GenerateCosineNormalRay(WorldPosition, WorldNormal, RandSample.yz, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		half3 N = WorldNormal;
+		half3 V = -CameraDirection;
+		half3 L = Ray.Direction;
+		float NoL = saturate(dot(N, L));
+		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		FDirectLighting LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
+		RayThroughput *= LightingSample.Diffuse / DiffuseColor;
+		Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, WorldNormal, MaxNormalBias);
+		
+		float MaterialPdf = 0.0;
+		uint Bounce = 0;
+		#if !USE_SURFEL
+		while (Bounce < MaxBounces)
+		#endif
+		{
+			// Cast ray
+			uint RayFlags = 0;
+			const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+			const bool bEnableSkyLightContribution = true;
+			const bool bIgnoreTranslucentMaterials = false;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+			RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+			FRayCone RayCone = (FRayCone)0;
+			FMaterialClosestHitPayload Payload = TraceMaterialRay(
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				Ray,
+				RayCone,
+				PixelCoord,
+				bEnableSkyLightContribution,
+				bIgnoreTranslucentMaterials);
+
+			// Environment hit
+			if (Payload.IsMiss())
+			{
+				// Optional multi-bounce SkyLight contribution
+				if (EvalSkyLight && Bounce > 0)
+				{
+					uint SkyLightId = 0;
+					RayDesc LightRay = Ray;
+					LightRay.TMax = POSITIVE_INFINITY;
+					float3 EnvironmentRadiance = SkyLight_TraceLight(Ray, SkyLightId).Radiance;
+					Irradiance += EnvironmentRadiance * RayThroughput / RayPdf;
+				}
+				break;
+			}
+
+			#if !USE_SURFEL
+			if (Bounce == 0)
+			#endif
+			{
+				float3 HitPos = Ray.Origin + Ray.Direction * Payload.HitT;
+				// sampleRef.Create( samPos,Payload.WorldNormal, WorldPosition, GBuffer.WorldNormal );
+				sampleRef.CreationPoint = WorldPosition;
+				sampleRef.CreationNormal = WorldNormal;
+				sampleRef.Position = HitPos;
+				sampleRef.Normal = Payload.WorldNormal;
+			}
+			if (Payload.HitT > MaxRayDistanceForGI) break;
+
+			// Update intersection
+			Ray.Origin += Ray.Direction * Payload.HitT;
+
+			//Create faux GBuffer to use with EvaluateBxDF
+			FGBufferData GBufferData = (FGBufferData)0;
+			GBufferData.Depth = 1.f; // Do not use depth
+			GBufferData.WorldNormal = Payload.WorldNormal;
+			GBufferData.BaseColor = Payload.BaseColor;
+			GBufferData.CustomData = Payload.CustomData;
+			GBufferData.GBufferAO = Payload.GBufferAO;
+			GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+			GBufferData.SpecularColor = Payload.SpecularColor;
+			GBufferData.DiffuseColor = Payload.DiffuseColor;			
+			GBufferData.Metallic = Payload.Metallic;
+			GBufferData.Specular = Payload.Specular;
+			GBufferData.Roughness = Payload.Roughness;
+			GBufferData.ShadingModelID = Payload.ShadingModelID;
+			GBufferData.CustomData = Payload.CustomData;
+
+			// if (AccumulateEmissive)
+			// {
+			// 	Irradiance += Payload.Radiance;
+			// }
+
+			//Perform next-event estimation
+			float SplitFactor = 1.0 / NextEventEstimationSamples;
+			// float SplitFactor = 1.0 / 1;
+			for (uint NeeTrial = 0; NeeTrial < NextEventEstimationSamples; ++NeeTrial)
+			{
+				// Light selection
+				int LightId;
+				float3 LightRadianceOverPdf = 0;
+				float NeePdf = 0.0;
+
+				float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+
+				RayDesc LightRay;
+				if (SampleLight(RandSample3,
+								Ray.Origin,
+								Payload.WorldNormal,
+								Payload.PrimitiveLightingChannelMask,
+								ENABLE_TRANSMISSION,
+								LightId,
+								LightRay.Direction,
+								LightRay.TMax,
+								LightRadianceOverPdf,
+								NeePdf))
+				{
+					LightRay.Origin = Ray.Origin;
+					LightRay.TMin = 0;
+					LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+					bool bTransmission = HasTransmission(LightId);
+					float3 BiasNormal = Payload.WorldNormal;
+					if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+					{
+						BiasNormal = -BiasNormal;
+					}
+					ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+					// Trace visibility ray
+					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						NeeRayFlags,
+						NeeInstanceInclusionMask,
+						PixelCoord,
+						LightRay);
+
+					// No hit indicates successful next-event connection
+					if (NeePayload.IsMiss())
+					{
+						// Evaluate material
+						float3 MaterialThroughput;
+						float MaterialEvalPdf = 0.0;
+#if USE_PATHTRACING_MATERIALS
+						float3 MaterialWeight = 0;
+						EvalMaterial(Ray.Direction, LightRay.Direction, Payload, MaterialWeight, MaterialEvalPdf);
+						MaterialThroughput = MaterialWeight * MaterialEvalPdf;
+#else
+						half3 N = Payload.WorldNormal;
+						half3 V = -Ray.Direction;
+						half3 L = LightRay.Direction;
+						float NoL = saturate(dot(N, L));
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+						MaterialThroughput = LightingSample.Diffuse;
+						if (bTransmission)
+						{
+							MaterialThroughput += LightingSample.Transmission;
+						}
+						MaterialEvalPdf = 1.0;
+#endif
+
+						// Record the contribution
+						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * RayThroughput * SplitFactor / RayPdf;
+
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+					}
+				}
+			}
+
+			// Perform material sampling
+#if !USE_SURFEL
+			if (Bounce + 1 < MaxBounces)
+			{
+				float3 Direction;
+				float3 Throughput = 1.0;
+#if USE_PATHTRACING_MATERIALS
+				RandSample4 = RandomSequence_GenerateSample4D(RandSequence);
+
+				float PositionBiasSign;
+				float3 Weight = 0;
+				SampleMaterial(Ray.Direction, Payload, RandSample, Direction, Weight, MaterialPdf, PositionBiasSign);
+				Throughput = Weight * MaterialPdf;
+#else
+
+				float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+
+				float3 RayOrigin = Ray.Origin;
+				GenerateCosineNormalRay(RayOrigin, Payload.WorldNormal, RandSample3.xy, Ray.Origin, Direction, Ray.TMin, Ray.TMax, MaterialPdf);
+				
+				half3 N = Payload.WorldNormal;
+				half3 V = -Ray.Direction;
+				half3 L = Direction;
+				float NoL = saturate(dot(N, L));
+				FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+				FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+				Throughput = LightingSample.Diffuse;
+#endif
+				if (MaterialPdf <= 0.0)
+				{
+					break;
+				}
+
+				// Update ray
+				Ray.Direction = Direction;
+				RayThroughput *= Throughput;
+				RayPdf *= MaterialPdf;
+
+				// Russian roulette based on DiffuseColor
+				float2 Rand = RandomSequence_GenerateSample2D(RandSequence);
+				
+				// float Ratio = 1 - LongPathRatio;
+				if( bRussian )
+				{	
+					// if ( Rand.y < Ratio )
+					{
+						float RRSample = Rand.x;
+						// float ProbabilityOfSuccess = Luminance(DiffuseColor);
+						float3 PathT = RayThroughput * DiffuseColor / RayPdf;
+						float ProbabilityOfSuccess = max(max(PathT.x, PathT.y), PathT.z);
+						float ProbabilityOfTermination = 1.0 - ProbabilityOfSuccess;
+						if (RRSample < ProbabilityOfTermination) break;
+						RayThroughput /= ProbabilityOfSuccess;
+					}
+				}
+
+			}
+			Bounce++;
+#else
+			Irradiance += GBufferData.DiffuseColor * GetSurfelGI(Ray.Origin, GBufferData.WorldNormal, 0, RandSequence);
+#endif
+		}
+	
+		sampleRef.Irradiance = Irradiance;
+		// float pdfScale = 1.0;
+		// float weight = Luminance(sampleRef.Irradiance);
+		float targetPdf = GetTargetPdf(sampleRef.Irradiance, sampleRef.CreationPoint,sampleRef.CreationNormal, sampleRef.Position);	
+		float invSourcePdf = 1.0;
+		float risRnd = RandContext.GenerateSample1D();
+
+		bool selected = LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
+	}
+	LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
+	LocalReservoir.M = 1;
+
+	// state = RTXGI_Reservoir::Empty();
+	state = LocalReservoir;
+}
+
+void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuffer, float DeviceZ, float3 WorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXGI_Reservoir state)
+{
+	uint cachedResult = 0x0u;
+
+	RTXGI_Reservoir centerSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchID, InputSlice));
+
+	float3 selectedPos;
+	float3 selectedNormal;
+	float3 selectedLi;
+	int selected = -1;
+
+	if (centerSample.sampleRef.IsValid() )
+	{
+		selectedPos = centerSample.sampleRef.Position;
+		selectedNormal = centerSample.sampleRef.Normal;
+		selectedLi = centerSample.sampleRef.Irradiance;
+		selected = true;
+	}
+	centerSample.M = min(centerSample.M, MaxTemporalHistory);
+	state.CombineReservoirs(centerSample, /* random = */ 0.5f, centerSample.targetPdf);
+
+	float3 WorldNormal = GBuffer.WorldNormal;
+	//
+	// Walk the specified number of neighbors, resampling using RIS
+	//
+
+	// Two sample modes for spatial resampling
+	//   predefined low-discrepency sequence
+	//   random data stored in local array for use with second pass
+	int NumSamples = SpatialSamples;
+	const int TARGET_M = 512;
+	if (centerSample.M < MaxTemporalHistory)
+	{
+		NumSamples = max(NumSamples, SpatialSamplesBoost);
+	}
+
+#if !USE_LDS_FOR_SPATIAL_RESAMPLE
+	NumSamples = min(NumSamples, MAX_SPATIAL_SAMPLES);
+
+	int2 SamplePoints[MAX_SPATIAL_SAMPLES] = (int2[MAX_SPATIAL_SAMPLES])0;
+#else
+	uint StartIdx = RandContext.GenerateSample1D() * NeighborOffsetMask;
+
+	// using uint mask to track samples, so absolute limit is 32
+	NumSamples = min(NumSamples, 32);
+	// NumSamples = min(NumSamples, 300);
+#endif
+
+    const float SSAOFactor = smoothstep(5.0, 10.0, centerSample.M);
+    float KernelRadius = lerp(SpatialSamplingRadius, 32, lerp(1, SSAOTex[PixelCoord].r, SSAOFactor));
+	const float AngleOffset = 2 * PI * RandContext.GenerateSample1D();
+	for (int i = 0; i < NumSamples && state.M < TARGET_M; ++i)
+	{
+		// float ang = (i + AngleOffset) * GOLDEN_ANGLE;
+        // float radius = float(i + RandContext.GenerateSample1D()) * (KernelRadius / NumSamples);
+        // int2 PixelOffset = float2(cos(ang), sin(ang)) * radius;
+		// const int2 SampleCoord = PixelCoord + PixelOffset;
+		// const bool IsCenterSample = i == 0;
+		
+#if !USE_LDS_FOR_SPATIAL_RESAMPLE
+		float2 Offset = RandContext.GenerateSample2D() * 2.0f - 1.0f;
+		int2 SampleCoord = round(float2(PixelCoord) + (Offset * KernelRadius));
+
+		SamplePoints[i] = SampleCoord;
+#else
+		float2 Offset = NeighborOffsets[(StartIdx + i) & NeighborOffsetMask] * 2.0f - 1.0f;
+		int2 SampleCoord = round(float2(PixelCoord) + (Offset * KernelRadius));
+#endif
+
+		if (any(SampleCoord < 0) || any(SampleCoord >= View.BufferSizeAndInvSize.xy) || all(SampleCoord == PixelCoord))
+		{
+			continue;
+		}
+
+		// Read adjacent GBuffer data
+		FGBufferData AdjGBuffer = GetGBufferDataFromSceneTexturesLoad(SampleCoord);
+		float AdjDeviceZ = SceneDepthTexture.Load(int3(SampleCoord, 0)).r;
+		float3 AdjWorldPosition;
+		float3 AdjCameraDirection;
+		ReconstructWorldPositionAndCameraDirectionFromDeviceZ(SampleCoord, AdjDeviceZ, AdjWorldPosition, AdjCameraDirection);
+
+
+		// TODO: refine sample rejection tests
+		if (dot(GBuffer.WorldNormal, AdjGBuffer.WorldNormal) < SpatialNormalRejectionThreshold)
+		{
+			continue;
+		}
+
+		if (abs(GBuffer.Depth - AdjGBuffer.Depth) / GBuffer.Depth > SpatialDepthRejectionThreshold)
+		{
+			continue;
+		}
+
+		if (GBuffer.ShadingModelID != AdjGBuffer.ShadingModelID)
+		{
+			continue;
+		}
+		uint2 samplePosID = clamp(floor(SampleCoord / float(UpscaleFactor) ), uint2(0,0), ReservoirBufferDim.xy - 1);
+		RTXGI_Reservoir neighborSample = RTXGI_Reservoir::Load(ReadReservoirData(samplePosID, InputSlice));
+		neighborSample.M = min(neighborSample.M, 500);
+		// Load that neighbor's RIS state, do resampling
+		if (neighborSample.sampleRef.IsValid())
+		{			
+			//ToDo - does this need to be a permutation?
+			bool Visible = true;
+#if (VISIBILITY_BEFORE_COMBINE)
+			if (ApplyApproximateVisibilityTest)
+			{
+				Visible = CheckApproximateVisibility(SampleCoord, DeviceZ, WorldPosition, GBuffer, neighborSample.sampleRef);
+			}
+#endif
+			//float neighborWeight = Visible ? GetApproximateLightSampleWeight(WorldPosition, CameraDirection, GBuffer, neighborSample.sampleRef) : 0;
+			float3 OffsetB = neighborSample.sampleRef.Position - neighborSample.sampleRef.CreationPoint;
+			float3 OffsetA = neighborSample.sampleRef.Position - WorldPosition;
+			// Discard back-face
+			if (dot(WorldNormal, OffsetA) < 0 || any(isnan(OffsetA)) || any(isnan(OffsetB)))
+			{
+				continue;
+			}
+
+			//float pOldTN = GetTargetPdf(neighborSample.sampleRef.Irradiance, neighborSample.sampleRef.CreationNormal, neighborSample.sampleRef.CreationPoint, GatherSampleTNear.Position);
+			float pNewTN = GetTargetPdf(neighborSample.sampleRef.Irradiance, WorldNormal, WorldPosition, neighborSample.sampleRef.Position);
+
+			float RB2 = dot(OffsetB, OffsetB);
+			float RA2 = dot(OffsetA, OffsetA);
+			OffsetB = normalize(OffsetB);
+			OffsetA = normalize(OffsetA);
+
+			float cosA = dot(WorldNormal, OffsetB);
+			float cosB = dot(neighborSample.sampleRef.CreationNormal, OffsetB);
+			float cosPhiA = -dot(OffsetA, neighborSample.sampleRef.Normal);
+			float cosPhiB = -dot(OffsetB, neighborSample.sampleRef.Normal);
+			// Discard extreme samples to prevent fireflies
+			if ( cosPhiB <= 0 || RA2 <= 0 || RB2 <= 0)
+			{
+				continue;
+			}
+			float Jocbian = RB2 * max(0.0,cosPhiA) / max(1e-5, (RA2 * cosPhiB));
+
+			float neighborWeight = Visible ?  pNewTN * Jocbian : 0;
+			{
+				cachedResult |= (1u << uint(i));
+				if (state.CombineReservoirs(neighborSample, RandContext.GenerateSample1D(), neighborWeight))
+				{
+					selected = i;
+					selectedPos = neighborSample.sampleRef.Position;
+					selectedNormal = neighborSample.sampleRef.Normal;
+				}
+			}
+		}
+	}
+
+	if (state.sampleRef.IsValid())
+	{
+#if (!SPATIAL_RESTIR_BIAS)
+		{
+			// Compute the unbiased normalization term (instead of using 1/M)
+			float pi = state.targetPdf;
+			float piSum = state.targetPdf * centerSample.M;
+
+			// To do this, we need to walk our neighbors again
+			for (int i = 0; i < NumSamples; ++i)
+			{
+				// If we skipped this neighbor above, do so again.
+				if ((cachedResult & (1u << uint(i))) == 0) continue;
+
+				// Handle the rare cases when there is no sample
+				if (selected == -1) continue;
+
+#if !USE_LDS_FOR_SPATIAL_RESAMPLE
+				int2 SampleCoord = SamplePoints[i];
+#else
+				float2 Offset = NeighborOffsets[(StartIdx + i) & NeighborOffsetMask] * 2.0f - 1.0f;
+				int2 SampleCoord = round(float2(PixelCoord) + (Offset * SpatialSamplingRadius));
+#endif
+
+				FGBufferData AdjGBuffer = GetGBufferDataFromSceneTexturesLoad(SampleCoord);
+				float AdjDeviceZ = SceneDepthTexture.Load(int3(SampleCoord, 0)).r;
+				float3 AdjWorldPosition;
+				float3 AdjCameraDirection;
+				ReconstructWorldPositionAndCameraDirectionFromDeviceZ(SampleCoord, AdjDeviceZ, AdjWorldPosition, AdjCameraDirection);
+
+				// Get the PDF of the sample RIS selected in the first loop, above, *at this neighbor* 
+				float ps = GetApproximateLightSampleWeight(AdjWorldPosition, AdjCameraDirection, AdjGBuffer, state.sampleRef);
+#if 1 
+				//ToDo - does this need to be a permutation?
+				if (ApplyApproximateVisibilityTest && ps > 0)
+				{
+					//bool Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, AdjWorldPosition, AdjGBuffer, state.sampleRef);
+					bool Visible = CheckApproximateVisibility(SampleCoord, AdjDeviceZ, AdjWorldPosition, AdjGBuffer, state.sampleRef);
+
+					if (!Visible)
+					{
+						ps = 0;
+					}
+				}
+#endif
+				uint2 sampleID = uint2(SampleCoord / float(UpscaleFactor) + 0.5);
+				if( any(sampleID > DispatchRaysDimensions().xy) )
+					continue;
+				RTXGI_Reservoir neighborSample = RTXGI_Reservoir::Load(ReadReservoirData(sampleID, InputSlice));
+
+				// Select this sample for the (normalization) numerator if this particular neighbor pixel
+				//     was the one we selected via RIS in the first loop, above.
+				pi = selected == i ? ps : pi;
+
+				// Add to the sums of weights for the (normalization) denominator
+				piSum += ps * neighborSample.M;
+			}
+
+			// Use "MIS-like" normalization
+			state.FinalizeResampling(pi, piSum);
+		}
+#else
+		{
+			state.FinalizeResampling(1.0, state.M);
+		}
+#endif
+
+	}
+}
+
+#if USE_DEFERED_GI
+void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint PixelRayIndex,uint2 SvPosition, FGBufferData GBufferData, inout FRandomContext RandContext, inout RTXGI_Reservoir state)
+{
+	RTXGI_Reservoir LocalReservoir = RTXGI_Reservoir::Empty();
+	float3 WorldPosition = GIRay.Origin;
+    float RayPdf = GIRay.Pdf;
+    float3 Irradiance = 0;
+	const uint SampleCount = 1;
+
+#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+	// uint2 BufferSize = View.BufferSizeAndInvSize.xy;
+	uint2 BufferSize = ceil(View.BufferSizeAndInvSize.xy / UpscaleFactor);
+	uint2 Pixel = PixelCoord;
+	// uint2 Pixel = PixelCoord;
+	int startAddr =  MAX_CUT_NODES * ( (Pixel.y / CutShareGroupSize) * ((BufferSize.x + CutShareGroupSize - 1) / CutShareGroupSize) + Pixel.x / CutShareGroupSize );
+
+	uint numPass = ceil(float(MaxCutNodes) / (InterleaveRate * InterleaveRate));
+#endif
+
+	for(uint SampleIndex = 0; SampleIndex < SampleCount; SampleIndex++)
+	{
+		RTXGI_SampleRef sampleRef;
+		RayDesc Ray;
+		Ray.TMin = 0.01;
+		Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+		Ray.Origin    = GIRay.Origin;
+		Ray.Direction = GIRay.GetDirection();
+
+		RandomSequence RandSequence;
+		RandomSequence_Initialize(RandSequence, SvPosition, SampleIndex, View.StateFrameIndex, SampleCount);
+
+#if MESH_LIGHT_SAMPLING
+	#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+		float factor = 1.0 ;
+		for(uint NeeTrial = 0; NeeTrial < numPass; ++NeeTrial)
+	#else
+		float factor = 1.0 / NextEventEstimationSamples;
+		for (uint NeeTrial = 0; NeeTrial < NextEventEstimationSamples; ++NeeTrial)
+	#endif
+		{
+			float3 LightRadianceOverPdf = 0;
+			float NeePdf = 0.0;
+
+			float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+			RayDesc LightRay;
+			int NodeID = 1;
+		#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+			if( CutShareGroupSize > 0)
+			{
+				int cutNodeId = NeeTrial;
+
+				int startId = 0;
+				int endId = MaxCutNodes;
+
+				if (InterleaveRate > 1)
+				{
+					int interleaveGroupSize = InterleaveRate * InterleaveRate;
+					int interleaveSamplingId = ( View.StateFrameIndex + InterleaveRate * (Pixel.y % InterleaveRate) + (Pixel.x % InterleaveRate)) % interleaveGroupSize;
+
+					float ratio = float(MaxCutNodes) / interleaveGroupSize;
+					startId = int(interleaveSamplingId * ratio);  
+					endId = interleaveSamplingId == interleaveGroupSize - 1 ? MaxCutNodes : int((interleaveSamplingId + 1) * ratio);
+
+					if (startId + NeeTrial >= endId) break;
+					else
+					{
+						cutNodeId = startId + NeeTrial;
+					}
+				}
+				else
+				{
+					if (cutNodeId >= MaxCutNodes) break;
+				}
+				int cutID = cutNodeId + startAddr;
+				NodeID = MeshLightCutBuffer[cutID];
+				if (NodeID < 0) break;
+			}
+		#endif
+			if( SampleMeshLight(RandSample3,
+						Ray.Origin,
+						GBufferData.WorldNormal,
+						NodeID,
+						LightRay.Direction,
+						LightRay.TMax,
+						LightRadianceOverPdf,
+						NeePdf) )
+			{
+		#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+			LightRadianceOverPdf *= ( InterleaveRate * InterleaveRate);
+		#endif
+				LightRay.Origin = Ray.Origin;
+				LightRay.TMin = 0;
+				LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+				bool bTransmission = true;
+				float3 BiasNormal = GBufferData.WorldNormal;
+				if ( dot(BiasNormal, LightRay.Direction) < 0.0)
+				{
+					BiasNormal = -BiasNormal;
+				}
+				ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+				// Trace visibility ray
+				uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+				const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+				NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+				FMinimalPayload NeePayload = TraceVisibilityRay(
+					TLAS,
+					NeeRayFlags,
+					NeeInstanceInclusionMask,
+					PixelCoord,
+					LightRay);
+
+				// No hit indicates successful next-event connection
+				if (NeePayload.IsMiss())
+				{
+					// Evaluate material
+					float3 MaterialThroughput;
+					half3 N = GBufferData.WorldNormal;
+					half3 V = -Ray.Direction;
+					half3 L = LightRay.Direction;
+					float NoL = saturate(dot(N, L));
+					FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+					FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+					MaterialThroughput = LightingSample.Diffuse;
+					if (bTransmission)
+					{
+						MaterialThroughput += LightingSample.Transmission;
+					}
+
+					// Record the contribution
+	
+					float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * factor;
+					// float3 ExitantRadianceSample = float3(1,0,0);
+					// Tonemap for firefly suppression
+					if (UseFireflySuppression)
+					{
+						ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+					}
+
+					Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+				}
+			}
+		}
+#endif //MESH_LIGHT_SAMPLING
+		float3 RayThroughput = 1.0;
+		float3 RandSample = RandomSequence_GenerateSample1D(RandSequence);
+		RayThroughput *= Diffuse_Lambert(GBufferData.DiffuseColor) * saturate(dot(GBufferData.WorldNormal, Ray.Direction)) / GBufferData.DiffuseColor ;
+		
+		if (UseRussianRoulette)
+		{
+			float RRSample = RandSample.x;
+			float ProbabilityOfSuccess = Luminance(GBufferData.DiffuseColor);
+			float ProbabilityOfTermination = 1.0 - ProbabilityOfSuccess;
+			if (RRSample < ProbabilityOfTermination) continue;
+			RayThroughput /= ProbabilityOfSuccess;
+		}
+
+#if USE_RADIANCE_CACHE
+		FarRadianceFieldQuery FieldQuery = FarRadianceFieldQuery::FromRay(Ray.Origin, Ray.Direction);
+        FieldQuery.QueryNormal = GBufferData.WorldNormal;
+        FieldQuery.InterpolationURand = RandomSequence_GenerateSample3D(RandSequence);
+        FarRadianceField Field = FieldQuery.Query();
+        if (Field.IsHit()) 
+        {
+            Ray.TMax = Field.ProbeHitT;
+        }
+#endif
+
+		FRayIntersectionBookmark Bookmark = BookmarkBuffer[PixelRayIndex];
+		uint RayFlags = 0;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+		const bool bEnableSkyLightContribution = true;
+		const bool bIgnoreTranslucentMaterials = false;
+		
+	#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	#endif
+
+		FPackedMaterialClosestHitPayload PackedPayload = (FPackedMaterialClosestHitPayload)0;
+		if (bEnableSkyLightContribution)
+		{
+			PackedPayload.SetEnableSkyLightContribution();
+		}
+		PackedPayload.SetPixelCoord(SvPosition);
+		PackedPayload.SetMipBias(TextureMipBias);
+		
+		TraceDeferredMaterialShadingRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			Ray,
+			Bookmark,
+			PackedPayload);
+
+		//Unpack the payload
+		FMaterialClosestHitPayload Payload = UnpackRayTracingPayload(PackedPayload, Ray);
+
+		// Environment hit
+		if (Payload.IsMiss())
+		{
+		#if USE_RADIANCE_CACHE
+			if (Field.IsHit()) 
+            {
+                Irradiance += Field.Radiance * Field.InvPdf;
+				// RWDebugDiffuseUAV[PixelCoord] = float4(Irradiance, 1.0);
+			}
+			else 
+		#endif
+			{
+				// Optional multi-bounce SkyLight contribution
+				if (EvalSkyLight )
+				{
+					uint SkyLightId = 0;
+					RayDesc LightRay = Ray;
+					LightRay.TMax = POSITIVE_INFINITY;
+					float3 EnvironmentRadiance = SkyLight_TraceLight(Ray, SkyLightId).Radiance;
+					Irradiance += EnvironmentRadiance / RayPdf;
+				}
+			}
+			break;
+		}
+
+		if (Payload.HitT > MaxRayDistanceForGI)
+			break;
+		{
+			float3 HitPos = Ray.Origin + Ray.Direction * Payload.HitT;
+			sampleRef.CreationPoint = WorldPosition;
+			sampleRef.CreationNormal = GBufferData.WorldNormal;
+			sampleRef.Position = HitPos;
+			sampleRef.Normal = Payload.WorldNormal;
+		}
+
+		// Create faux GBuffer to use with EvaluateBxDF
+		FGBufferData GBufferData = (FGBufferData)0;
+		GBufferData.Depth = 1.f; // Do not use depth
+		GBufferData.WorldNormal = Payload.WorldNormal;
+		GBufferData.BaseColor = Payload.BaseColor;
+		GBufferData.CustomData = Payload.CustomData;
+		GBufferData.GBufferAO = Payload.GBufferAO;
+		GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+		GBufferData.SpecularColor = Payload.SpecularColor;
+		GBufferData.DiffuseColor = Payload.DiffuseColor;
+		GBufferData.Metallic = Payload.Metallic;
+		GBufferData.Specular = Payload.Specular;
+		GBufferData.Roughness = Payload.Roughness;
+		GBufferData.ShadingModelID = Payload.ShadingModelID;
+		GBufferData.CustomData = Payload.CustomData;
+
+
+		//TODO: use mesh light explict sampling
+		// if (AccumulateEmissive)
+		// {
+		// 	Irradiance += Payload.Radiance;
+		// }
+
+		float3 Position = Payload.WorldPos;
+		Ray.Origin = Position;
+		float3 Normal = Payload.WorldNormal;
+#if USE_SCREEN_GI_REPROJECTION
+		// float4 RayHitClipPos =  mul( float4( Position, 1 ), View.WorldToClip );
+		// RayHitClipPos.xyz *= rcp(RayHitClipPos.w);
+		// float2 RayHitUV = (RayHitClipPos.xy * float2(1, -1) + 1) * 0.5;
+		// uint2 HitPixelCoord = RayHitUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+		// float HitScreenDepth = SceneDepthTexture.Load(int3(HitPixelCoord, 0)).r;
+		// bool IsOnScreen = true && all(abs(RayHitClipPos.xy) < 1.0)
+        //     && abs((RayHitClipPos.z - HitScreenDepth) / RayHitClipPos.z) < 0.1;
+
+		float4 RayHitClipPos = mul(float4(Position, 1), View.WorldToClip);
+		float3 RayHitScreenPos = RayHitClipPos.xyz / RayHitClipPos.w;
+		float2 RayHitUV = RayHitScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+		uint2 HitPixelCoord = RayHitUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+		float HitScreenDepth = SceneDepthTexture.Load(int3(HitPixelCoord, 0)).r;
+		bool IsOnScreen = true && all(abs(RayHitUV.xy) < 1.0)
+             && abs((RayHitScreenPos.z - HitScreenDepth) / RayHitScreenPos.z) < 0.1;
+        // If it is on-screen, we'll try to use its reprojected radiance from the previous frame
+        float4 ProjectedRadiance = 0;
+        if (IsOnScreen) 
+		{
+            // ProjectedRadiance = ReprojectedHistory.SampleLevel(LinearSampler, HitUV, 0);
+			ProjectedRadiance = ReprojectedHistory[HitPixelCoord];
+            // Check if the temporal reprojection is valid.
+            IsOnScreen = ProjectedRadiance.w > 0;
+        }
+
+		if( IsOnScreen )
+		{
+			Irradiance += ProjectedRadiance.xyz  / View.PreExposure;
+			//RWDebugDiffuseUAV[PixelCoord] = float4(ProjectedRadiance.xyz, 1.0);
+		}
+		else
+#endif
+		{
+#if !MESH_LIGHT_SAMPLING
+			Irradiance += Payload.Radiance * RayThroughput / RayPdf;
+#else
+	#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+			for(uint NeeID = 0; NeeID < numPass; ++NeeID)
+	#else
+			for (uint NeeID = 0; NeeID < NextEventEstimationSamples; ++NeeID)
+	#endif
+			{
+				float3 LightRadianceOverPdf = 0;
+				float NeePdf = 0.0;
+
+				float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+				RayDesc LightRay;
+				int nodeID = 1;
+			#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+				if( CutShareGroupSize > 0)
+				{
+					int cutNodeId = NeeID;
+
+					int startId = 0;
+					int endId = MaxCutNodes;
+
+					if (InterleaveRate > 1)
+					{
+						int interleaveGroupSize = InterleaveRate * InterleaveRate;
+						int interleaveSamplingId = ( View.StateFrameIndex + InterleaveRate * (Pixel.y % InterleaveRate) + (Pixel.x % InterleaveRate)) % interleaveGroupSize;
+
+						float ratio = float(MaxCutNodes) / interleaveGroupSize;
+						startId = int(interleaveSamplingId * ratio);  
+						endId = interleaveSamplingId == interleaveGroupSize - 1 ? MaxCutNodes : int((interleaveSamplingId + 1) * ratio);
+
+						if (startId + NeeID >= endId) break;
+						else
+						{
+							cutNodeId = startId + NeeID;
+						}
+					}
+					else
+					{
+						if (cutNodeId >= MaxCutNodes) break;
+					}
+					int cutID = cutNodeId + startAddr;
+					nodeID = MeshLightCutBuffer[cutID];
+					if (nodeID < 0) break;
+				}
+			#endif
+				if( SampleMeshLight(RandSample3,
+							Ray.Origin,
+							Payload.WorldNormal,
+							nodeID,
+							LightRay.Direction,
+							LightRay.TMax,
+							LightRadianceOverPdf,
+							NeePdf) )
+				{
+		#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+			LightRadianceOverPdf *= ( InterleaveRate * InterleaveRate);
+		#endif
+					LightRay.Origin = Ray.Origin;
+					LightRay.TMin = 0;
+					LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+					bool bTransmission = true;
+					float3 BiasNormal = Payload.WorldNormal;
+					if ( dot(BiasNormal, LightRay.Direction) < 0.0)
+					{
+						BiasNormal = -BiasNormal;
+					}
+					ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+					// Trace visibility ray
+					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+	#if !ENABLE_TWO_SIDED_GEOMETRY
+					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	#endif
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						NeeRayFlags,
+						NeeInstanceInclusionMask,
+						PixelCoord,
+						LightRay);
+
+					// No hit indicates successful next-event connection
+					if (NeePayload.IsMiss())
+					{
+						// Evaluate material
+						float3 MaterialThroughput;
+	#if USE_PATHTRACING_MATERIALS
+						FMaterialEval MaterialEval = EvalMaterial(CameraDirection, LightRay.Direction, Payload, false);
+						MaterialThroughput = MaterialEval.Weight * MaterialEval.Pdf;
+	#else
+						half3 N = Payload.WorldNormal;
+						half3 V = -Ray.Direction;
+						half3 L = LightRay.Direction;
+						float NoL = saturate(dot(N, L));
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+						MaterialThroughput = LightingSample.Diffuse;
+						if (bTransmission)
+						{
+							MaterialThroughput += LightingSample.Transmission;
+						}
+	#endif
+
+						// Record the contribution
+						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput* RayThroughput * factor / RayPdf;
+						// float3 ExitantRadianceSample = float3(1,0,0);
+						// Tonemap for firefly suppression
+						if (UseFireflySuppression)
+						{
+							ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+						}
+
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+					}
+				}
+			}
+#endif //MESH_LIGHT_SAMPLING
+		}
+
+		{
+			// Perform next-event estimation
+			float SplitFactor = 1.0 / NextEventEstimationSamples;
+			for (uint NeeTrial = 0; NeeTrial < NextEventEstimationSamples; ++NeeTrial)
+			{
+				// Light selection
+				int LightId;
+				float3 LightRadianceOverPdf = 0;
+				float NeePdf = 0.0;
+
+				float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+
+				RayDesc LightRay;
+				if (SampleLight(RandSample3,
+								Position,
+								Normal,
+								Payload.PrimitiveLightingChannelMask,
+								ENABLE_TRANSMISSION,
+								LightId,
+								LightRay.Direction,
+								LightRay.TMax,
+								LightRadianceOverPdf,
+								NeePdf))
+				{
+					LightRay.Origin = Position;
+					LightRay.TMin = 0;
+					LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+					bool bTransmission = HasTransmission(LightId);
+					float3 BiasNormal = Payload.WorldNormal;
+					if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+					{
+						BiasNormal = -BiasNormal;
+					}
+					ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+					// Trace visibility ray
+					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+		#if !ENABLE_TWO_SIDED_GEOMETRY
+					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+		#endif
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						NeeRayFlags,
+						NeeInstanceInclusionMask,
+						SvPosition,
+						LightRay);
+
+					// No hit indicates successful next-event connection
+					if (NeePayload.IsMiss())
+					{
+						// Evaluate material
+						half3 N = Payload.WorldNormal;
+						half3 V = -Ray.Direction;
+						half3 L = LightRay.Direction;
+						float NoL = saturate(dot(N, L));
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+						float3 MaterialThroughput = LightingSample.Diffuse;
+						if (bTransmission)
+						{
+							MaterialThroughput += LightingSample.Transmission;
+						}
+
+						// Record the contribution
+						float3 ExitantRadianceSample = RayThroughput * LightRadianceOverPdf * MaterialThroughput * SplitFactor / RayPdf;
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+					}
+				}
+			}
+		}
+#if USE_SURFEL
+		float3 SurfeLighting =  GBufferData.DiffuseColor * GetSurfelGI(Ray.Origin, GBufferData.WorldNormal, 0, RandSequence);
+		Irradiance += SurfeLighting;
+		RWDebugDiffuseUAV[PixelCoord] = float4(SurfeLighting,1.0);
+#endif
+
+		sampleRef.Irradiance = Irradiance;
+		float targetPdf = GetTargetPdf(sampleRef.Irradiance, sampleRef.CreationPoint,sampleRef.CreationNormal, sampleRef.Position);	
+		float invSourcePdf = 1.0;
+		float risRnd = RandContext.GenerateSample1D();
+
+		bool selected = LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
+	}
+	LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
+	LocalReservoir.M = 1;
+	state = LocalReservoir;
+}
+
+/***************************************************************************************************
+ *
+ *  GenerateInitialSamplesForDeferedGI
+ *
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
+{
+	const uint DispatchThreadId = DispatchRaysIndex().x; // This shader is dispatched in 1D configuration
+
+	FDeferredMaterialPayload DeferredMaterialPayload = (FDeferredMaterialPayload)0;
+	DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_INVALID;
+
+#if DIM_DEFERRED_MATERIAL_MODE == DEFERRED_MATERIAL_MODE_GATHER
+
+	FSortedGIRay GIRay;
+
+	{
+		const uint  ThreadGroupSize  = GI_RAY_DIRECTION_SORT_TILE_SIZE * GI_RAY_DIRECTION_SORT_TILE_SIZE;
+		const uint2 TileSize         = uint2(GI_RAY_DIRECTION_SORT_TILE_SIZE, GI_RAY_DIRECTION_SORT_TILE_SIZE);
+		const uint  TileIndex        = DispatchThreadId / ThreadGroupSize;
+		const uint  RayIndexInTile   = DispatchThreadId % ThreadGroupSize;
+		const uint2 NumTiles         = TileAlignedResolution / TileSize;
+		const uint2 TileBasePixelPos = uint2(TileIndex % NumTiles.x, TileIndex / NumTiles.x) * TileSize;
+		const uint2 PixelPos         = View.ViewRectMin.xy + TileBasePixelPos + uint2(RayIndexInTile % TileSize.x, RayIndexInTile / TileSize.x);
+
+		GIRay = GenerateDeferredGIRay(PixelPos, UpscaleFactor, MaxNormalBias);
+        RayBuffer[DispatchThreadId] = GIRay; // Store the ray to be used in shading phase
+	}	
+
+	DeferredMaterialPayload.PixelCoordinates = DispatchThreadId; // Store the sorted ray index, not packed 2D pixel coordinates
+	const uint2 PixelCoord = UnpackPixelCoordinates(GIRay.PixelCoordinates);
+
+    uint2 SvPosition = GetPixelCoord(PixelCoord, UpscaleFactor);
+    float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+    float2 UV = (float2(SvPosition) + 0.5) * InvBufferSize;
+
+    //#dxr-todo: workaround for flickering. UE-87281
+    FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(SvPosition);
+
+    // Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+    if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+    {
+        GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+    }
+    bool bShouldTrace = ShouldTraceRay(PixelCoord,GBufferData );
+	if ( bShouldTrace )
+	{
+		RayDesc Ray;
+        Ray.TMin = 0.01;
+        Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+		Ray.Origin    = GIRay.Origin;
+		Ray.Direction = GIRay.GetDirection();
+
+		DeferredMaterialPayload.SortKey = RAY_TRACING_DEFERRED_MATERIAL_KEY_RAY_MISS;
+		FRayIntersectionBookmark Bookmark = (FRayIntersectionBookmark)0;
+
+        uint RayFlags = 0;
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+        TraceDeferredMaterialGatherRay(TLAS,
+            RayFlags,
+            RAY_TRACING_MASK_OPAQUE,
+            Ray,
+            Bookmark,
+            DeferredMaterialPayload
+        );
+		BookmarkBuffer[DispatchThreadId] = Bookmark;
+	}
+
+	MaterialBuffer[DispatchThreadId] = DeferredMaterialPayload;
+#elif DIM_DEFERRED_MATERIAL_MODE == DEFERRED_MATERIAL_MODE_SHADE
+	    
+    DeferredMaterialPayload = MaterialBuffer[DispatchThreadId];
+
+	// Linear ray index is stored in PixelCoordinates (see DEFERRED_MATERIAL_MODE_GATHER above)
+	const uint GIRayIndex = DeferredMaterialPayload.PixelCoordinates;
+
+	FSortedGIRay GIRay = RayBuffer[GIRayIndex];
+	const uint2 PixelCoord = UnpackPixelCoordinates(GIRay.PixelCoordinates);
+    uint2 SvPosition = GetPixelCoord(PixelCoord, UpscaleFactor);
+    float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
+    float2 UV = (float2(SvPosition) + 0.5) * InvBufferSize;
+    // RWDebugDiffuseUAV[PixelCoord] = 0.0;
+
+	uint LinearIndex = CalcLinearIndex(SvPosition);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+
+    //#dxr-todo: workaround for flickering. UE-87281
+    FGBufferData GBufferData = GetGBufferDataFromSceneTexturesLoad(SvPosition);
+
+    // Remap DiffuseColor when using SubsurfaceProfile (GBuffer decoding replaces with 100% albedo)
+    if (UseSubsurfaceProfile(GBufferData.ShadingModelID))
+    {
+        GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
+    }
+	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
+	bool bTraceRay = ShouldTraceRay(PixelCoord, GBufferData);
+
+	if (bTraceRay)
+	{
+		ProduceInitialSampleForDeferedGI( PixelCoord,GIRay, GIRayIndex,SvPosition ,GBufferData,  RandContext, state);
+	}
+	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
+
+#endif
+}
+
+#endif
+
+
+/***************************************************************************************************
+ *
+ *  GenerateInitialSamples
+ *
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+
+	// Get G-Buffer surface data
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+	float Depth = GBuffer.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
+	// Diffuse color rejection threshold
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+	if (bIsValidPixel)
+	{
+		ProduceInitialSample(PixelCoord, GBuffer, DeviceZ, WorldPosition, CameraDirection, RandContext, state);
+	}
+
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
+}
+
+/***************************************************************************************************
+ *
+ *  EvaluateRestirGILighting
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
+{
+
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex);
+
+	// Get G-Buffer surface data
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+	float Depth = GBuffer.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+	RTXGI_Reservoir risSample = RTXGI_Reservoir::Empty();
+	float3 DiffuseExitantRadiance = 0.0;
+	float RayDistance = 0.0;
+	float HitCount = 0.0;
+
+	if (bIsValidPixel)
+	{
+		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+		{
+			risSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice + Reservoir));
+
+			if (risSample.sampleRef.IsValid())
+			{
+				float3 LightPosition = risSample.sampleRef.Position;
+				float3 Direction = (LightPosition - WorldPosition);
+				
+				RayDesc Ray;	
+				Ray.Origin = WorldPosition;
+				Ray.Direction = normalize(Direction);
+				Ray.TMin = 0;
+				Ray.TMax = length(Direction) - 1e-1;
+				Ray.TMax = min(Ray.TMax, MaxShadowDistance);
+
+				float3 BiasNormal = GBuffer.WorldNormal;
+				if ( dot(BiasNormal, Ray.Direction) < 0.0)
+				{
+					BiasNormal = -BiasNormal;
+				}
+				ApplyPositionBias(Ray, BiasNormal, MaxNormalBias);
+
+				uint RayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+				RayFlags |= VisibilityFaceCull == 1 ? RAY_FLAG_CULL_FRONT_FACING_TRIANGLES : 0;
+				RayFlags |= VisibilityFaceCull == 2 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+				const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+				FLightFunctionPayload LightPayload = TraceLightFunctionRay(
+					TLAS,
+					RayFlags,
+					InstanceInclusionMask,
+					PixelCoord,
+					Ray);
+				if (!LightPayload.IsHit() )
+				{
+					DiffuseExitantRadiance +=  risSample.sampleRef.Irradiance * risSample.weightSum;
+					RayDistance += Ray.TMax;
+					HitCount += 1.0f;
+				}
+				else
+				{
+					HitCount += 1.0f;
+					RayDistance += LightPayload.HitT;
+					if (FeedbackVisibility)
+					{
+						risSample.weightSum = 0.0f;
+						risSample.targetPdf = 0.0f;
+						risSample.M = 0;
+					}
+				}
+			}
+			else
+			{
+				// sample occluded, kill it for the history
+				risSample = RTXGI_Reservoir::Empty();
+			}
+			// if (UseFireflySuppression)
+			// {
+			// 	DiffuseExitantRadiance *= rcp(1.0 + Luminance(DiffuseExitantRadiance));
+			// }
+			WriteReservoirHistoryData(DispatchThreadId, Reservoir, risSample.Store());
+		}
+
+		DiffuseExitantRadiance /= float(NumReservoirs);
+
+		RayDistance /= max(HitCount, 1.0);
+
+		// Apply the pre-exposure scale to the resulting shaded value
+#if USE_PREEXPOSURE
+		DiffuseExitantRadiance *= View.PreExposure;
+#endif
+
+		DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance);
+	}
+	else
+	{
+		// Invalid pixel, write empty reservoir
+		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+		{
+			WriteReservoirHistoryData(DispatchThreadId, Reservoir, risSample.Store());
+		}
+	}
+	//WriteReservoirHistoryData(DispatchThreadId, 0, RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice)).Store());
+	RWDiffuseUAV[DispatchThreadId] = float4(DiffuseExitantRadiance,1.0);
+	RWRayDistanceUAV[DispatchThreadId] = float2(RayDistance, NumReservoirs);
+}
+
+/***************************************************************************************************
+ *
+ *  ApplySpatialResampling
+ *
+ *
+ ***************************************************************************************************/
+//
+
+RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	if (any(PixelCoord > View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+
+	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+	if (bIsValidPixel)
+	{
+		ApplySpatialResampling(PixelCoord, DispatchThreadId,GBuffer, DeviceZ, WorldPosition, CameraDirection, RandContext, state);
+	}
+	
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
+}
+/***************************************************************************************************
+ *
+ *  ApplyTemporalResampling
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
+{
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchDimension = DispatchRaysDimensions().xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	if (any(PixelCoord > View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 WorldPosition;
+	float3 CameraDirection;
+	ReconstructWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, WorldPosition, CameraDirection);
+
+	RTXGI_Reservoir state = RTXGI_Reservoir::Empty();
+
+	float3 DiffuseColor = GBuffer.DiffuseColor;
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && Luminance(DiffuseColor) > DiffuseThreshold;
+
+	float3 WorldNormal = GBuffer.WorldNormal;
+	if (bIsValidPixel)
+	{
+		RTXGI_Reservoir curSample = RTXGI_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
+
+		int historyLimit = min(RTXGI_Reservoir::MaxM,MaxTemporalHistory * curSample.M);
+		state.CombineReservoirs(curSample, /* random = */ 0.5, curSample.targetPdf);
+
+		// Backproject this pixel to last frame
+
+		// start by just using our sample position
+		int2 prevPos = PixelCoord;
+		float ExpectedPrevLinearDepth = GBuffer.Depth;
+
+		float2 ViewUV = (float2(PixelCoord) + 0.5) * View.ViewSizeAndInvSize.zw;
+		float4 NDC = float4(ViewUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+
+#if GBUFFER_HAS_VELOCITY && 0
+		// Some objects can get marked as not having velocities, which leads to DecodeGBuffer zeroing them
+		// This appears to be errant under some conditions, so overriding the rejection produces better results
+		GBuffer.Velocity = GBufferVelocityTexture.Load(int3(PixelCoord, 0));
+#endif
+		if (GBuffer.Velocity.x > 0.0)
+		{
+			float2 Velocity = DecodeVelocityFromTexture(GBuffer.Velocity).xy;
+			float2 PrevNDC = NDC.xy - Velocity;
+			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+			ExpectedPrevLinearDepth = ConvertFromDeviceZ(DeviceZ - DecodeVelocityFromTexture(GBuffer.Velocity).z);
+		}
+		else
+		{
+			float4 PrevNDC = mul(NDC, View.ClipToPrevClip);
+			PrevNDC.xyz /= PrevNDC.w;
+			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+
+			ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
+		}
+
+
+		//ToDo - full GBuffer not available for last frame, so we're going to need to approximate using current + channels we have
+		// could make a better approximation than what is used here
+		FGBufferData PrevGBuffer = GBuffer;
+// 		bool foundNeighbor = false;
+// 		const float radius = 4;
+
+// 		// Try to find a matching surface in the neighborhood of the reprojected pixel
+// 		for (int i = 0; i < 9; i++)
+// 		{
+// 			int2 offset = 0;
+// 			if (i > 0)
+// 			{
+// 				offset = int2((RandContext.GenerateSample2D() - 0.5f) * radius);
+// 			}
+// 			int2 idx = prevPos + offset;
+
+// 			float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
+// 			float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
+
+// 			// TODO: refine sample rejection tests
+// 			if (dot(GBuffer.WorldNormal, PrevWorldNormal) < TemporalNormalRejectionThreshold)
+// 			{
+// 				continue;
+// 			}
+
+// 			if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > TemporalDepthRejectionThreshold)
+// 			{
+// 				continue;
+// 			}
+
+// 			PrevGBuffer.WorldNormal = PrevWorldNormal;
+// 			PrevGBuffer.Depth = PrevDepth;
+
+// 			prevPos = idx;
+// 			foundNeighbor = true;
+// 			break;
+// 		}
+
+// 		bool selectedPreviousSample = false;
+// 		uint previousM = 0;
+// 		float previousWeight = 0;
+
+// 		if (foundNeighbor)
+// 		{
+// 			// Resample the previous frame sample into the current reservoir, but reduce the gisample's weight
+// 			// according to the bilinear weight of the current pixel
+// 			uint2 prePosId = uint2(prevPos / float(UpscaleFactor) + 0.5);
+// 			if( any(prePosId > DispatchDimension.xy) || any(prePosId) < 0)
+// 				return;
+// 			RTXGI_Reservoir prevSample = RTXGI_Reservoir::Load(ReadReservoirHistoryData(prePosId, HistoryReservoir));
+// 			prevSample.M = min(prevSample.M, historyLimit);
+
+// 			if (prevSample.sampleRef.IsValid())
+// 			{
+// 				bool Visible = true;
+// #if (VISIBILITY_BEFORE_COMBINE)
+// 				if (ApplyApproximateVisibilityTest)
+// 				{
+// 					Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, WorldPosition, GBuffer, prevSample.sampleRef);
+// 				}
+// #endif
+// 				//previousWeight = Visible ? GetApproximateLightSampleWeight(WorldPosition, CameraDirection, GBuffer, prevSample.sampleRef) : 0;
+// 				float Jocbian = 1.0f;
+// 				float pNewTN = GetTargetPdf(prevSample.sampleRef.Irradiance, WorldNormal, WorldPosition, prevSample.sampleRef.Position);
+// 				previousWeight = Visible ?  pNewTN * Jocbian : 0;
+// 				{
+// 					previousM = prevSample.M;
+
+// 					if( state.CombineReservoirs(prevSample, RandContext.GenerateSample1D(), previousWeight) )
+// 					{
+// 						selectedPreviousSample = true;
+// 					}
+// 				}
+// 			}
+// 		}
+
+// #if (!TEMPORAL_RESTIR_BIAS)		
+// 		// Compute the unbiased normalization term (instead of using 1/M)
+// 		float pi = state.targetPdf;   // Since it was selected, this is known to be equiv to lightWeight(state.sampleRef, context)
+// 		float piSum = state.targetPdf * curSample.M;
+
+// 		if (state.sampleRef.IsValid() && previousM > 0)
+// 		{
+// 			float pt = GetApproximateLightSampleWeight(WorldPosition, CameraDirection, GBuffer, state.sampleRef);
+
+// #if (!VISIBILITY_BEFORE_COMBINE)
+// 			//ToDo - does this need to be a permutation?
+// 			if (ApplyApproximateVisibilityTest && pt > 0)
+// 			{
+// 				bool Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, WorldPosition, GBuffer, state.sampleRef);
+
+// 				if (!Visible)
+// 				{
+// 					pt = 0;
+// 				}
+// 			}
+// #endif
+
+// 			pi = selectedPreviousSample ? pt : pi;
+// 			piSum += pt * previousM;
+// 		}
+
+// 		state.FinalizeResampling(pi, piSum);
+// #else
+// 		// If the prior reservoir actually corresponds to the current reservoir, then the visibility and weights should all be the same, and cancel out.
+// 		state.FinalizeResampling(1, state.M);
+// #endif
+// 	}
+		const float AngleOffset = ((View.StateFrameIndex + 7) * 11) % 32 * 2 * PI;
+		float M_sum = 1;
+		for (uint SampleIndex = 0; SampleIndex < 5 && M_sum < MaxTemporalHistory * 1.25; ++SampleIndex) 
+		{
+				const float ang = (SampleIndex + AngleOffset) * GOLDEN_ANGLE;
+				const float PixelOffsetRadius = sqrt(
+					float(((SampleIndex - 1) + View.StateFrameIndex) & 3) + 1
+				) * clamp(historyLimit - M_sum, 1, 7); // TODO: keep high in noisy situations
+
+				const float2 PxielOffsetBase = float2(
+					cos(ang), sin(ang)
+				) * PixelOffsetRadius;
+
+				const int2 PixelOffset =
+					SampleIndex == 0
+					? 0
+					: int2(PxielOffsetBase)
+					;
+				int2 idx = prevPos + PixelOffset;
+
+				float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
+				float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
+
+				// TODO: refine sample rejection tests
+				if (dot(GBuffer.WorldNormal, PrevWorldNormal) < TemporalNormalRejectionThreshold)
+				{
+					continue;
+				}
+
+				if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > TemporalDepthRejectionThreshold)
+				{
+					continue;
+				}
+
+				PrevGBuffer.WorldNormal = PrevWorldNormal;
+				PrevGBuffer.Depth = PrevDepth;
+
+				prevPos = idx;
+
+				const uint2 prePosId = clamp(floor(prevPos / float(UpscaleFactor) ), uint2(0,0), ReservoirBufferDim.xy - 1);
+				RTXGI_Reservoir prevSample = RTXGI_Reservoir::Load(ReadReservoirHistoryData(prePosId, HistoryReservoir));
+				prevSample.M = min(prevSample.M, historyLimit);
+				// prevSample.M = max(0, min(prevSample.M, exp2(log2(MaxTemporalHistory) * 1.0 ) ));
+
+				if (prevSample.sampleRef.IsValid())
+				{
+					float Jocbian = 1.0f;
+					float pNewTN = GetTargetPdf(prevSample.sampleRef.Irradiance, WorldNormal, WorldPosition, prevSample.sampleRef.Position);
+				
+					state.CombineReservoirs(prevSample, RandContext.GenerateSample1D(), pNewTN * Jocbian);
+				}
+				M_sum += prevSample.M;
+		}
+		state.FinalizeResampling(1, state.M);
+	}
+
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
+}

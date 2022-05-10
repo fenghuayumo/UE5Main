@@ -1,0 +1,61 @@
+#ifndef RESERVOIR_USH
+#define RESERVOIR_USH
+
+uint3 ReservoirBufferDim;
+
+#define RESTIR_RESERVOIR_W_CLAMP    5.0
+static const float GOLDEN_ANGLE = 2.39996323;
+
+#define DIFFUSE_GI_SAMPLING_FULL_SPHERE 0
+
+struct Reservoir
+{
+    float   WeightSum;
+    uint    PixelCoord;
+    float   M;
+    float   W;
+
+    static Reservoir Create() 
+    {
+        Reservoir res;
+        res.WeightSum = 0;
+        res.PixelCoord = 0;
+        res.M = 0;
+        res.W = 0;
+        return res;
+    }
+
+    static Reservoir Load(float4 raw) 
+    {
+        Reservoir res;
+        res.WeightSum = raw.x;
+        res.PixelCoord = asuint(raw.y);
+        res.M = raw.z;
+        res.W = raw.w;
+        return res;
+    }
+
+    float4 Store() 
+    {
+        return float4(WeightSum, asfloat(PixelCoord), M, W);
+    }
+
+    bool Update(float w, uint pixelCoord, uint rnd) 
+    {
+        this.WeightSum += w;
+        this.M += 1;
+        const float dart = rnd;
+        const float prob = w / this.WeightSum;
+
+        if (prob >= dart) 
+        {
+            this.PixelCoord = pixelCoord;
+            return true;
+        }
+        else 
+            return false;
+
+    }
+};
+
+#endif

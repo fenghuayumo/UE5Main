@@ -1036,7 +1036,9 @@ bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 	FSceneTextureParameters& SceneTextures,
 	FViewInfo& View,
 	IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig* OutRayTracingConfig,
-	IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs)
+	IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+	FSurfelBufResources* SurfelRes,
+	FRadianceVolumeProbeConfigs* RadianceProbeConfig)
 #if RHI_RAYTRACING
 {
 	if (!View.ViewState) return false;
@@ -1081,7 +1083,12 @@ bool FDeferredShadingSceneRenderer::RenderRayTracingGlobalIllumination(
 	}
 	else if (IsRestirGIEnabled(View))
 	{
-		RenderFusionRestirGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs);
+		RenderFusionSurfelGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs, *SurfelRes);
+
+		//RenderWRC(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs, *RadianceProbeConfig);
+	
+		RenderFusionRestirGI(GraphBuilder, SceneTextures, View, *OutRayTracingConfig, UpscaleFactor, OutDenoiserInputs, SurfelRes, RadianceProbeConfig);
+
 	}
 	//else if (IsFusionGIEnabled(View))
 	//{

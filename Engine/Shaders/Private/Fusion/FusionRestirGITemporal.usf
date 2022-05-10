@@ -1,0 +1,347 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingReflectionsCommon.ush"
+#include "../RayTracing/RayTracingDeferredReflections.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+
+Texture2D<float>    DepthHistoryTex;
+Texture2D<float4>   NormalHistoryTex;
+
+
+Texture2D<float4>   IrradianceTex; // xyz : irradiance, w : invSourcePdf
+Texture2D<float4>   HitNormalTex; // xyz : hitnormal, w : hitT
+Texture2D<float4>   HitPosDotTex;// xyz : raydirection, w: NDotL
+
+Texture2D<float4>   ReservoirHistoryTex; // 
+Texture2D<float4>   IrradianceHistoryTex;
+Texture2D<float4>   CreatePosHistoryTex;
+Texture2D<float4>   HitPosDistHistoryTex;
+Texture2D<float4>   HitNormalDotHistoryTex;
+
+RWTexture2D<float4> RWReservoirUAV;
+RWTexture2D<float4> RWIrradianceUAV;
+RWTexture2D<float4> RWCreatePosUAV;
+RWTexture2D<float4> RWHitNormalDotUAV;
+RWTexture2D<float4> RWHitPosDistUAV;
+
+float4 HistoryScreenPositionScaleBias;
+uint MaxTemporalHistory;
+// float NormalThrehold;
+uint UpscaleFactor;
+// uint SpatialSamples;
+void GenerateGIRayDirection(
+	float3 WorldNormal,
+	float2 RandSample,
+	out float3 RayDirection,
+    out float RayPdf
+)
+{
+#if  BRDF_COSINE_SAMPLING
+	// Perform cosine-hemispherical sampling and convert to world-space
+	float4 Direction_Tangent = CosineSampleHemisphere(RandSample);
+	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
+
+
+	RayDirection = Direction_World;
+	RayPdf = Direction_Tangent.w;
+#else     //Hemisphere
+    float4 Direction_Tangent = UniformSampleHemisphere(RandSample);
+	float3 Direction_World = TangentToWorld(Direction_Tangent.xyz, WorldNormal);
+	RayDirection = Direction_World;
+    RayPdf = Direction_Tangent.w;
+#endif
+}
+
+float2 GetReprojectedBufferUV(float2 ScreenPos, float SceneDepth, float4 EncodedVelocity)
+{
+	float DeviceZ = ConvertToDeviceZ(SceneDepth);
+	float4 ThisClip = float4(ScreenPos, DeviceZ, 1);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+	float2 PrevScreenPos = PrevClip.xy / PrevClip.w;
+	if (EncodedVelocity.x > 0.0)
+	{
+		// #yuriy_todo: use full 3D velocity when it's available
+		PrevScreenPos = ThisClip.xy - DecodeVelocityFromTexture(EncodedVelocity).xy;
+	}
+
+	PrevScreenPos.xy = clamp(PrevScreenPos.xy, (float2)-1, (float2)1);
+
+	return PrevScreenPos.xy * HistoryScreenPositionScaleBias.xy + HistoryScreenPositionScaleBias.zw;
+}
+
+bool DisocclusionHeuristic(float2 ScreenPos, float DeviceZ, float2 HistoryUV)
+{
+	float PrevDeviceZ = DepthHistoryTex.SampleLevel(GlobalPointClampedSampler, HistoryUV, 0).r;
+	float4 ThisClip = float4(ScreenPos, DeviceZ, 1);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+	float3 PrevExpectedDeviceZ = PrevClip.z / PrevClip.w;
+
+	float3 CameraVelocity = LWCToFloat(LWCSubtract(PrimaryView.WorldViewOrigin, PrimaryView.PrevWorldViewOrigin));
+
+	float CompensatedPrevDeviceZ = ConvertToDeviceZ(ConvertFromDeviceZ(PrevDeviceZ) + length(CameraVelocity));
+
+	// Empirically chosen threshold to balance between aliasing/noise from false positives and ghosting from false negatives
+	float DisocclusionMaxDeviceZ = 0.001;
+
+	return and(PrevDeviceZ - DeviceZ > DisocclusionMaxDeviceZ, CompensatedPrevDeviceZ - PrevExpectedDeviceZ > DisocclusionMaxDeviceZ);
+}
+
+[numthreads(8, 8, 1)]
+void TemporalResamplingCS(uint2 DispatchThreadID : SV_DispatchThreadID) 
+{
+    uint2 DispatchThreadId = DispatchThreadID.xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	if (any(PixelCoord >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+    const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+    const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999;
+    if ( !bIsValidPixel) 
+    {
+        RWIrradianceUAV[DispatchThreadID] = float4(0.0.xxx, -1.0);
+        RWHitNormalDotUAV[DispatchThreadID] = 0.0.xxxx;
+        RWReservoirUAV[DispatchThreadID] = 0.0.xxxx;
+        return;
+    }
+
+
+    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+	float3 TranslatedWorldPosition = ReconstructTranslatedWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+    
+    float3 WorldNormal = GBuffer.WorldNormal;
+    uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex +  32);
+
+    float p_q_sel = 0;
+    float3 IrradianceQS = 0;
+    float3 CreatePosQS = 0;
+    float3 HitPosQS = 1;
+    float3 HitNormalQS = 1;
+    
+    Reservoir reservoir = Reservoir::Create();
+    const uint PixelIndex = DispatchThreadId.x | (DispatchThreadId.y << 16);
+
+    reservoir.PixelCoord = PixelIndex;
+
+    float3 OutRayDirection = 0.0;
+
+
+    {
+        //float RayPdf = 1.0;
+        // RandomSequence RandSequence;
+	    // RandomSequence_Initialize(RandSequence, PixelCoord, 0, View.StateFrameIndex, 1);
+
+        // float3 RandSample = RandomSequence_GenerateSample3D(RandSequence);
+        // GenerateGIRayDirection(TranslatedWorldPosition, RandSample.yz, OutRayDirection,RayPdf );
+        float4 IrradianceInvPdf = IrradianceTex[DispatchThreadId];
+        float4 HitNormalDist = HitNormalTex[DispatchThreadId];
+        float4 HitPosDot = HitPosDotTex[DispatchThreadId];
+        OutRayDirection = HitPosDot.xyz;
+        const float p_q = p_q_sel = max(1e-3, Luminance(IrradianceInvPdf.xyz))
+            #if !DIFFUSE_GI_BRDF_SAMPLING
+                * max(0, /*dot(WorldNormal, OutRayDirection)*/ HitPosDot.w)
+            #endif
+            ;
+
+        const float HitT = HitNormalDist.w;
+        const float inv_pdf_q = IrradianceInvPdf.w;
+
+        IrradianceQS = IrradianceInvPdf.xyz;
+        CreatePosQS = TranslatedWorldPosition;
+        HitPosQS = TranslatedWorldPosition + OutRayDirection * HitNormalDist.w;
+        HitNormalQS = HitNormalDist.xyz;
+
+        reservoir.PixelCoord = PixelIndex;
+        reservoir.WeightSum = p_q * inv_pdf_q;
+        reservoir.M = 1;
+        reservoir.W = inv_pdf_q;
+    }
+
+    //float2 PrevUV = BufferUV;
+    //float2 UVDiff = 0.0;
+    const float4 EncodedVelocity = Texture2DSampleLevel(GBufferVelocityTexture, GlobalPointClampedSampler, BufferUV, 0);
+    const float2 PrevUV = GetReprojectedBufferUV(ScreenPos, SceneDepth, EncodedVelocity);
+    const float2 UVDiff =  PrevUV - BufferUV;
+
+    const int SubPixelCount = (UpscaleFactor * UpscaleFactor - 1);
+#if USE_RESAMPLING
+    {
+        float M_sum = reservoir.M;
+        const float AngleOffset = ((View.StateFrameIndex + 7) * 11) % 32 * 2 * PI;
+        const uint SpatialSamples = 5;
+        for (uint SampleIndex = 0; SampleIndex < SpatialSamples && M_sum < MaxTemporalHistory * 1.25; ++SampleIndex) 
+        {
+            const float Angle = (SampleIndex + AngleOffset) * GOLDEN_ANGLE;
+            const float PixelOffsetRadius = sqrt(float(((SampleIndex - 1) + View.StateFrameIndex) & SubPixelCount) + 1) * 
+                                            clamp(MaxTemporalHistory - M_sum, 1, MaxTemporalHistory); // TODO: keep high in noisy situations
+            
+            const float2 PixelOffsetBase = float2(cos(Angle), sin(Angle)) * PixelOffsetRadius;
+
+            const int2 PixelOffset = SampleIndex == 0 ? 0 : int2(PixelOffsetBase);
+            int2 ReprojPx = floor( SampleIndex == 0 ? DispatchThreadId : ((DispatchThreadId + PixelOffset ^ SubPixelCount) + UVDiff * View.BufferSizeAndInvSize.xy * 0.5 + 0.5)); 
+
+            const int2 ReservoirPixel = ReprojPx + PixelOffset;
+            const uint2 HighReservoirPixel = GetPixelCoord(ReservoirPixel, UpscaleFactor);
+
+            Reservoir r = Reservoir::Load(ReservoirHistoryTex[ReservoirPixel]);
+            const uint2 spx = uint2(r.PixelCoord & 0xffff, r.PixelCoord >> 16);
+            
+            const float SampleDepth = DepthHistoryTex[PixelCoord + PixelOffset * 2];
+
+            const float3 PrevCreatePos = CreatePosHistoryTex[spx];
+            if (length(PrevCreatePos - TranslatedWorldPosition) > 0.1 * SceneDepth) 
+                continue;
+
+            if ( SampleDepth < 1e-3 || SampleDepth > 0.999 ) 
+                continue;
+
+            // if ( abs(DeviceZ - SampleDepth) > 1e-4 ) 
+            //     continue;
+
+            const float NormalThreHold = 0.5;
+            const float3 SampledNormal = DecodeNormal(NormalHistoryTex[HighReservoirPixel].rgb); //  GBufferATexture
+            if (SampleIndex != 0 && dot(SampledNormal, WorldNormal) < NormalThreHold) 
+                continue;
+
+            const float4 SampleHitPosDist = HitPosDistHistoryTex[spx];
+            const float3 SampleHitPos = SampleHitPosDist.xyz;
+
+            const float PrevDist = SampleHitPosDist.w;
+
+            const float4 SampleHitNormalAndDot = HitNormalDotHistoryTex[spx];
+
+            const float3 ToSampleHit= SampleHitPos - TranslatedWorldPosition;
+            const float  DistToSampleHit = length(ToSampleHit);
+            const float3 DirToSampleHit = ToSampleHit * rcp(DistToSampleHit);
+
+            const float CenterToHitVis = -dot(SampleHitNormalAndDot.xyz, DirToSampleHit);
+
+            // Note: also doing this for sample 0, as under extreme aliasing,
+            // we can easily get bad samples in.
+            if (dot(DirToSampleHit, TranslatedWorldPosition) < 1e-4) 
+                continue;
+            
+            // Ignore samples hit surfaces that face away from the center point
+            if (CenterToHitVis <= 1e-4 && SampleIndex != 0) 
+                continue;
+
+            const float4 PrevIrradiance = IrradianceHistoryTex[spx];
+
+            // r.M = max(0, min(r.M, exp2(log2(MaxTemporalHistory) * (1.0 - rt_invalidity))));
+            r.M = min(r.M, MaxTemporalHistory);
+
+            float p_q = 1;
+            p_q *= max(1e-3, Luminance(PrevIrradiance.rgb));
+            #if !DIFFUSE_GI_BRDF_SAMPLING
+                p_q *= max(0, dot(DirToSampleHit, WorldNormal));
+            #endif
+
+            float visibility = 1;
+            float jacobian = 1;
+
+            // Note: needed for sample 0 due to temporal jitter.
+            //if (SampleIndex > 0)
+            {
+                // Distance falloff. Needed to avoid leaks.
+                jacobian *= clamp(PrevDist / DistToSampleHit, 1e-4, 1e4);
+                jacobian *= jacobian;
+
+                // N of hit dot -L. Needed to avoid leaks.
+                jacobian *= clamp(CenterToHitVis / SampleHitNormalAndDot.w,
+                    /// max(1e-5, -dot(SampleHitNormalAndDot.xyz, prev_DirToSampleHit_ws));
+                    0, 1e4);
+            }
+
+            // Fixes boiling artifacts near edges. Unstable jacobians,
+            // but also effectively reduces reliance on reservoir exchange
+            // in tight corners, which is desirable since the well-distributed
+            // raw samples thrown at temporal filters will do better.
+            // if (USE_JACOBIAN_BASED_REJECTION) 
+            // {
+            //     const float JACOBIAN_REJECT_THRESHOLD = 4.0;
+            //     if (!(jacobian < JACOBIAN_REJECT_THRESHOLD && jacobian > 1.0 / JACOBIAN_REJECT_THRESHOLD)) 
+            //         continue;
+            // }
+
+            // Raymarch to check occlusion
+            // if (SampleIndex > 0) 
+            // {
+            //     const ViewRayContext sample_ray_ctx = ViewRayContext::from_uv_and_depth(sample_uv, sample_depth);
+            //     const float3 sample_origin_vs = sample_ray_ctx.ray_hit_vs();
+        	// 	const float3 surface_offset_vs = sample_origin_vs - view_ray_context.ray_hit_vs();
+
+            //     // TODO: finish the derivations, don't perspective-project for every sample.
+
+            //     const float3 raymarch_dir_unnorm_ws = SampleHitPos - view_ray_context.ray_hit_ws();
+            //     const float3 raymarch_end_ws =
+            //         view_ray_context.ray_hit_ws()
+            //         // TODO: what's a good max distance to raymarch? Probably need to project some stuff
+            //         + raymarch_dir_unnorm_ws * min(1.0, length(surface_offset_vs) / length(raymarch_dir_unnorm_ws));
+
+            //     const float2 raymarch_end_uv = cs_to_uv(position_world_to_clip(raymarch_end_ws).xy);
+            //     const float2 raymarch_len_px = (raymarch_end_uv - uv) * gbuffer_tex_size.xy;
+
+            //     const uint MIN_PX_PER_STEP = 2;
+            //     const uint MAX_TAPS = 2;
+
+            //     const int k_count = min(MAX_TAPS, int(floor(length(raymarch_len_px) / MIN_PX_PER_STEP)));
+
+            //     // Depth values only have the front; assume a certain thickness.
+            //     const float Z_LAYER_THICKNESS = 0.05;
+
+            //     for (int k = 0; k < k_count; ++k) 
+            //     {
+            //         const float t = (k + 0.5) / k_count;
+            //         const float3 interp_pos_ws = lerp(view_ray_context.ray_hit_ws(), raymarch_end_ws, t);
+            //         const float3 interp_pos_cs = position_world_to_clip(interp_pos_ws);
+            //         const float depth_at_interp = depth_tex.SampleLevel(sampler_nnc, cs_to_uv(interp_pos_cs.xy), 0);
+            //         if (depth_at_interp > interp_pos_cs.z * 1.001) {
+            //             visibility *= smoothstep(0, Z_LAYER_THICKNESS, inverse_depth_relative_diff(interp_pos_cs.z, depth_at_interp));
+            //         }
+            //     }
+    		// }
+
+            M_sum += r.M;
+            if (reservoir.Update(p_q * r.W * r.M * visibility * jacobian, PixelIndex, RandContext.GenerateSample1D()) ) 
+            {
+                OutRayDirection = DirToSampleHit;
+                p_q_sel = p_q;
+                IrradianceQS = PrevIrradiance.rgb;
+                CreatePosQS = PrevCreatePos;
+                HitPosQS = SampleHitPos;
+                HitNormalQS = SampleHitNormalAndDot.xyz;
+            }
+        }
+
+        reservoir.M = M_sum;
+        reservoir.W = (1.0 / max(1e-5, p_q_sel)) * (reservoir.WeightSum / reservoir.M);
+        reservoir.W = min(reservoir.W, RESTIR_RESERVOIR_W_CLAMP);
+    }
+#endif
+    const float4 HitNoramlDot = float4(HitNormalQS, -dot(HitNormalQS, OutRayDirection));
+
+    RWIrradianceUAV[DispatchThreadId] = float4(IrradianceQS, dot(WorldNormal, OutRayDirection));
+    RWCreatePosUAV[DispatchThreadId] = float4(CreatePosQS,0);
+    RWHitNormalDotUAV[DispatchThreadId] = HitNoramlDot;
+    RWHitPosDistUAV[DispatchThreadId] =  float4(HitPosQS, length(HitPosQS - TranslatedWorldPosition));
+    RWReservoirUAV[DispatchThreadId] = reservoir.Store();
+}

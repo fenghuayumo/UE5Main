@@ -1,0 +1,122 @@
+
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingReflectionsCommon.ush"
+#include "../RayTracing/RayTracingDeferredReflections.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+Texture2D<float4>   IrradianceTex;
+Texture2D<float4>   ReservoirTex;
+Texture2D<float4>   HitPosDistTex;
+Texture2D<float4>   HitNormalTex;
+
+Texture2D<float4>   SSAOTex;
+RWTexture2D<float4> RWGlobalIlluminationUAV;
+
+uint SpatialSamples;
+uint UpscaleFactor;
+static float GGXNdfUnNorm(float a2, float cos_theta) 
+{
+	float denom_sqrt = cos_theta * cos_theta * (a2 - 1.0) + 1.0;
+	return a2 / (denom_sqrt * denom_sqrt);
+}
+
+
+[numthreads(8, 8, 1)]
+void RestirGIResolveCS(uint2 PixelCoord : SV_DispatchThreadID) 
+{
+
+    // uint2 PixelCoord = GetPixelCoord(DispatchThreadID, UpscaleFactor);
+    if (any(PixelCoord >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+    const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+    const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999;
+    if ( !bIsValidPixel) 
+    {
+        RWGlobalIlluminationUAV[PixelCoord] = 0;
+        return;
+    }
+    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+	float3 TranslatedWorldPosition = ReconstructTranslatedWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+    
+    float3 CenterNormal = GBuffer.WorldNormal;
+
+    float3 CenterNormalVS = normalize(mul(CenterNormal, (float3x3)View.TranslatedWorldToView));
+    const float CenterDepth = DeviceZ;
+
+    float3 WeightedIrradiance = 0;
+    float w_sum = 0;
+
+    const uint UpscaleFactorPow2 = UpscaleFactor * UpscaleFactor;
+	const uint SubPixelId = View.StateFrameIndex & (UpscaleFactorPow2 - 1);
+
+    uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex);
+
+    for (uint SampleIndex = 0; SampleIndex < SpatialSamples; ++SampleIndex) 
+    {
+        float3 IrradianceSum = 0;
+
+        const float Angle = (SampleIndex + RandContext.GenerateSample1D() ) * GOLDEN_ANGLE + (SubPixelId / UpscaleFactorPow2) * 2 * PI;
+        const float Radius = pow(float(SampleIndex), 0.666) * 1.0 + 0.4;
+        const float2 RpxOffset = float2(cos(Angle), sin(Angle)) * Radius;
+        const int2 Rpx = int2(floor(float2(PixelCoord) * 0.5 + RpxOffset));
+
+        Reservoir r = Reservoir::Load(ReservoirTex[Rpx]);
+        const uint2 spx = uint2(r.PixelCoord & 0xffff, r.PixelCoord >> 16);
+
+        const float3 HitPos = HitPosDistTex[spx].xyz;
+        const float3 SampleOffset = HitPos - TranslatedWorldPosition;
+        const float SampleDist = length(SampleOffset);
+        const float3 SampleDir = SampleOffset / SampleDist;
+        const float3 SampleHitNormal = HitNormalTex[spx].xyz;
+
+        float GTerm =
+            max(0.0, dot(CenterNormal, SampleDir))
+            * (DIFFUSE_GI_SAMPLING_FULL_SPHERE ? PI : 2);
+        float3 radiance = IrradianceTex[spx].rgb;
+
+        IrradianceSum += radiance* r.W * GTerm;
+
+        const uint2  hRpx = GetPixelCoord(Rpx, UpscaleFactor);
+        const float3 SampledNormal = normalize(DecodeNormal(GBufferATexture[hRpx].xyz));
+        const float SampledDepth = SceneDepthTexture[hRpx].r;
+        
+        float w = 1;
+        float Ndot = dot(SampledNormal, CenterNormal);
+        w *= GGXNdfUnNorm(0.01, saturate(Ndot));
+        w *= exp2(-200.0 * abs( CenterNormalVS.z * (CenterDepth / SampledDepth - 1.0)));
+
+        #if USE_SSAO_STEERING
+            const float SampledSSAO = SSAOTex[hRpx].r;
+            w *= exp2(-10.0 * abs(SampledSSAO - CenterSSAO));
+        #endif
+
+        WeightedIrradiance += IrradianceSum * w;
+        w_sum += w;
+    }
+
+    WeightedIrradiance /= max(1e-20, w_sum);
+    WeightedIrradiance *= View.PreExposure;
+    // WeightedIrradiance *= View.PreExposure;
+    RWGlobalIlluminationUAV[PixelCoord] = float4(WeightedIrradiance, 1);
+
+}

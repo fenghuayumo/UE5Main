@@ -1,0 +1,285 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingReflectionsCommon.ush"
+#include "../RayTracing/RayTracingDeferredReflections.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+Texture2D<float4>   IrradianceTex; // xyz : irradiance, w : invSourcePdf
+Texture2D<float4>   HitNormalDotTex; // xyz : hitnormal, w : hitT
+Texture2D<float4>   HitPosDistTex;
+Texture2D<float4>   ReservoirTex;
+
+Texture2D<float4>   SSAOTex;
+RWTexture2D<float4> RWReservoirUAV;
+
+uint UpscaleFactor;
+uint SpatialSamples;
+uint SpatialPassIdx;
+int MaxTemporalHistory;
+[numthreads(8, 8, 1)]
+void SpatialResamplingCS(uint2 DispatchThreadID : SV_DispatchThreadID) 
+{
+    uint2 DispatchThreadId = DispatchThreadID.xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+	if (any(PixelCoord >= View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+    const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+    const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999;
+    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+
+	float3 TranslatedWorldPosition = ReconstructTranslatedWorldPositionFromDeviceZ(PixelCoord, DeviceZ);
+    
+    float3 WorldNormal = GBuffer.WorldNormal;
+    uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + 32 * SpatialPassIdx);
+
+    const float CenterSSAO = SSAOTex[PixelCoord].r;
+
+    Reservoir reservoir = Reservoir::Create();
+    float p_q_sel = 0;
+    float M_sum = 0;
+
+    float SampleRadiusOffset = RandContext.GenerateSample1D();
+
+    float PoorNormals = 0;
+
+    Reservoir CenterReservoir = Reservoir::Load(ReservoirTex[DispatchThreadID]);
+
+    // Don't be picky at low contribution counts. SSAO weighing
+    // in those circumstances results in boiling near edges.
+    const float SSAOFactor = smoothstep(5.0, 10.0, CenterReservoir.M);
+    float KernelRadius = lerp(2.0, 16.0, lerp(1, CenterSSAO, SSAOFactor));
+
+    if (SpatialPassIdx == 1) 
+    {
+        KernelRadius = lerp(2.0, 32.0, lerp(1, CenterSSAO, SSAOFactor));
+    }
+
+    const uint TARGET_M = 512;
+
+    float AngleOffset = RandContext.GenerateSample1D() * PI * 2;
+
+    for (uint SampleIndex = 0; SampleIndex < SpatialSamples && M_sum < TARGET_M; ++SampleIndex) 
+    {
+        //float ang = M_PI / 2;
+        float Angle = (SampleIndex + AngleOffset) * GOLDEN_ANGLE;
+        float Radius = 0 == SampleIndex ? 0 : float(SampleIndex + SampleRadiusOffset) * (KernelRadius / SpatialSamples);
+        int2 rpx_offset = float2(cos(Angle), sin(Angle)) * Radius;
+
+        const bool IsCeneterSample = SampleIndex == 0;
+        //const bool IsCeneterSample = all(rpx_offset == 0);
+
+        const int2 rpx = DispatchThreadId + rpx_offset;
+        Reservoir r = Reservoir::Load(ReservoirTex[rpx]);
+
+        if (IsCeneterSample && SpatialPassIdx == 0) 
+        {
+            #if 1
+                r.M = min(r.M, MaxTemporalHistory );
+            #else
+                r.M = min(r.M, 500);
+            #endif
+        } 
+        else 
+            r.M = min(r.M, 500);
+
+        const uint2 spx = uint2(r.PixelCoord & 0xffff, r.PixelCoord >> 16);
+        float4 PrevIrradiance = IrradianceTex[spx];
+        float visibility = 1;
+
+        const int2 SampleOffset = int2(DispatchThreadId) - int2(rpx);
+        const float SampleDist2 = dot(SampleOffset, SampleOffset);
+        const float3 SampleNormal = DecodeNormal(GBufferATexture[rpx].rgb);
+
+        #if DIFFUSE_GI_BRDF_SAMPLING
+            float NormalThrehold = 0.9;
+        #else
+            float NormalThrehold = 0.5;
+        #endif
+        
+        if (SpatialPassIdx != 0) 
+            NormalThrehold = 0.5;
+
+        if (CenterReservoir.M < 10) 
+            NormalThrehold = 0.5 * exp2(-max(0, PoorNormals) * 0.3);
+
+        // Note: Waaaaaay more loose than the ReSTIR papers. Reduces noise in
+        // areas of high geometric complexity. The resulting bias tends to brighten edges,
+        // and we clamp that effect later. The artifacts is less prounounced normal map detail.
+        // TODO: detect this first, and sharpen the threshold. The poor normal counting below
+        // is a shitty take at that.
+        if (!IsCeneterSample && dot(SampleNormal, WorldNormal) < NormalThrehold) 
+        {
+            PoorNormals += 1;
+            continue;
+        } else {
+            PoorNormals -= 1;
+        }
+
+        const float ssao_dart = RandContext.GenerateSample1D();
+        const uint2 hrpx =  GetPixelCoord(spx, UpscaleFactor);
+        const float SampleSSAO = SSAOTex[hrpx].r;
+
+        // Balance between details and splotches in corner
+        const float SSAOThrehold = SpatialPassIdx == 0 ? 0.2 : 0.4;
+
+        // Was: abs(SampleSSAO - CenterSSAO); that can however reject too aggressively.
+        // Some leaking is better than flicker and very dark corners.
+        const float ssao_infl = smoothstep(0.0, SSAOThrehold, SSAOFactor * abs(SampleSSAO - CenterSSAO));
+
+        if (!IsCeneterSample && ssao_infl > ssao_dart) 
+        {    // Note: improves contacts, but results in boiling/noise in corners
+            // This is really just an approximation of a visbility check,
+            // which we can do in a better way.
+            continue;
+        }
+        const float SampleDepth = SceneDepthTexture[hrpx].r;
+        
+        if (SampleDepth <= 1e-3 || SampleDepth > 0.999 ) 
+            continue;
+
+        const float3 SmapleWorldPos = ReconstructTranslatedWorldPositionFromDeviceZ(hrpx, SampleDepth);
+        const float4 SampleHitPosDist = HitPosDistTex[spx];// + float4(get_eye_position(), 0.0);
+        const float3 SampleHitPos = SampleHitPosDist.xyz;
+        const float3 PrevDirToSampleHitUnNorm = SampleHitPos - SmapleWorldPos;
+        const float3 PrevDirToSampleHit = normalize(PrevDirToSampleHitUnNorm);
+        const float PrevDist = length(PrevDirToSampleHitUnNorm);
+
+        // Reject hits too close to the surface
+        if (!IsCeneterSample && !(PrevDist > 1e-2)) 
+            continue;
+
+        const float3 DirToSampleHitUnnorm = SampleHitPos - TranslatedWorldPosition;
+        const float DistToSampleHit = length(DirToSampleHitUnnorm);
+        const float3 DirToSampleHit = normalize(DirToSampleHitUnnorm);
+
+        // Reject hits below the normal plane
+        if (!IsCeneterSample && dot(DirToSampleHit, WorldNormal) < 1e-5) 
+            continue;
+
+        // TODO: combine all those into a single similarity metric?
+
+        // Reject neighbors with vastly different depths
+        if (SpatialPassIdx == 0) 
+        {
+            if (!IsCeneterSample && abs(DeviceZ - SampleDepth) / DeviceZ > 0.2) 
+                continue;
+        } 
+        else 
+        {
+            if (!IsCeneterSample && abs(DeviceZ - SampleDepth) / DeviceZ > 0.1) 
+                continue;
+        }
+
+        {
+    		// const float3 surface_offset_vs = sample_origin_vs - view_ray_context.ray_hit_vs();
+            // const float SampleIndexnclination = dot(normalize(surface_offset_vs), WorldNormal);
+            // const float ray_inclination = dot(DirToSampleHit, WorldNormal);
+
+            // // Approx shadowing (bias)
+            // if (!IsCeneterSample && ray_inclination * 0.2 < SampleIndexnclination) {
+            //     continue;
+            // }
+
+            // Raymarch to check occlusion
+            // if (true && !IsCeneterSample) {
+            //     // TODO: finish the derivations, don't perspective-project for every sample.
+
+            //     const float3 raymarch_dir_unnorm_ws = SampleHitPos - view_ray_context.ray_hit_ws();
+            //     const float3 raymarch_end_ws =
+            //         view_ray_context.ray_hit_ws()
+            //         // TODO: what's a good max distance to raymarch? Probably need to project some stuff
+            //         + raymarch_dir_unnorm_ws * min(1.0, length(surface_offset_vs) / length(raymarch_dir_unnorm_ws));
+
+            //     const float2 raymarch_end_uv = cs_to_uv(position_world_to_clip(raymarch_end_ws).xy);
+            //     const float2 raymarch_len_px = (raymarch_end_uv - uv) * output_tex_size.xy;
+
+            //     const uint MIN_PX_PER_STEP = 2;
+            //     const uint MAX_TAPS = 3;
+
+            //     const int k_count = min(MAX_TAPS, int(floor(length(raymarch_len_px) / MIN_PX_PER_STEP)));
+
+            //     // Depth values only have the front; assume a certain thickness.
+            //     const float Z_LAYER_THICKNESS = 0.05;
+
+            //     for (int k = 0; k < k_count; ++k) {
+            //         const float t = (k + 0.5) / k_count;
+            //         const float3 interp_pos_ws = lerp(view_ray_context.ray_hit_ws(), raymarch_end_ws, t);
+            //         const float3 interp_pos_cs = position_world_to_clip(interp_pos_ws);
+            //         const float depth_at_interp = half_depth_tex.SampleLevel(sampler_nnc, cs_to_uv(interp_pos_cs.xy), 0);
+            //         if (depth_at_interp > interp_pos_cs.z * 1.001) {
+            //             visibility *= smoothstep(0, Z_LAYER_THICKNESS, inverse_depth_relative_diff(interp_pos_cs.z, depth_at_interp));
+            //         }
+            //     }
+    		// }
+        }
+
+        const float4 SampleHitNormalDot = HitNormalDotTex[spx];
+        const float CenterToHitVis = -dot(SampleHitNormalDot.xyz, DirToSampleHit);
+
+        // Ignore samples hit surfaces that face away from the center point
+        if (CenterToHitVis <= 1e-3 && SampleIndex != 0) 
+            continue;
+
+        float p_q = 1;
+        p_q *= max(1e-3, Luminance(PrevIrradiance.rgb));
+
+        // Actually looks more noisy with this the N dot L when using BRDF sampling.
+        // With (hemi)spherical sampling, it's fine.
+        #if !DIFFUSE_GI_BRDF_SAMPLING
+            p_q *= max(0, dot(DirToSampleHit, WorldNormal));
+        #endif
+
+        float jacobian = 1;
+
+        // Distance falloff. Needed to avoid leaks.
+        //jacobian *= max(0.0, PrevDist) / max(1e-4, DistToSampleHit);
+        jacobian *= clamp(PrevDist / DistToSampleHit, 1e-4, 1e4);
+        jacobian *= jacobian;
+
+        // N of hit dot -L. Needed to avoid leaks.
+        jacobian *= clamp(CenterToHitVis / SampleHitNormalDot.w, 0, 1e4);
+
+        if (IsCeneterSample) 
+            jacobian = 1;
+
+        if (jacobian < 1.0 / 4.0 || jacobian > 16.0) 
+            continue;
+
+        if (!(p_q > 0)) 
+            continue;
+
+        float w = p_q * r.W * r.M * jacobian;
+        if (reservoir.Update(w * visibility, r.PixelCoord,  RandContext.GenerateSample1D())) 
+        {
+            p_q_sel = p_q;
+        }
+
+        M_sum += r.M;
+    }
+
+    reservoir.M = M_sum;
+    reservoir.W = (1.0 / max(1e-8, p_q_sel)) * (reservoir.WeightSum / max(1, reservoir.M));
+
+    reservoir.W = min(reservoir.W, RESTIR_RESERVOIR_W_CLAMP);
+
+    RWReservoirUAV[DispatchThreadID] = reservoir.Store();
+}
