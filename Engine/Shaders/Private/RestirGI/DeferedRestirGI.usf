@@ -328,10 +328,10 @@ bool ShouldTraceRay(uint2 DispatchThreadId, FGBufferData GBufferData)
 	}
 
 	// Cull based on ViewRect
-	if (any(DispatchThreadId - View.ViewRectMin.xy >= RayTracingResolution))
-	{
-		bTraceRay = false;
-	}
+	// if (any(DispatchThreadId - View.ViewRectMin.xy >= RayTracingResolution))
+	// {
+	// 	bTraceRay = false;
+	// }
 
 	return bTraceRay;
 }
@@ -486,7 +486,7 @@ void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint P
 		Ray.TMin = 0.01;
 		Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
 		Ray.Origin    = GIRay.Origin;
-		Ray.Direction = GIRay.GetDirection();
+		Ray.Direction = normalize(GIRay.GetDirection());
 
 		RandomSequence RandSequence;
 		RandomSequence_Initialize(RandSequence, SvPosition, SampleIndex, View.StateFrameIndex, SampleCount);
@@ -880,7 +880,7 @@ void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint P
 			}
 #endif //MESH_LIGHT_SAMPLING
 		}
-
+       
 		{
 			// Perform next-event estimation
 			float SplitFactor = 1.0 / NextEventEstimationSamples;
@@ -954,6 +954,7 @@ void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint P
 				}
 			}
 		}
+         
 #if USE_SURFEL
 		float3 SurfeLighting =  GBufferData.DiffuseColor * GetSurfelGI(Ray.Origin, GBufferData.WorldNormal, 0, RandSequence);
 		Irradiance += SurfeLighting;
@@ -970,6 +971,7 @@ void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint P
 	LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
 	LocalReservoir.M = 1;
 	state = LocalReservoir;
+
     if (HitCount > 0.0)
 	{
 		HitDistance /= HitCount;
@@ -1014,7 +1016,7 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
 	const uint2 PixelCoord = UnpackPixelCoordinates(GIRay.PixelCoordinates);
 
     if (all(PixelCoord - View.ViewRectMin.xy < RayTracingResolution))
-	{
+    {   
         uint2 SvPosition = GetPixelCoord(PixelCoord, UpscaleFactor);
         float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
         float2 UV = (float2(SvPosition) + 0.5) * InvBufferSize;
@@ -1028,6 +1030,7 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
             GBufferData.DiffuseColor = GBufferData.StoredBaseColor;
         }
         bool bShouldTrace = ShouldTraceRay(PixelCoord,GBufferData );
+
         if ( bShouldTrace )
         {
             RayDesc Ray;
@@ -1053,8 +1056,7 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
             );
             BookmarkBuffer[DispatchThreadId] = Bookmark;
         }
-	}
-
+    }
 	MaterialBuffer[DispatchThreadId] = DeferredMaterialPayload;
 #elif DIM_DEFERRED_MATERIAL_MODE == DEFERRED_MATERIAL_MODE_SHADE
 	    
@@ -1065,6 +1067,8 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
 
 	FSortedGIRay GIRay = RayBuffer[GIRayIndex];
 	const uint2 PixelCoord = UnpackPixelCoordinates(GIRay.PixelCoordinates);
+    if (any(PixelCoord - View.ViewRectMin.xy >= RayTracingResolution))
+        return;
     uint2 SvPosition = GetPixelCoord(PixelCoord, UpscaleFactor);
     float2 InvBufferSize = View.BufferSizeAndInvSize.zw;
     float2 UV = (float2(SvPosition) + 0.5) * InvBufferSize;
@@ -1089,7 +1093,8 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesForDeferedGIRGS)
 		ProduceInitialSampleForDeferedGI( PixelCoord,GIRay, GIRayIndex,SvPosition ,GBufferData,  RandContext, state);
 	}
 	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
-    RWDebugDiffuseUAV[PixelCoord] = float4(state.sampleRef.Irradiance,1.0);
+    // RWDebugDiffuseUAV[PixelCoord] = float4(state.sampleRef.Irradiance * View.PreExposure, 1.0);
+    // RWDebugDiffuseUAV[PixelCoord] = bTraceRay ?float4(GIRay.GetDirection() * 0.5 + 0.5, 1.0) : 0.0;  
 #endif
 }
 
