@@ -564,7 +564,9 @@ private:
 		FSceneTextures& SceneTextures,
 		FLumenSceneFrameTemporaries& FrameTemporaries,
 		FRDGTextureRef LightingChannelsTexture,
-		bool bIsVisualizePass);
+		bool bIsVisualizePass,
+		FSurfelBufResources* SurfelResource = nullptr,
+		FRadianceVolumeProbeConfigs* ProbeConfig = nullptr);
 
 	/** Renders sky lighting and reflections that can be done in a deferred pass. */
 	void RenderDeferredReflectionsAndSkyLighting(
@@ -942,7 +944,9 @@ private:
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View,
 		IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig* RayTracingConfig,
-		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs);
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FSurfelBufResources* SurfelRes,
+		FRadianceVolumeProbeConfigs* RadianceProbeConfig);
 	
 	void RenderRayTracingGlobalIlluminationBruteForce(
 		FRDGBuilder& GraphBuilder,
@@ -993,16 +997,16 @@ private:
 		int32 UpscaleFactor,
 		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs);
 
-	void AllocateSurfels(FRDGBuilder& GraphBuilder,
+	void FusionAllocateSurfels(FRDGBuilder& GraphBuilder,
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View,
 		FSurfelBufResources& SurfelRes);
 
-	void WRCTrace(FRDGBuilder& GraphBuilder,
+	void FusionWRCTrace(FRDGBuilder& GraphBuilder,
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View);
 
-	void RenderWRC(FRDGBuilder& GraphBuilder,
+	void RenderFusionWRC(FRDGBuilder& GraphBuilder,
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View,
 		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
@@ -1010,7 +1014,7 @@ private:
 		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
 		FRadianceVolumeProbeConfigs& ProbeConfig);
 
-	bool SurfelTrace(FRDGBuilder& GraphBuilder,
+	bool FusionSurfelTrace(FRDGBuilder& GraphBuilder,
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View,
 		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
@@ -1018,7 +1022,7 @@ private:
 		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
 		FSurfelBufResources& SurfelRes);
 
-	bool SurfelGI(FRDGBuilder& GraphBuilder,
+	bool RenderFusionSurfelGI(FRDGBuilder& GraphBuilder,
 		FSceneTextureParameters& SceneTextures,
 		FViewInfo& View,
 		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,

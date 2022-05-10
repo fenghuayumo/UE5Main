@@ -653,8 +653,8 @@ const TCHAR* const kTemporalAccumulationResourceNames[] = {
 	nullptr,
 
 	// DiffuseIndirect
-	TEXT("DiffuseIndirect.Denoiser.TemporalAccumulation0"),
-	TEXT("DiffuseIndirect.Denoiser.TemporalAccumulation1"),
+	TEXT("DiffuseIndirectTemporalAccumulation0"),
+	TEXT("DiffuseIndirectTemporalAccumulation1"),
 	nullptr,
 	nullptr,
 
@@ -703,8 +703,8 @@ const TCHAR* const kHistoryConvolutionResourceNames[] = {
 	nullptr,
 
 	// DiffuseIndirect
-	TEXT("DiffuseIndirect.Denoiser.HistoryConvolution0"),
-	TEXT("DiffuseIndirect.Denoiser.HistoryConvolution1"),
+	TEXT("DiffuseIndirectHistoryConvolution0"),
+	TEXT("DiffuseIndirectHistoryConvolution1"),
 	nullptr,
 	nullptr,
 

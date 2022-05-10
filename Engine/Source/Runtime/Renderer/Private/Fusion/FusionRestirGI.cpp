@@ -68,12 +68,12 @@
     );
 
     static TAutoConsoleVariable<float> CVarRestirGISpatialSamplingRadius(
-    	TEXT("r.Fusion.RestirGI.Spatial.SamplingRadius"), 32.0f,
-    	TEXT("Spatial radius for sampling in pixels (Default 32.0)"),
+    	TEXT("r.Fusion.RestirGI.Spatial.SamplingRadius"), 16.0f,
+    	TEXT("Spatial radius for sampling in pixels (Default 16.0)"),
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatialSamples(
-    	TEXT("r.Fusion.RestirGI.Spatial.Samples"), 1,
+    	TEXT("r.Fusion.RestirGI.Spatial.Samples"), 6,
     	TEXT("Spatial samples per pixel"),
     	ECVF_RenderThreadSafe);
 
@@ -98,7 +98,7 @@
     	ECVF_RenderThreadSafe);
 
     static TAutoConsoleVariable<int32> CVarRestirGITemporalMaxHistory(
-    	TEXT("r.Fusion.RestirGI.Temporal.MaxHistory"), 10,
+    	TEXT("r.Fusion.RestirGI.Temporal.MaxHistory"), 30,
     	TEXT("Maximum temporal history for samples (default 10)"),
     	ECVF_RenderThreadSafe);
 
@@ -111,7 +111,11 @@
     	TEXT("r.Fusion.RestirGI.Temporal.DepthRejectionThreshold"), 0.1f,
     	TEXT("Rejection threshold for rejecting samples based on depth differences (default 0.1)"),
     	ECVF_RenderThreadSafe);
-
+    static TAutoConsoleVariable<int32> CVarRestirGITemporalSamples(
+    	TEXT("r.Fusion.RestirGI.Temporal.Samples"), 2,
+    	TEXT("Temporal samples per pixel for Resampling(default 2)"),
+    	ECVF_RenderThreadSafe);
+		
     static TAutoConsoleVariable<int32> CVarRestirGITemporalApplyApproxVisibility(
     	TEXT("r.Fusion.RestirGI.Temporal.ApplyApproxVisibility"), 0,
     	TEXT("Apply an approximate visibility test on sample selected during reprojection"),
@@ -178,19 +182,43 @@ static TAutoConsoleVariable<int32> CVarRestirGIDenoiserSpatialEnabled(
 	TEXT("whether use spatial filter."),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
+	TEXT("r.Fusion.RestirGI.Denoiser.Spatial.ReconstructSampleCount"), 4,
+	TEXT("ReconstructSampleCount (default 4)"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarRestirGIDenoiserSpatialPhiDepth(
+	TEXT("r.Fusion.RestirGI.Denoiser.Spatial.PhiDepth"), 10.0,
+	TEXT("Control spatial filter Strength for Depth Part. The bigger value means Strong filter, the result will be more blur"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarRestirGIDenoiserSpatialNormalPower(
+	TEXT("r.Fusion.RestirGI.Denoiser.Spatial.NormalPower"), 128.0,
+	TEXT("Control spatial filter Strength for Normal Part. The bigger value means Strong filter, the result will be more blur"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarRestirGIDenoiserSpatialPhiColor(
+	TEXT("r.Fusion.RestirGI.Denoiser.Spatial.PhiColor"), 10.0,
+	TEXT("Control spatial filter Strength for Color Part. The bigger value means Strong filter, the result will be more blur"),
+	ECVF_RenderThreadSafe);
+
 static TAutoConsoleVariable<int32> CVarRestirGIDenoiserTemporalEnabled(
 	TEXT("r.Fusion.RestirGI.Denoiser.Temporal"), 1,
 	TEXT("whether use Temporal filter."),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<float> CVarFusionHistroryClipFactor(
+	TEXT("r.Fusion.RestirGI.Denoiser.Temporal.HistroryClipFactor"), 2,
+	TEXT("RestirGI Denioser HistroryClipFactor (default 2)"),
+	ECVF_RenderThreadSafe);
+static TAutoConsoleVariable<float> CVarFusionDenoiserMaxLowSpp(
+	TEXT("r.Fusion.RestirGI.Denoiser.Temporal.MaxLowSpp"), 4,
+	TEXT("RestirGI Denioser MaxLowSpp (default 4)"),
+	ECVF_RenderThreadSafe);
+	
 static TAutoConsoleVariable<int32> CVarRestirGIUseScreenReprojection(
 	TEXT("r.Fusion.RestirGI.UseScreenReprojection"), 0,
 	TEXT("whether use Screen Reprojection GI."),
-	ECVF_RenderThreadSafe);
-
-static TAutoConsoleVariable<int32> CVarFusionReconstructSampleCount(
-	TEXT("r.Fusion.RestirGI.Denioser.Spatial.ReconstructSampleCount"), 4,
-	TEXT("ReconstructSampleCount (default 4)"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarFusionApplyApproxVisibility(
@@ -228,19 +256,21 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     };
 
     BEGIN_SHADER_PARAMETER_STRUCT(FRestirGICommonParameters, )
-    SHADER_PARAMETER(float, MaxNormalBias)
-    SHADER_PARAMETER(float, MaxShadowDistance)
-    SHADER_PARAMETER(int32, VisibilityApproximateTestMode)
-    SHADER_PARAMETER(int32, VisibilityFaceCull)
-    SHADER_PARAMETER(int32, SupportTranslucency)
-    SHADER_PARAMETER(int32, InexactShadows)
-    SHADER_PARAMETER(float, MaxBiasForInexactGeometry)
-    SHADER_PARAMETER(int32, MaxTemporalHistory)
-    SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
-    SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<RTXGI_PackedReservoir>, RWGIReservoirUAV)
-    SHADER_PARAMETER(FIntVector, ReservoirBufferDim)
-    SHADER_PARAMETER(uint32, UpscaleFactor)
-    SHADER_PARAMETER(float, DiffuseThreshold)
+		SHADER_PARAMETER(float, MaxNormalBias)
+		SHADER_PARAMETER(float, MaxShadowDistance)
+		SHADER_PARAMETER(int32, VisibilityApproximateTestMode)
+		SHADER_PARAMETER(int32, VisibilityFaceCull)
+		SHADER_PARAMETER(int32, SupportTranslucency)
+		SHADER_PARAMETER(int32, InexactShadows)
+		SHADER_PARAMETER(float, MaxBiasForInexactGeometry)
+		SHADER_PARAMETER(int32, MaxTemporalHistory)
+		SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
+		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<RTXGI_PackedReservoir>, RWGIReservoirUAV)
+		SHADER_PARAMETER(FIntVector, ReservoirBufferDim)
+		SHADER_PARAMETER(uint32, UpscaleFactor)
+		SHADER_PARAMETER(float, DiffuseThreshold)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugTex)
+		SHADER_PARAMETER(int32, DebugFlag)
     END_SHADER_PARAMETER_STRUCT()
 
     static void ApplyRestirGIGlobalSettings(FShaderCompilerEnvironment& OutEnvironment)
@@ -258,8 +288,8 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
 
     	class FEnableTwoSidedGeometryDim : SHADER_PERMUTATION_BOOL("ENABLE_TWO_SIDED_GEOMETRY");
     	class FEnableTransmissionDim : SHADER_PERMUTATION_INT("ENABLE_TRANSMISSION", 2);
-    	//class FUseSurfelDim : SHADER_PERMUTATION_BOOL("USE_SURFEL");
-    	using FPermutationDomain = TShaderPermutationDomain<FEnableTwoSidedGeometryDim, FEnableTransmissionDim>;
+    	class FUseSurfelDim : SHADER_PERMUTATION_BOOL("USE_SURFEL");
+    	using FPermutationDomain = TShaderPermutationDomain<FEnableTwoSidedGeometryDim, FEnableTransmissionDim,FUseSurfelDim>;
 
     	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     	{
@@ -270,7 +300,6 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     	{
     		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
     		ApplyRestirGIGlobalSettings(OutEnvironment);
-    		OutEnvironment.SetDefine(TEXT("USE_SURFEL"), 0);
     	}
 
     	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
@@ -301,13 +330,18 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, RWGlobalIlluminationRayDistanceUAV)
     		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
 
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(ByteAddressBuffer, SurfelMetaBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(ByteAddressBuffer, SurfelHashKeyBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(ByteAddressBuffer, SurfelHashValueBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<SurfelVertexPacked>, SurfelVertexBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(ByteAddressBuffer, CellIndexOffsetBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(ByteAddressBuffer, SurfelIndexBuf)
-    		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, SurfelIrradianceBuf)
+			//surfel gi
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWByteAddressBuffer, SurfelMetaBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWByteAddressBuffer, SurfelGridMetaBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint32> , SurfelEntryCellBuf)
+			
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint32>, SurfelLifeBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint32>, SurfelPoolBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FSurfelVertexPacked>, SurfelRePositionBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint32>, SurfelRePositionCountBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FSurfelVertexPacked>, SurfelVertexBuf)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, SurfelIrradianceBuf)
+
     	END_SHADER_PARAMETER_STRUCT()
     };
 
@@ -345,9 +379,8 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     		SHADER_PARAMETER(int32, ApplyApproximateVisibilityTest)
     		SHADER_PARAMETER(int32, InitialCandidates)
 			SHADER_PARAMETER(FVector4f, HistoryScreenPositionScaleBias)
+			SHADER_PARAMETER(int32, TemporalSamples)
 			
-    		//SHADER_PARAMETER(int32, InitialSampleVisibility)
-
     		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
 
     		SHADER_PARAMETER(FIntVector, ReservoirHistoryBufferDim)
@@ -357,8 +390,7 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 
     		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
-			// SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugTex)
-			// SHADER_PARAMETER(int32, DebugFlag)
+
     	END_SHADER_PARAMETER_STRUCT()
     };
 
@@ -447,8 +479,6 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
 
     		SHADER_PARAMETER_SRV(Buffer<float2>, NeighborOffsets)
 			SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSAOTex)
-			SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugTex)
-			SHADER_PARAMETER(int32, DebugFlag)
 
     	END_SHADER_PARAMETER_STRUCT()
     };
@@ -570,12 +600,12 @@ static TAutoConsoleVariable<int32> CVarFusionRestirDebug(
     	int EnableTransmission = CVarRayTracingGlobalIlluminationEnableTransmission.GetValueOnRenderThread();
     	for (int EnableTwoSidedGeometry = 0; EnableTwoSidedGeometry < 2; ++EnableTwoSidedGeometry)
     	{
-    		//for (int UseSurfel = 0; UseSurfel < 2; ++UseSurfel)
+    		for (int UseSurfel = 0; UseSurfel < 2; ++UseSurfel)
     		{
     			FRestirGIInitialSamplesRGS::FPermutationDomain PermutationVector;
     			PermutationVector.Set<FRestirGIInitialSamplesRGS::FEnableTwoSidedGeometryDim>(EnableTwoSidedGeometry == 1);
     			PermutationVector.Set<FRestirGIInitialSamplesRGS::FEnableTransmissionDim>(EnableTransmission);
-    			//PermutationVector.Set<FRestirGIInitialSamplesRGS::FUseSurfelDim>(UseSurfel == 1);
+    			PermutationVector.Set<FRestirGIInitialSamplesRGS::FUseSurfelDim>(UseSurfel == 1);
     			TShaderMapRef<FRestirGIInitialSamplesRGS> RayGenerationShader(View.ShaderMap, PermutationVector);
     			OutRayGenShaders.Add(RayGenerationShader.GetRayTracingShader());
     		}
@@ -761,6 +791,9 @@ class FRestirGITemporalFilterCS : public FGlobalShader
 		SHADER_PARAMETER(FVector4f, BufferTexSize)
         SHADER_PARAMETER(float, TemporalNormalRejectionThreshold)
         SHADER_PARAMETER(float, TemporalDepthRejectionThreshold)
+		SHADER_PARAMETER(float, HistroryClipFactor)
+		SHADER_PARAMETER(float, MaxLowSpp)
+		
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 
 	END_SHADER_PARAMETER_STRUCT()
@@ -815,6 +848,10 @@ class FRestirGISpatialFilterCS : public FGlobalShader
 		SHADER_PARAMETER(FVector4f, BufferTexSize)
         SHADER_PARAMETER(int, UpscaleFactor)
 		SHADER_PARAMETER(int, ReconstructSampleCount)
+		SHADER_PARAMETER(float, PhiDepth)
+		SHADER_PARAMETER(float, PhiNormal)
+		SHADER_PARAMETER(float, PhiColor)
+		
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 
 	END_SHADER_PARAMETER_STRUCT()
@@ -845,9 +882,6 @@ void PrefilterRestirGI(FRDGBuilder& GraphBuilder,
 		FClearValueBinding::None,
 		TexCreate_ShaderResource | TexCreate_RenderTargetable | TexCreate_UAV);
 	auto PreOutputTex = GraphBuilder.CreateTexture(Desc, TEXT("DiffuseIndirectPreConvolution0"));
-	uint32 IterationCount = 1;
-	uint32 SequenceCount = 1;
-	uint32 DimensionCount = 24;
 
 	FRestirGISpatialFilterCS::FParameters CommonParameters;
 
@@ -872,6 +906,9 @@ void PrefilterRestirGI(FRDGBuilder& GraphBuilder,
 		PassParameters->BufferTexSize = FVector4f(HalfTexSize.X, HalfTexSize.Y, 1.0 / HalfTexSize.X, 1.0 / HalfTexSize.Y);
 		PassParameters->UpscaleFactor = int32(1.0 / Config.ResolutionFraction);
 		PassParameters->ReconstructSampleCount = CVarFusionReconstructSampleCount.GetValueOnRenderThread(); 
+		PassParameters->PhiDepth = CVarRestirGIDenoiserSpatialPhiDepth.GetValueOnRenderThread();
+		PassParameters->PhiNormal = CVarRestirGIDenoiserSpatialNormalPower.GetValueOnRenderThread();
+		PassParameters->PhiColor = CVarRestirGIDenoiserSpatialPhiColor.GetValueOnRenderThread();
 		ClearUnusedGraphResources(ComputeShader, PassParameters);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
@@ -924,6 +961,12 @@ void ReprojectRestirGI(FRDGBuilder& GraphBuilder,
 		PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		PassParameters->LinearClampSampler = TStaticSamplerState<SF_Trilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 		PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+		PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+		PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+
+		PassParameters->NormalTexture = GBufferATexture;
+		PassParameters->DepthTexture = SceneDepthTexture;
+		PassParameters->VelocityTexture = SceneVelocityTexture;
 
 		PassParameters->BufferTexSize = BufferTexSize;
 		ClearUnusedGraphResources(ComputeShader, PassParameters);
@@ -1016,7 +1059,8 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
                 PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
                 PassParameters->TemporalNormalRejectionThreshold = CVarRestirGITemporalNormalRejectionThreshold.GetValueOnRenderThread();
                 PassParameters->TemporalDepthRejectionThreshold = CVarRestirGITemporalDepthRejectionThreshold.GetValueOnRenderThread();
-
+				PassParameters->HistroryClipFactor = CVarFusionHistroryClipFactor.GetValueOnRenderThread();
+				PassParameters->MaxLowSpp = CVarFusionDenoiserMaxLowSpp.GetValueOnRenderThread();
                 PassParameters->BufferTexSize = BufferTexSize;
                 ClearUnusedGraphResources(ComputeShader, PassParameters);
                 FComputeShaderUtils::AddPass(
@@ -1055,6 +1099,10 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
         PassParameters->BufferTexSize = BufferTexSize;
         PassParameters->UpscaleFactor = int32(1.0 /Config.ResolutionFraction); 
 		PassParameters->ReconstructSampleCount = CVarFusionReconstructSampleCount.GetValueOnRenderThread(); 
+		PassParameters->PhiDepth = CVarRestirGIDenoiserSpatialPhiDepth.GetValueOnRenderThread();
+		PassParameters->PhiNormal = CVarRestirGIDenoiserSpatialNormalPower.GetValueOnRenderThread();
+		PassParameters->PhiColor = CVarRestirGIDenoiserSpatialPhiColor.GetValueOnRenderThread();
+
         ClearUnusedGraphResources(ComputeShader, PassParameters);
         FComputeShaderUtils::AddPass(
             GraphBuilder,
@@ -1119,12 +1167,37 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
         PassParameters->RestirGICommonParameters = CommonParameters;
         //PassParameters->RWGlobalIlluminationUAV = GraphBuilder.CreateUAV(Diffuse);
         PassParameters->RWGlobalIlluminationRayDistanceUAV = GraphBuilder.CreateUAV(OutDenoiserInputs->RayHitDistance);
+		
+		bool UseSurfel = /*IsSurfelGIEnabled(View) && */CVarRestirGIUseSurfel.GetValueOnRenderThread() != 0;
+		if (SurfelRes && UseSurfel)
+		{
+			FRDGBufferRef SurfelMetaBuf = SurfelRes->SurfelMetaBuf;
+			FRDGBufferRef SurfelGridMetaBuf = SurfelRes->SurfelGridMetaBuf;
+			FRDGBufferRef SurfelEntryCellBuf = SurfelRes->SurfelEntryCellBuf;
+			FRDGBufferRef SurfelPoolBuf = SurfelRes->SurfelPoolBuf;
+			FRDGBufferRef SurfelLifeBuf = SurfelRes->SurfelLifeBuf;
+			FRDGBufferRef SurfelVertexBuf = SurfelRes->SurfelVertexBuf;
+			FRDGBufferRef SurfelIrradianceBuf = SurfelRes->SurfelIrradianceBuf;
+			FRDGBufferRef SurfelRePositionBuf = SurfelRes->SurfelRePositionBuf;
+			FRDGBufferRef SurfelRePositionCountBuf = SurfelRes->SurfelRePositionCountBuf;
+
+			PassParameters->SurfelMetaBuf = GraphBuilder.CreateUAV(SurfelMetaBuf, EPixelFormat::PF_R8_UINT);
+			PassParameters->SurfelGridMetaBuf = GraphBuilder.CreateUAV(SurfelGridMetaBuf, EPixelFormat::PF_R8_UINT);
+			PassParameters->SurfelEntryCellBuf = GraphBuilder.CreateUAV(SurfelEntryCellBuf);
+
+			PassParameters->SurfelPoolBuf = GraphBuilder.CreateUAV(SurfelPoolBuf);
+			PassParameters->SurfelLifeBuf = GraphBuilder.CreateUAV(SurfelLifeBuf);
+			PassParameters->SurfelVertexBuf = GraphBuilder.CreateUAV(SurfelMetaBuf);
+			PassParameters->SurfelIrradianceBuf = GraphBuilder.CreateUAV(SurfelIrradianceBuf);
+			PassParameters->SurfelRePositionBuf = GraphBuilder.CreateUAV(SurfelRePositionBuf);
+			PassParameters->SurfelRePositionCountBuf = GraphBuilder.CreateUAV(SurfelRePositionCountBuf);
+		}
 
 
         FRestirGIInitialSamplesRGS::FPermutationDomain PermutationVector;
         PermutationVector.Set<FRestirGIInitialSamplesRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingGlobalIlluminationEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
         PermutationVector.Set<FRestirGIInitialSamplesRGS::FEnableTransmissionDim>(CVarRayTracingGlobalIlluminationEnableTransmission.GetValueOnRenderThread());
-        //PermutationVector.Set<FRestirGIInitialSamplesRGS::FUseSurfelDim>(UseSurfel);
+        PermutationVector.Set<FRestirGIInitialSamplesRGS::FUseSurfelDim>(UseSurfel);
         TShaderMapRef<FRestirGIInitialSamplesRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
         ClearUnusedGraphResources(RayGenShader, PassParameters);
 
@@ -1207,7 +1280,10 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
     	CommonParameters.MaxTemporalHistory = FMath::Max(1, CVarRestirGITemporalMaxHistory.GetValueOnRenderThread());
     	CommonParameters.UpscaleFactor = UpscaleFactor;
     	CommonParameters.MaxShadowDistance = MaxShadowDistance;
-    	CommonParameters.DiffuseThreshold = GRayTracingGlobalIlluminationDiffuseThreshold;;
+    	CommonParameters.DiffuseThreshold = GRayTracingGlobalIlluminationDiffuseThreshold;
+		CommonParameters.RWDebugTex = GraphBuilder.CreateUAV(DebugTex);
+		CommonParameters.DebugFlag = CVarFusionRestirDebug.GetValueOnRenderThread(); //
+
     	// FIntPoint LightingResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
         FIntPoint LightingResolution = PaddedSize;
         
@@ -1253,7 +1329,7 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 				PassParameters->TemporalNormalRejectionThreshold = FMath::Clamp(CVarRestirGITemporalNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
 				PassParameters->ApplyApproximateVisibilityTest = CVarRestirGITemporalApplyApproxVisibility.GetValueOnAnyThread();
 				PassParameters->HistoryScreenPositionScaleBias = HistoryScreenPositionScaleBias;
-
+				PassParameters->TemporalSamples = CVarRestirGITemporalSamples.GetValueOnRenderThread();
 				PassParameters->GIReservoirHistory = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(View.PrevViewInfo.RestirGIHistory.GIReservoirs));
 				PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
 				PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
@@ -1318,9 +1394,6 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 
 				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-				PassParameters->RWDebugTex = GraphBuilder.CreateUAV(DebugTex);
-				PassParameters->DebugFlag = CVarFusionRestirDebug.GetValueOnRenderThread(); //
-
 				PassParameters->InputSlice = Reservoir - 1;
 				PassParameters->OutputSlice = Reservoir;
 				PassParameters->HistoryReservoir = Reservoir - 1;

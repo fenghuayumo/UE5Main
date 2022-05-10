@@ -1467,7 +1467,7 @@ bool FDeferredShadingSceneRenderer::SetupRayTracingPipelineStates(FRHICommandLis
 
 					// PrepareRayTracingSampledDirectLighting(View, RayGenShaders);
 					PrepareFusionRestirGI(View, RayGenShaders);
-					// PrepareFusionSurfelGI(View, RayGenShaders);
+					PrepareFusionSurfelGI(View, RayGenShaders);
 					// PrepareFusionWRCGI(View, RayGenShaders);
 
 					if (DoesPlatformSupportLumenGI(ShaderPlatform) && Lumen::UseHardwareRayTracing(*ActiveViewFamily))
@@ -2911,7 +2911,9 @@ void FDeferredShadingSceneRenderer::Render(FRDGBuilder& GraphBuilder)
 		BeginGatheringLumenSurfaceCacheFeedback(GraphBuilder, Views[0], LumenFrameTemporaries);
 
 		FRDGTextureRef DynamicBentNormalAOTexture = nullptr;
-		RenderDiffuseIndirectAndAmbientOcclusion(GraphBuilder, SceneTextures, LumenFrameTemporaries, LightingChannelsTexture, /* bIsVisualizePass = */ false);
+		FSurfelBufResources SurfelRes = { 0 };
+		FRadianceVolumeProbeConfigs RadianceProbeConfig;
+		RenderDiffuseIndirectAndAmbientOcclusion(GraphBuilder, SceneTextures, LumenFrameTemporaries, LightingChannelsTexture, /* bIsVisualizePass = */ false,&SurfelRes,&RadianceProbeConfig);
 
 		// These modulate the scenecolor output from the basepass, which is assumed to be indirect lighting
 		if (bAllowStaticLighting)

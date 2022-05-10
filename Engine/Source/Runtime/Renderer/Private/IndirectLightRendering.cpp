@@ -782,7 +782,9 @@ void FDeferredShadingSceneRenderer::RenderDiffuseIndirectAndAmbientOcclusion(
 	FSceneTextures& SceneTextures,
 	FLumenSceneFrameTemporaries& LumenFrameTemporaries,
 	FRDGTextureRef LightingChannelsTexture,
-	bool bIsVisualizePass)
+	bool bIsVisualizePass,
+	FSurfelBufResources* SurfelResource,
+	FRadianceVolumeProbeConfigs* ProbeConfig)
 {
 	using namespace HybridIndirectLighting;
 
@@ -856,7 +858,7 @@ void FDeferredShadingSceneRenderer::RenderDiffuseIndirectAndAmbientOcclusion(
 		{
 			// TODO: Refactor under the HybridIndirectLighting standard API.
 			// TODO: hybrid SSGI / RTGI
-			RenderRayTracingGlobalIllumination(GraphBuilder, SceneTextureParameters, View, /* out */ &RayTracingConfig, /* out */ &DenoiserInputs);
+			RenderRayTracingGlobalIllumination(GraphBuilder, SceneTextureParameters, View, /* out */ &RayTracingConfig, /* out */ &DenoiserInputs, SurfelResource, ProbeConfig);
 		}
 		else if (ViewPipelineState.DiffuseIndirectMethod == EDiffuseIndirectMethod::Lumen)
 		{
