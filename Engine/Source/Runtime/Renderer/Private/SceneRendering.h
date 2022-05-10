@@ -1509,9 +1509,9 @@ public:
 	// Furthest and closest Hierarchical Z Buffer
 	FRDGTextureRef HZB = nullptr;
 	FRDGTextureRef ClosestHZB = nullptr;
-	FRDGTextureRef ProjectedRestirGITexture;
-	FRDGTextureRef	ProjectionMapTexture;
-	FRDGTextureRef	ScreenSpaceAO;
+	FRDGTextureRef ProjectedRestirGITexture = nullptr;
+	FRDGTextureRef	ProjectionMapTexture = nullptr;
+	FRDGTextureRef	ScreenSpaceAO = nullptr;
 
 	int32 NumBoxReflectionCaptures;
 	int32 NumSphereReflectionCaptures;

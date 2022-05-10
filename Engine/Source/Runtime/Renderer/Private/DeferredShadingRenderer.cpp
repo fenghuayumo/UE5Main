@@ -1469,7 +1469,7 @@ bool FDeferredShadingSceneRenderer::SetupRayTracingPipelineStates(FRHICommandLis
 					PrepareFusionRestirGI(View, RayGenShaders);
 					PrepareFusionSurfelGI(View, RayGenShaders);
 					// PrepareFusionWRCGI(View, RayGenShaders);
-
+					PrepareFusionDeferedGI(View, RayGenShaders);
 					if (DoesPlatformSupportLumenGI(ShaderPlatform) && Lumen::UseHardwareRayTracing(*ActiveViewFamily))
 					{
 						PrepareLumenHardwareRayTracingScreenProbeGather(View, RayGenShaders);
@@ -1801,6 +1801,7 @@ void FDeferredShadingSceneRenderer::WaitForRayTracingScene(FRDGBuilder& GraphBui
 					PrepareRayTracingReflectionsDeferredMaterial(View, *Scene, DeferredMaterialRayGenShaders);
 					PrepareRayTracingDeferredReflectionsDeferredMaterial(View, *Scene, DeferredMaterialRayGenShaders);
 					PrepareRayTracingGlobalIlluminationDeferredMaterial(View, DeferredMaterialRayGenShaders);
+					PrepareFusionDeferredGIDeferredMaterial(View, DeferredMaterialRayGenShaders);
 					if (DoesPlatformSupportLumenGI(ShaderPlatform))
 					{
 						PrepareLumenHardwareRayTracingReflectionsDeferredMaterial(View, DeferredMaterialRayGenShaders);
