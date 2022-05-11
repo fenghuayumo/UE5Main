@@ -62,7 +62,7 @@ float working_luma(float3 v) { return v.x; }
 
 #define RESET_HISTORY 0
 #define REPROJECT_HISTORY 1
-static const int TARGET_COUNT = 32;
+static const int TARGET_COUNT = 64;
 [numthreads(8, 8, 1)]
 void TemporalFilter(uint2 DispatchThreadId: SV_DispatchThreadID) 
 {
@@ -180,7 +180,10 @@ void TemporalFilter(uint2 DispatchThreadId: SV_DispatchThreadID)
     const float VarianceAdjustedTemporalChange = smoothstep(0.1, 1.0, 0.05 * TemporalChange / TemporalDev);
 
     float HistorySpp = min(History.a, TARGET_COUNT);
-    float ClampBoxSize = lerp(0.25, 1.0, pow(saturate(HistorySpp / TARGET_COUNT), 2)) * HistroryClipFactor;
+    float2 MovePixel = Reproject.xy * BufferTexSize.xy ;
+    // float  MoveFactor = 1.0 / max(length(MovePixel), 1.0);
+    float MoveFactor = lerp(1, 0.25, length(MovePixel));
+    float ClampBoxSize = lerp(0.25, 1.0, pow(saturate(HistorySpp / TARGET_COUNT), 2)) * HistroryClipFactor * MoveFactor;
     ClampBoxSize = max(ClampBoxSize, 0.5);
 
 	float4 NMin = Current - Dev * ClampBoxSize;

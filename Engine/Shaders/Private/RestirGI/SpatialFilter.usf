@@ -8,6 +8,7 @@ Texture2D    DepthTexture;
 
 Texture2D  SSAOTex;
 Texture2D  InputTex;
+Texture2D  RayHitDistanceTex;
 RWTexture2D<float4> RWFilteredTex;
 
 SamplerState        LinearClampSampler;
@@ -96,12 +97,24 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
     float3 CenterNormalVS = normalize(mul(CenterNormal, (float3x3)View.TranslatedWorldToView));
     const int2  CenterPx = int2(floor(float2(DispatchID.xy + 0.5) * ResolutionFraction));
     float3 CenterValue = InputTex[CenterPx].rgb;
+    
+    // const float MinFilterSize = UpscaleFactor; // Always want a bit of blur (more when input is lower res)
+	// const float MaxFilterSize = 8.0;
+    // const uint2 PixelRandomSeed = Rand3DPCG16(int3(DispatchID, View.StateFrameIndexMod8)).xy;
+    // const float RayHitDist = RayHitDistanceTex[DispatchID].r / 100.0;
     for(uint SampleIndex = 0; SampleIndex < ReconstructSampleCount; SampleIndex++)
-    {
+    {   
+        // const float FilterSize = lerp(MinFilterSize, MaxFilterSize, saturate(RayHitDist));
+        // float2 HammersleySample = Hammersley16(SampleIndex, ReconstructSampleCount, PixelRandomSeed);
+        // float2 DiskSample = UniformSampleDisk(HammersleySample); // slightly more expensive, but maybe slightly better? the jury is out...
+        // float2 SampleOffset = DiskSample * FilterSize;
+
         const float Angle = (SampleIndex + RandAngleOffset) * GOLDEN_ANGLE + (RaySubPixelId / float(SubPixelCount) ) * 2 * PI;
-        const float Radius = pow(float(SampleIndex), 0.666) * 1.0 + 1.0;
-        const float2 Offset = float2(cos(Angle), sin(Angle)) * Radius;
-        const int2   Px = int2(floor(float2(DispatchID.xy) * ResolutionFraction + Offset));
+        const float Radius = pow(float(SampleIndex), 0.666) * 1.0 + UpscaleFactor;
+        const float2 SampleOffset = float2(cos(Angle), sin(Angle)) * Radius;
+
+        const int2   Px = int2(floor(float2(DispatchID.xy) * ResolutionFraction + SampleOffset));
+       
         // uint2 Px = DispatchID + int2(x,y);
         // const int2   Px = int2(floor(float2(DispatchID.xy) * ResolutionFraction));
         const float2 SampledUV = float2(Px + 0.5)  * BufferTexSize.zw;
@@ -151,8 +164,8 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
 
     const float AngleOff = (View.StateFrameIndex * 13) % 32 * 2 * PI + PI * InterleavedGradientNoise(PixelCoord);
 
-    const uint MAX_SAMPLE_COUNT = 8;
-    const float MAX_RADIUS_PX = 16.0;
+    const uint MAX_SAMPLE_COUNT = 16; //8
+    const float MAX_RADIUS_PX = 32.0; // 16
 
     // Feeds into the `pow` to remap sample index to radius.
     // At 0.5 (sqrt), it's proper circle sampling, with higher values becoming conical.
