@@ -1,0 +1,982 @@
+
+#include "../Common.ush"
+
+#ifndef MAX_SPATIAL_SAMPLES
+#define MAX_SPATIAL_SAMPLES		16
+#endif
+
+#ifndef USE_LDS_FOR_SPATIAL_RESAMPLE
+#define USE_LDS_FOR_SPATIAL_RESAMPLE	0
+#endif
+
+// strand-based single-pass hair
+#ifndef HAIR_SHADING
+#define HAIR_SHADING		0
+#endif
+
+#define INITIAL_SAMPLE_PASS_NUM		0
+#define TEMPORAL_SAMPLE_PASS_NUM	1
+#define SPATIAL_SAMPLE_PASS_NUM		2
+#define EVALUATION_PASS_NUM			3
+
+#define SUPPORT_CONTACT_SHADOWS		0
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../DeferredLightingCommon.ush"
+
+// #if USE_HAIR_LIGHTING
+// #include "../HairStrands/HairStrandsRaytracing.ush"
+// #endif
+
+#include "../SceneTextureParameters.ush"
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "../RayTracing/RayTracingSkyLightCommon.ush"
+
+#include "ReservoirManagement.ush"
+#include "RandomNumberUtils.ush"
+
+
+RaytracingAccelerationStructure TLAS;
+RWTexture2D<float4> RWDiffuseUAV;
+RWTexture2D<float2> RWRayDistanceUAV;
+
+RWTexture2D<float4> RWDebugDiffuseUAV;
+RWTexture2D<float2>	RWDebugRayDistanceUAV;
+
+Texture2D<float> DepthHistory;
+Texture2D<float4> NormalHistory;
+
+float 	MaxNormalBias;
+int 	InputSlice;
+int 	OutputSlice;
+int 	NumReservoirs;
+int 	HistoryReservoir;
+int 	InitialCandidates;
+float 	SpatialSamplingRadius;
+int 	SpatialSamples;
+int 	SpatialSamplesBoost;
+int 	MaxTemporalHistory;
+int 	ApplyApproximateVisibilityTest;
+int 	DiscountNaiveSamples;
+int 	SpatiallyHashTemporalReprojection;
+
+float 	SkyLightMaxRayDistance;
+int 	bSkyLightTransmission;
+float 	SkyLightMaxShadowThickness;
+int 	FeedbackVisibility;
+int 	InitialSampleVisibility;
+
+float SpatialDepthRejectionThreshold;
+float SpatialNormalRejectionThreshold;
+float TemporalDepthRejectionThreshold;
+float TemporalNormalRejectionThreshold;
+
+uint NeighborOffsetMask;
+Buffer<float2> NeighborOffsets;
+
+
+bool CheckApproximateVisibility(uint2 PixelCoord, float DeviceZ, float3 TranslatedWorldPosition, FGBufferData GBuffer,  RTXDI_SDK_LightSampleRef SampleRef)
+{
+	float2 LightUV = SampleRef.GetUV();
+	RayDesc Ray;
+	Ray.Origin = TranslatedWorldPosition;
+	Ray.Direction = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+	Ray.TMin = 0.0;
+	Ray.TMax = SkyLightMaxRayDistance;
+
+	float3 CurrentWorldNormal = GBuffer.WorldNormal;
+	// Recompute the current WorldNormal if lighting a hair fiber
+	if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+	{
+		const float3 LightDirection = Ray.Direction;
+		const float3 TangentDirection = normalize(CurrentWorldNormal);
+
+		CurrentWorldNormal = normalize(LightDirection - TangentDirection * dot(LightDirection, TangentDirection));
+	}
+
+	// Apply a depth bias based on if the sample world position came from the g-buffer or not
+	float NoL = dot(CurrentWorldNormal, Ray.Direction);
+	if (NoL > 0.0)
+	{
+		ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, CurrentWorldNormal, MaxNormalBias);
+	}
+	else
+	{
+		ApplyPositionBias(Ray, -CurrentWorldNormal, MaxNormalBias);
+	}
+	uint RayFlags = 0;
+	const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+
+#if !ENABLE_MATERIALS
+		RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+#endif
+#if !ENABLE_TWO_SIDED_GEOMETRY
+		RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+	FMinimalPayload MinimalPayload = TraceVisibilityRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		PixelCoord,
+		Ray);
+
+	return !MinimalPayload.IsHit();
+}
+
+float GetApproximateLightSampleWeight(float3 TranslatedWorldPosition, float3 CameraDirection, FGBufferData GBufferData, RTXDI_SDK_LightSampleRef SampleRef)
+{
+	// Evaluate material
+	float2 LightUV = SampleRef.GetUV();
+	const half3 N = GBufferData.WorldNormal;
+	const half3 V = -CameraDirection;
+	const half3 L = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+	float NoL = saturate(dot(N,L));
+	FDirectLighting LightingSample;
+	if (GBufferData.ShadingModelID == SHADINGMODELID_HAIR)
+	{
+		float Shadow = 0.0;
+		float Backlit = 0.0;
+		float Area = 0.0;
+		uint2 Random = 0;
+		FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
+		LightingSample.Diffuse = HairShading(GBufferData, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
+		LightingSample.Transmission = 0;
+		LightingSample.Specular = 0;
+	}
+	else
+	{
+		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+	}
+	// float3 Brdf = LightingSample.Diffuse + LightingSample.Transmission + LightingSample.Specular;
+	float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
+
+	// float3 Color = IncomingRadiance * Brdf;
+	float3 DiffuseThroughput = LightingSample.Diffuse;
+	if (bSkyLightTransmission)
+	{
+		DiffuseThroughput += LightingSample.Transmission;
+	}
+	float3 Color = IncomingRadiance * DiffuseThroughput;
+	return Luminance(Color);
+}
+
+
+void ProduceInitialSample(
+	uint2 PixelCoord,
+	FGBufferData GBuffer,
+	float DeviceZ,
+	float3 TranslatedWorldPosition,
+	float3 CameraDirection,
+	inout FRandomContext RandContext,
+	inout FRandomContext CoherentRandContext,
+	inout RTXDI_SDK_Reservoir state)
+{
+	const int NumLightSamples = InitialCandidates;
+
+	RTXDI_SDK_Reservoir SkylightReservoir = RTXDI_SDK_Reservoir::Empty();
+	//for(uint SampleIndex = 0; SampleIndex < NumLightSamples; SampleIndex++)
+	{
+		// Select a tile of random samples for the thread using the coherent sampler improve coherence of local threads
+		float2 RandSample = RandContext.GenerateSample2D();
+		FSkyLightSample SkySample = SkyLight_SampleLight(RandSample);
+		float2 SampleLocation = InverseEquiAreaSphericalMapping(SkySample.Direction.yzx);
+		uint SkyLightIdx = 0;
+
+		float pdfScale = 1.0 / SkySample.Pdf;
+
+		RTXDI_SDK_LightSampleRef sampleRef = RTXDI_SDK_LightSampleRef::Create(SkyLightIdx, SampleLocation);
+
+		float weight = GetApproximateLightSampleWeight(TranslatedWorldPosition, CameraDirection, GBuffer, sampleRef);
+		float risRnd = RandContext.GenerateSample1D();
+
+ 		SkylightReservoir.StreamSample(sampleRef, risRnd, weight, pdfScale);
+	}
+
+	SkylightReservoir.FinalizeResampling(1.0, SkylightReservoir.M);
+	SkylightReservoir.M = 1;
+
+	state = RTXDI_SDK_Reservoir::Empty();
+	state.CombineReservoirs(SkylightReservoir, RandContext.GenerateSample1D(), SkylightReservoir.targetPdf);
+	//state = SkylightReservoir;
+    bool PostTestVisibility = InitialSampleVisibility == 1;
+	float RayHitDist = -1.0;
+	if (PostTestVisibility && state.sampleRef.IsValid())
+	{
+
+		//bool Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, TranslatedWorldPosition, GBuffer, state.sampleRef);
+		float2 LightUV = state.sampleRef.GetUV();
+		RayDesc Ray;
+		Ray.Origin = TranslatedWorldPosition;
+		Ray.Direction = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+		// Ray.Direction = SkySample.Direction;
+		Ray.TMin = 0.0;
+		Ray.TMax = SkyLightMaxRayDistance;
+
+		float3 CurrentWorldNormal = GBuffer.WorldNormal;
+		// Recompute the current WorldNormal if lighting a hair fiber
+		if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+		{
+			const float3 LightDirection = Ray.Direction;
+			const float3 TangentDirection = normalize(CurrentWorldNormal);
+
+			CurrentWorldNormal = normalize(LightDirection - TangentDirection * dot(LightDirection, TangentDirection));
+		}
+
+		// Apply a depth bias based on if the sample world position came from the g-buffer or not
+		float NoL = dot(CurrentWorldNormal, Ray.Direction);
+		if (NoL > 0.0)
+		{
+			ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, CurrentWorldNormal, MaxNormalBias);
+		}
+		else
+		{
+			ApplyPositionBias(Ray, -CurrentWorldNormal, MaxNormalBias);
+		}
+		uint RayFlags = 0;
+		const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+
+	#if !ENABLE_MATERIALS
+			RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+	#endif
+	#if !ENABLE_TWO_SIDED_GEOMETRY
+			RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	#endif
+
+		FMinimalPayload MinimalPayload = TraceVisibilityRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			PixelCoord,
+			Ray);
+
+		// #if USE_HAIR_LIGHTING
+		// if (GBufferData.ShadingModelID != SHADINGMODELID_HAIR)
+		// {
+		// 	const float HairOcclusionThreshold = 1;
+		// 	RandomSequence RandSequence;
+		// 	uint LinearIndex = CalcLinearIndex(PixelCoord);
+		// 	RandomSequence_Initialize(RandSequence, LinearIndex, View.StateFrameIndex);
+		// 	MinimalPayload.HitT = TraverseHair(PixelCoord, RandSequence, Ray.Origin, Ray.Direction, MinimalPayload.HitT, VirtualVoxel.Raytracing_SkyOcclusionThreshold);
+		// }
+		// #endif
+
+		if (MinimalPayload.IsHit() )
+		{
+			state.sampleRef = RTXDI_SDK_LightSampleRef::Invalid();
+
+			state.weightSum = 0;
+			state.targetPdf = 0;
+			RayHitDist = MinimalPayload.HitT;
+		}
+	}
+	RWDebugRayDistanceUAV[PixelCoord] = float2(RayHitDist, 1.0);
+	state.FinalizeResampling(1.0, 1.0);
+	state.M = 1;
+}
+
+/***************************************************************************************************
+ *
+ *  GenerateInitialSamples
+ *
+ *  Draw random samples from the light list and evaluate an approximate luminance to select
+ * a weighted random sample. After selection, test the sample for visibility, and reject if not
+ * visible.
+ *
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	RWDebugRayDistanceUAV[PixelCoord] = float2(0,0);
+
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + INITIAL_SAMPLE_PASS_NUM * 63);
+
+	// seed an RNG to be coherent across a small tile
+	uint CoherentLinearIndex = CalcLinearIndex(DispatchRaysIndex().xy / 8);
+	FRandomContext CoherentRandContext = FRandomContext::Create(CoherentLinearIndex, View.StateFrameIndex + HistoryReservoir * 32 * INITIAL_SAMPLE_PASS_NUM * 63);
+
+
+	// Get G-Buffer surface data
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+	float Depth = GBuffer.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+	float3 TranslatedWorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+
+	RTXDI_SDK_Reservoir state = RTXDI_SDK_Reservoir::Empty();
+
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+
+	float3 Albedo = GBuffer.DiffuseColor;
+
+	// Recalculate DiffuseColor if subsurface reverted the contribution within the G-Buffer
+	if (UseSubsurfaceProfile(GBuffer.ShadingModelID))
+	{
+		Albedo = GBuffer.StoredBaseColor - GBuffer.StoredBaseColor * GBuffer.Metallic;
+		GBuffer.DiffuseColor = Albedo;
+	}
+
+	if (bIsValidPixel)
+	{
+		ProduceInitialSample(PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, CoherentRandContext, state);
+	}
+
+	WriteReservoirData(PixelCoord,OutputSlice, state.Store());
+
+	// float2 LightUV = state.sampleRef.GetUV();
+	// float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
+	// const half3 N = GBuffer.WorldNormal;
+	// const half3 V = -CameraDirection;
+	// const half3 L = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+	// const float NoL = saturate(dot(N,L));
+	// FDirectLighting LightingSample;
+	// if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+	// {
+	// 	float Shadow = 0.0;
+	// 	float Backlit = 0.0;
+	// 	float Area = 0.0;
+	// 	uint2 Random = 0;
+	// 	FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
+	// 	LightingSample.Diffuse = HairShading(GBuffer, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
+	// 	LightingSample.Transmission = 0;
+	// 	LightingSample.Specular = 0;
+	// }
+	// else
+	// {
+	// 	FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+	// 	LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
+	// }
+	// float3 DiffuseThroughput = LightingSample.Diffuse;
+	// if (bSkyLightTransmission)
+	// {
+	// 	DiffuseThroughput += LightingSample.Transmission;
+	// }
+	// float3 DiffuseExitantRadiance = IncomingRadiance * DiffuseThroughput *  state.weightSum;
+	// DiffuseExitantRadiance.r = Albedo.r > 0.0 ? DiffuseExitantRadiance.r / Albedo.r : DiffuseExitantRadiance.r;
+	// DiffuseExitantRadiance.g = Albedo.g > 0.0 ? DiffuseExitantRadiance.g / Albedo.g : DiffuseExitantRadiance.g;
+	// DiffuseExitantRadiance.b = Albedo.b > 0.0 ? DiffuseExitantRadiance.b / Albedo.b : DiffuseExitantRadiance.b;
+	// DiffuseExitantRadiance.rgb *= View.PreExposure;
+
+	// DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance.rgb);
+	// RWDebugDiffuseUAV[PixelCoord] = float4(IncomingRadiance * View.PreExposure * state.weightSum, 1.0);
+}
+
+// Permutation for temporal sampling to increase noise
+int2 ApplyPermutationSampling(int2 InPosition)
+{
+	if (SpatiallyHashTemporalReprojection != 0)
+	{
+		// Hash the frame index to produce a high frequency perturbation on the temporal sample selected
+		// This introduces more noise, but reduces larger scale artifacts
+		// Presently using the weaker hash function, no quality difference was seen with StrongIntegerHash
+		uint UniformRandom = WeakIntegerHash(View.StateFrameIndex);
+		int2 HashOffset = { UniformRandom & 3, (UniformRandom >> 2) & 3 };
+
+		InPosition -= HashOffset;
+		InPosition.xy ^= 3;
+		InPosition += HashOffset;
+	}
+
+	return InPosition;
+}
+
+/***************************************************************************************************
+ *
+ *  ApplyTemporalResampling
+ *
+ *  Shader to handle temporal resampling of light reservoirs.
+ *
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+
+	if (any(DispatchRaysIndex().xy > View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + 63 * TEMPORAL_SAMPLE_PASS_NUM);
+
+	// seed an RNG to be coherent across a small tile
+	uint CoherentLinearIndex = CalcLinearIndex(DispatchRaysIndex().xy / 8);
+	FRandomContext CoherentRandContext = FRandomContext::Create(CoherentLinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + 63 * INITIAL_SAMPLE_PASS_NUM);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 TranslatedWorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+
+	RTXDI_SDK_Reservoir state = RTXDI_SDK_Reservoir::Empty();
+
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+
+	if (bIsValidPixel)
+	{
+		RTXDI_SDK_Reservoir curSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice));
+		int historyLimit = min(RTXDI_SDK_Reservoir::MaxM,MaxTemporalHistory * curSample.M);
+
+		state.CombineReservoirs(curSample, /* random = */ 0.5, curSample.targetPdf);
+
+		// Backproject this pixel to last frame
+
+		// start by just using our sample position
+		int2 prevPos = PixelCoord;
+		float ExpectedPrevLinearDepth = GBuffer.Depth;
+
+		float2 ViewUV = (DispatchRaysIndex().xy + 0.5) * View.ViewSizeAndInvSize.zw;
+		float4 NDC = float4(ViewUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+
+
+#if GBUFFER_HAS_VELOCITY && 0
+		// Some objects can get marked as not having velocities, which leads to DecodeGBuffer zeroing them
+		// This appears to be errant under some conditions, so overriding the rejection produces better results
+		GBuffer.Velocity = GBufferVelocityTexture.Load(int3(PixelCoord, 0));
+#endif
+		if (GBuffer.Velocity.x > 0.0)
+		{
+			float2 Velocity = DecodeVelocityFromTexture(GBuffer.Velocity).xy;
+			float2 PrevNDC = NDC.xy - Velocity;
+			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+
+			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
+			PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
+
+			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+
+			ExpectedPrevLinearDepth = ConvertFromDeviceZ(DeviceZ - DecodeVelocityFromTexture(GBuffer.Velocity).z);
+		}
+		else
+		{
+			float4 PrevNDC = mul(NDC, View.ClipToPrevClip);
+			PrevNDC.xyz /= PrevNDC.w;
+			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+
+			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
+			PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
+
+			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+
+			ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
+		}
+
+		//ToDo - full GBuffer not available for last frame, so we're going to need to approximate using current + channels we have
+		// could make a better approximation than what is used here
+		FGBufferData PrevGBuffer = GBuffer;
+		bool foundNeighbor = false;
+		const float radius = 3;
+
+		// Try to find a matching surface in the neighborhood of the reprojected pixel
+		for (int i = 0; i < 9; i++)
+		{
+			int2 offset = 0;
+			int2 idx = prevPos;
+			if (i > 0)
+			{
+				offset = int2((RandContext.GenerateSample2D() - 0.5f) * radius);
+				idx = prevPos + offset;
+			}
+			// else
+			// {
+			// 	idx = ApplyPermutationSampling(idx);
+			// }
+
+			float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
+			float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
+
+			// TODO: refine sample rejection tests
+			if (dot(GBuffer.WorldNormal, PrevWorldNormal) < TemporalNormalRejectionThreshold)
+			{
+				continue;
+			}
+
+			if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > TemporalDepthRejectionThreshold)
+			{
+				continue;
+			}
+
+			PrevGBuffer.WorldNormal = PrevWorldNormal;
+			PrevGBuffer.Depth = PrevDepth;
+
+			prevPos = idx;
+			foundNeighbor = true;
+			break;
+		}
+
+		bool selectedPreviousSample = false;
+		uint previousM = 0;
+		float previousWeight = 0;
+
+		if (foundNeighbor)
+		{
+			// Resample the previous frame sample into the current reservoir, but reduce the light's weight
+			// according to the bilinear weight of the current pixel
+			RTXDI_SDK_Reservoir prevSample = RTXDI_SDK_Reservoir::Load(ReadReservoirHistoryData(prevPos, HistoryReservoir));
+			prevSample.M = min(prevSample.M, historyLimit);
+
+			if (prevSample.sampleRef.IsValid())
+			{
+				bool Visible = true;
+#if (VISIBILITY_BEFORE_COMBINE)
+				if (ApplyApproximateVisibilityTest)
+				{
+					Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, TranslatedWorldPosition, GBuffer, prevSample.sampleRef);
+				}
+#endif
+				previousWeight = Visible ? GetApproximateLightSampleWeight(TranslatedWorldPosition, CameraDirection, GBuffer, prevSample.sampleRef) : 0;
+				{
+					previousM = prevSample.M;
+
+					if (state.CombineReservoirs(prevSample, RandContext.GenerateSample1D(), previousWeight))
+					{
+						selectedPreviousSample = true;
+					}
+				}
+			}
+		}
+
+
+// #if 1
+// 		// Use prior light history to improve normalization
+
+// 		// Compute the unbiased normalization term (instead of using 1/M)
+// 		float pi = state.targetPdf;   // Since it was selected, this is known to be equiv to lightWeight(state.sampleRef, context)
+// 		float piSum = state.targetPdf * curSample.M;
+
+// 		if (state.sampleRef.IsValid()  && previousM > 0)
+// 		{
+// 			// remap into last frame's light list
+// 			RTXDI_SDK_LightSampleRef SampleRef = state.sampleRef;
+
+// 			float pt = GetApproximateLightSampleWeight(TranslatedWorldPosition, CameraDirection, GBuffer, SampleRef);
+
+// #if (!VISIBILITY_BEFORE_COMBINE)
+// 			//ToDo - does this need to be a permutation?
+// 			if (ApplyApproximateVisibilityTest && pt > 0)
+// 			{
+// 				bool Visible = CheckApproximateVisibility(PixelCoord, DeviceZ, TranslatedWorldPosition, GBuffer, state.sampleRef);
+
+// 				if (!Visible)
+// 				{
+// 					pt = 0;
+// 				}
+// 			}
+// #endif
+
+// 			pi = selectedPreviousSample ? pt : pi;
+// 			piSum += pt * previousM;
+// 		}
+
+// 		state.FinalizeResampling(pi, piSum);
+// #else
+		// If the prior reservoir actually corresponds to the current reservoir, then the visibility and weights should all be the same, and cancel out.
+		state.FinalizeResampling(1, state.M);
+// #endif
+	}
+
+	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
+}
+
+void ApplySpatialResampling(uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 TranslatedWorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXDI_SDK_Reservoir state)
+{
+	// We loop through neighbors twice.  Cache the validity / edge-stopping function
+	//   results for the 2nd time through.
+	uint cachedResult = 0x0u;
+
+	// This is the weight we'll use (instead of 1/M) to make our estimate unbaised (see paper).
+	float normalizationWeight = 1.0f;
+
+	RTXDI_SDK_Reservoir centerSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice));
+
+	int selected = -1;
+
+	state.CombineReservoirs(centerSample, /* random = */ 0.5f, centerSample.targetPdf);
+
+	//
+	// Walk the specified number of neighbors, resampling using RIS
+	//
+
+	// Two sample modes for spatial resampling
+	//   predefined low-discrepency sequence
+	//   random data stored in local array for use with second pass
+	int NumSamples = SpatialSamples;
+	if (centerSample.M < MaxTemporalHistory)
+	{
+		NumSamples = max(NumSamples, SpatialSamplesBoost);
+	}
+
+#if !USE_LDS_FOR_SPATIAL_RESAMPLE
+	NumSamples = min(NumSamples, MAX_SPATIAL_SAMPLES);
+
+	int2 SamplePoints[MAX_SPATIAL_SAMPLES] = (int2[MAX_SPATIAL_SAMPLES])0;
+#else
+	uint StartIdx = RandContext.GenerateSample1D() * NeighborOffsetMask;
+
+	// using uint mask to track samples, so absolute limit is 32
+	NumSamples = min(NumSamples, 32);
+#endif
+
+	for (int i = 0; i < NumSamples; ++i)
+	{
+
+#if !USE_LDS_FOR_SPATIAL_RESAMPLE
+		float2 Offset = RandContext.GenerateSample2D() * 2.0f - 1.0f;
+		int2 SampleCoord = round(float2(PixelCoord) + (Offset * SpatialSamplingRadius));
+
+		SamplePoints[i] = SampleCoord;
+#else
+		float2 Offset = NeighborOffsets[(StartIdx + i) & NeighborOffsetMask] * 2.0f - 1.0f;
+		int2 SampleCoord = round(float2(PixelCoord) + (Offset * SpatialSamplingRadius));
+#endif
+
+		
+		if (any(SampleCoord < 0) || any(SampleCoord >= View.BufferSizeAndInvSize.xy) || all(SampleCoord == PixelCoord))
+		{
+			continue;
+		}
+
+		// Read adjacent GBuffer data
+		FGBufferData AdjGBuffer = GetGBufferDataFromSceneTexturesLoad(SampleCoord);
+		float AdjDeviceZ = SceneDepthTexture.Load(int3(SampleCoord, 0)).r;
+		float3 AdjTranslatedWorldPosition;
+		float3 AdjCameraDirection;
+		ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(SampleCoord, AdjDeviceZ, AdjTranslatedWorldPosition, AdjCameraDirection);
+
+		// TODO: refine sample rejection tests
+		if (dot(GBuffer.WorldNormal, AdjGBuffer.WorldNormal) < SpatialNormalRejectionThreshold)
+		{
+			continue;
+		}
+
+		if (abs(GBuffer.Depth - AdjGBuffer.Depth) / GBuffer.Depth > SpatialDepthRejectionThreshold)
+		{
+			continue;
+		}
+
+		if (GBuffer.ShadingModelID != AdjGBuffer.ShadingModelID)
+		{
+			continue;
+		}
+
+		RTXDI_SDK_Reservoir neighborSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(SampleCoord, InputSlice));
+
+		float WeightScale = 1.0;
+		if (DiscountNaiveSamples && neighborSample.M <= 2)
+		{
+			WeightScale = 0.0;
+		}
+
+		// Load that neighbor's RIS state, do resampling
+		float neighborWeight = 0.0f;
+		if (neighborSample.sampleRef.IsValid())
+		{
+			//ToDo - does this need to be a permutation?
+			bool Visible = true;
+
+#if (VISIBILITY_BEFORE_COMBINE)
+			if (ApplyApproximateVisibilityTest)
+			{
+				Visible = CheckApproximateVisibility(SampleCoord, DeviceZ, TranslatedWorldPosition, GBuffer, neighborSample.sampleRef);
+			}
+#endif
+			neighborWeight = Visible ? GetApproximateLightSampleWeight(TranslatedWorldPosition, CameraDirection, GBuffer, neighborSample.sampleRef) : 0;
+			neighborWeight *= WeightScale;
+
+#define MERGE_ALL_SAMPLES 0
+
+			{
+				cachedResult |= (1u << uint(i));
+
+				if (state.CombineReservoirs(neighborSample, RandContext.GenerateSample1D(), neighborWeight))
+				{
+					selected = i;
+				}
+
+			}
+		}
+	}
+
+	if (state.sampleRef.IsValid())
+	{
+// 		if (true) // presently always using the bias correction method
+// 		{
+// 			// Compute the unbiased normalization term (instead of using 1/M)
+// 			float pi = state.targetPdf;
+// 			float piSum = state.targetPdf * centerSample.M;
+
+// 			// To do this, we need to walk our neighbors again
+// 			for (int i = 0; i < NumSamples; ++i)
+// 			{
+// 				// If we skipped this neighbor above, do so again.
+// 				if ((cachedResult & (1u << uint(i))) == 0) continue;
+
+// #if !USE_LDS_FOR_SPATIAL_RESAMPLE
+// 				int2 SampleCoord = SamplePoints[i];
+// #else
+// 				float2 Offset = NeighborOffsets[(StartIdx + i) & NeighborOffsetMask] * 2.0f - 1.0f;
+// 				int2 SampleCoord = round(float2(PixelCoord) + (Offset * SpatialSamplingRadius));
+// #endif
+
+// 				FGBufferData AdjGBuffer = GetGBufferDataFromSceneTexturesLoad(SampleCoord);
+// 				float AdjDeviceZ = SceneDepthTexture.Load(int3(SampleCoord, 0)).r;
+// 				float3 AdjTranslatedWorldPosition;
+// 				float3 AdjCameraDirection;
+// 				ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(SampleCoord, AdjDeviceZ, AdjTranslatedWorldPosition, AdjCameraDirection);
+
+// 				// Get the PDF of the sample RIS selected in the first loop, above, *at this neighbor* 
+// 				float ps = GetApproximateLightSampleWeight(AdjTranslatedWorldPosition, AdjCameraDirection, AdjGBuffer, state.sampleRef);
+// #if 1 
+// 				//ToDo - does this need to be a permutation?
+// 				if (ApplyApproximateVisibilityTest && ps > 0)
+// 				{
+// 					bool Visible = CheckApproximateVisibility(SampleCoord, AdjDeviceZ, AdjTranslatedWorldPosition, AdjGBuffer, state.sampleRef);
+
+// 					if (!Visible)
+// 					{
+// 						ps = 0;
+// 					}
+// 				}
+// #endif
+
+// 				RTXDI_SDK_Reservoir neighborSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(SampleCoord, InputSlice));
+
+// 				// Select this sample for the (normalization) numerator if this particular neighbor pixel
+// 				//     was the one we selected via RIS in the first loop, above.
+// 				pi = selected == i ? ps : pi;
+
+// 				// Add to the sums of weights for the (normalization) denominator
+// 				piSum += ps * neighborSample.M;
+// 			}
+
+// 			// Use "MIS-like" normalization
+// 			state.FinalizeResampling(pi, piSum);
+// 		}
+// 		else
+		{
+			state.FinalizeResampling(1.0, state.M);
+		}
+	}
+}
+
+RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
+{
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+
+	if (any(DispatchRaysIndex().xy > View.ViewSizeAndInvSize.xy))
+	{
+		return;
+	}
+
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + SPATIAL_SAMPLE_PASS_NUM * 63);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+	float3 TranslatedWorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+
+	RTXDI_SDK_Reservoir state = RTXDI_SDK_Reservoir::Empty();
+
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+
+	if (bIsValidPixel)
+	{
+		ApplySpatialResampling(PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, state);
+	}
+
+	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
+}
+
+/***************************************************************************************************
+ *
+ *  EvaluateSampledLighting
+ *
+ *  Take light samples from reservoirs and shade the sample with them.
+ *
+ ***************************************************************************************************/
+RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
+{
+
+	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	RWDebugDiffuseUAV[PixelCoord] = float4(0,0,0,0);
+	uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + EVALUATION_PASS_NUM * 63);
+
+	// Get G-Buffer surface data
+	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+	float Depth = GBuffer.Depth;
+	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+	float3 TranslatedWorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+
+	const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+
+	float3 Albedo = GBuffer.DiffuseColor;
+
+	// Recalculate DiffuseColor if subsurface reverted the contribution within the G-Buffer
+	if (UseSubsurfaceProfile(GBuffer.ShadingModelID))
+	{
+		Albedo = GBuffer.StoredBaseColor - GBuffer.StoredBaseColor * GBuffer.Metallic;
+		GBuffer.DiffuseColor = Albedo;
+	}
+	
+	RTXDI_SDK_Reservoir risSample = RTXDI_SDK_Reservoir::Empty();
+	
+	float3 ExitantRadiance = 0.0;
+	float3 DiffuseExitantRadiance = 0.0;
+	float RayDistance = 0.0;
+	float HitDistance = -1.0;
+	float HitCount = 0.0;
+	float AmbientOcclusion = 0.0;
+	if (bIsValidPixel)
+	{
+		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+		{
+			risSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice + Reservoir));
+
+			if (risSample.sampleRef.IsValid())
+			{
+				float2 LightUV = risSample.sampleRef.GetUV();
+				RayDesc Ray;
+				Ray.Origin = TranslatedWorldPosition;
+				Ray.Direction = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+				Ray.TMin = 0.0;
+				Ray.TMax = SkyLightMaxRayDistance;
+
+				float3 CurrentWorldNormal = GBuffer.WorldNormal;
+				// Recompute the current WorldNormal if lighting a hair fiber
+				if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+				{
+					const float3 LightDirection = Ray.Direction;
+					const float3 TangentDirection = normalize(CurrentWorldNormal);
+
+					CurrentWorldNormal = normalize(LightDirection - TangentDirection * dot(LightDirection, TangentDirection));
+				}
+
+				// Apply a depth bias based on if the sample world position came from the g-buffer or not
+				float NoL = dot(CurrentWorldNormal, Ray.Direction);
+				if (NoL > 0.0)
+				{
+					ApplyCameraRelativeDepthBias(Ray, PixelCoord, DeviceZ, CurrentWorldNormal, MaxNormalBias);
+				}
+				else
+				{
+					ApplyPositionBias(Ray, -CurrentWorldNormal, MaxNormalBias);
+				}
+				NoL = saturate(NoL);
+				uint RayFlags = 0;
+				const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+
+			#if !ENABLE_MATERIALS
+					RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+			#endif
+			#if !ENABLE_TWO_SIDED_GEOMETRY
+					RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+			#endif
+
+				FMinimalPayload MinimalPayload = TraceVisibilityRay(
+					TLAS,
+					RayFlags,
+					InstanceInclusionMask,
+					PixelCoord,
+					Ray);
+
+				if (MinimalPayload.IsHit() )
+				{
+					RayDistance += MinimalPayload.HitT;
+					HitCount += 1.0;
+					if (FeedbackVisibility)
+					{
+						risSample.weightSum = 0.0f;
+						risSample.targetPdf = 0.0f;
+					}
+				}
+				else
+				{
+					const half3 N = GBuffer.WorldNormal;
+					const half3 V = -CameraDirection;
+					const half3 L = Ray.Direction;
+					FDirectLighting LightingSample;
+					if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+					{
+						float Shadow = 0.0;
+						float Backlit = 0.0;
+						float Area = 0.0;
+						uint2 Random = 0;
+						FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
+						LightingSample.Diffuse = HairShading(GBuffer, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
+						LightingSample.Transmission = 0;
+						LightingSample.Specular = 0;
+					}
+					else
+					{
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
+					}
+					//float3 Brdf = LightingSample.Diffuse + LightingSample.Transmission + LightingSample.Specular;
+					float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
+
+					//ExitantRadiance += IncomingRadiance * Brdf  *  risSample.weightSum;
+					float3 DiffuseThroughput = LightingSample.Diffuse;
+					if (bSkyLightTransmission)
+					{
+						DiffuseThroughput += LightingSample.Transmission;
+					}
+					DiffuseExitantRadiance += IncomingRadiance * DiffuseThroughput *  risSample.weightSum;
+
+					RWDebugDiffuseUAV[PixelCoord] = float4(IncomingRadiance * View.PreExposure * risSample.weightSum, 1.0);
+				}
+			}
+			else
+			{
+				// sample occluded, kill it for the history
+				risSample = RTXDI_SDK_Reservoir::Empty();
+			}
+			WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
+			
+		}
+		//ExitantRadiance /= float(NumReservoirs);
+		DiffuseExitantRadiance/= float(NumReservoirs);
+		// if( HitCount > 0)
+		// 	HitDistance = RayDistance / HitCount;
+		const float SamplesPerPixelInv = rcp(NumReservoirs);
+		AmbientOcclusion = HitCount * SamplesPerPixelInv;
+    }
+	else
+	{
+		// Invalid pixel, write empty reservoir
+		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+		{
+			//WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
+			WriteReservoirHistoryData(PixelCoord , Reservoir, ReadReservoirData(PixelCoord, 0));
+		}
+	}
+	// Pre-divide by albedo, to be recovered in compositing
+	DiffuseExitantRadiance.r = Albedo.r > 0.0 ? DiffuseExitantRadiance.r / Albedo.r : DiffuseExitantRadiance.r;
+	DiffuseExitantRadiance.g = Albedo.g > 0.0 ? DiffuseExitantRadiance.g / Albedo.g : DiffuseExitantRadiance.g;
+	DiffuseExitantRadiance.b = Albedo.b > 0.0 ? DiffuseExitantRadiance.b / Albedo.b : DiffuseExitantRadiance.b;
+	DiffuseExitantRadiance.rgb *= View.PreExposure;
+
+	DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance.rgb);
+	RWDiffuseUAV[PixelCoord] = float4(DiffuseExitantRadiance, AmbientOcclusion);
+	// RWRayDistanceUAV[PixelCoord] = float2(HitDistance, 1.0);
+}

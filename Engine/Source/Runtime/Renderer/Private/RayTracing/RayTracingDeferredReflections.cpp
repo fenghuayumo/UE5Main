@@ -77,28 +77,28 @@ static TAutoConsoleVariable<int32> CVarRayTracingReflectionsSpatialResolve(
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<float> CVarRayTracingReflectionsSpatialResolveMaxRadius(
+TAutoConsoleVariable<float> CVarRayTracingReflectionsSpatialResolveMaxRadius(
 	TEXT("r.RayTracing.Reflections.ExperimentalDeferred.SpatialResolve.MaxRadius"),
 	8.0f,
 	TEXT("Maximum radius in pixels of the native reflection image. Actual radius depends on output pixel roughness, rougher reflections using larger radius. (default: 8)"),
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingReflectionsSpatialResolveNumSamples(
+ TAutoConsoleVariable<int32> CVarRayTracingReflectionsSpatialResolveNumSamples(
 	TEXT("r.RayTracing.Reflections.ExperimentalDeferred.SpatialResolve.NumSamples"),
 	8,
 	TEXT("Maximum number of screen space samples to take during spatial resolve step. More samples produces smoother output at higher GPU cost. Specialized shader is used for 4, 8, 12 and 16 samples. (default: 8)"),
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<float> CVarRayTracingReflectionsTemporalWeight(
+ TAutoConsoleVariable<float> CVarRayTracingReflectionsTemporalWeight(
 	TEXT("r.RayTracing.Reflections.ExperimentalDeferred.SpatialResolve.TemporalWeight"),
 	0.95f, // Up to 95% of the reflection can come from history buffer, at least 5% always from current frame
 	TEXT("Defines whether to perform temporal accumulation during reflection spatial resolve and how much weight to give to history. Valid values in range [0..1]. (default: 0.90)"),
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingReflectionsTemporalQuality(
+TAutoConsoleVariable<int32> CVarRayTracingReflectionsTemporalQuality(
 	TEXT("r.RayTracing.Reflections.ExperimentalDeferred.SpatialResolve.TemporalQuality"),
 	2,
 	TEXT("0: Disable temporal accumulation\n")
@@ -114,7 +114,7 @@ static TAutoConsoleVariable<float> CVarRayTracingReflectionsHorizontalResolution
 	TEXT("Reflection resolution scaling for the X axis between 0.25 and 4.0. Can only be used when spatial resolve is enabled. (default: 1)"),
 	ECVF_RenderThreadSafe
 );
-
+extern TAutoConsoleVariable<int32> CVarRayTracingReflectionsUseSurfel;
 namespace 
 {
 	struct FSortedReflectionRay
@@ -452,7 +452,9 @@ void FDeferredShadingSceneRenderer::RenderRayTracingDeferredReflections(
 	const FViewInfo& View,
 	int DenoiserMode,
 	const FRayTracingReflectionOptions& Options,
-	IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs)
+	IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs,
+	FSurfelBufResources* SurfelResource,
+	FRadianceVolumeProbeConfigs* ProbeConfig)
 {
 	const float ResolutionFraction = Options.ResolutionFraction;
 	const bool bGenerateRaysWithRGS = CVarRayTracingReflectionsGenerateRaysWithRGS.GetValueOnRenderThread()==1;

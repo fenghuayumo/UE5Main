@@ -206,8 +206,9 @@ static TAutoConsoleVariable<int32> CVarRestirGIDenoiserTemporalEnabled(
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<float> CVarFusionHistroryClipFactor(
-	TEXT("r.Fusion.RestirGI.Denoiser.Temporal.HistroryClipFactor"), 2,
-	TEXT("RestirGI Denioser HistroryClipFactor (default 2)"),
+	TEXT("r.Fusion.RestirGI.Denoiser.Temporal.HistroryClipFactor"), 8,
+	TEXT("RestirGI Denioser HistroryClipFactor (default 8).The larger the value means better the effect of noise reduction and convergence, but temoral lag will be more serious ")
+	TEXT("Can set the value according to camera move speed"),
 	ECVF_RenderThreadSafe);
 static TAutoConsoleVariable<float> CVarFusionDenoiserMaxLowSpp(
 	TEXT("r.Fusion.RestirGI.Denoiser.Temporal.MaxLowSpp"), 4,
@@ -1065,6 +1066,8 @@ class FRestirGISpatialFilterCS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SSAOTex)
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, InputTex)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, RayHitDistanceTex)
+		
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWFilteredTex)
         
         SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTexture)
@@ -1137,6 +1140,7 @@ void PrefilterRestirGI(FRDGBuilder& GraphBuilder,
 		PassParameters->PhiDepth = CVarRestirGIDenoiserSpatialPhiDepth.GetValueOnRenderThread();
 		PassParameters->PhiNormal = CVarRestirGIDenoiserSpatialNormalPower.GetValueOnRenderThread();
 		PassParameters->PhiColor = CVarRestirGIDenoiserSpatialPhiColor.GetValueOnRenderThread();
+		PassParameters->RayHitDistanceTex = OutDenoiserInputs->RayHitDistance;
 		ClearUnusedGraphResources(ComputeShader, PassParameters);
 		FComputeShaderUtils::AddPass(
 			GraphBuilder,
@@ -1819,17 +1823,17 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
     	{
     		/*	RDG_GPU_STAT_SCOPE(GraphBuilder, RestirSpatioalResampling);
     			RDG_EVENT_SCOPE(GraphBuilder, "Ray Tracing GI: SpatioalResampling");*/
-    		for (int32 Reservoir = NumReservoirs; Reservoir > 0; Reservoir--)
+    		for (int32 Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
     		{
 
 				FRestirGISpatialResampling::FParameters* PassParameters = GraphBuilder.AllocParameters<FRestirGISpatialResampling::FParameters>();
 
 				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-				PassParameters->InputSlice = Reservoir - 1;
-				PassParameters->OutputSlice = Reservoir;
-				PassParameters->HistoryReservoir = Reservoir - 1;
-				PassParameters->SpatialSamples = FMath::Max(CVarRestirGISpatialSamples.GetValueOnRenderThread(), 1);
+				PassParameters->InputSlice = Reservoir ;
+				PassParameters->OutputSlice = Reservoir + 1;
+				PassParameters->HistoryReservoir = 0;
+				PassParameters->SpatialSamples = Reservoir == 0 ? FMath::Max(CVarRestirGISpatialSamples.GetValueOnRenderThread(), 1) : 2;
 				PassParameters->SpatialSamplesBoost = FMath::Max(CVarRestirGISpatialSamplesBoost.GetValueOnRenderThread(), 1);
 				PassParameters->SpatialSamplingRadius = FMath::Max(1.0f, CVarRestirGISpatialSamplingRadius.GetValueOnRenderThread());
 				PassParameters->SpatialDepthRejectionThreshold = FMath::Clamp(CVarRestirGISpatialDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
@@ -1862,7 +1866,7 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 						RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
 
 					});
-				InitialSlice = Reservoir;
+				InitialSlice = Reservoir + 1;
     		}
     	}
     	// Shading evaluation pass

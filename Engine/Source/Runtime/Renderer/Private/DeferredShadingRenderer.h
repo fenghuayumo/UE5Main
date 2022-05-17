@@ -910,7 +910,19 @@ private:
 		const FViewInfo& View,
 		int DenoiserMode,
 		const FRayTracingReflectionOptions& Options,
-		IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs);
+		IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs,
+		FSurfelBufResources* SurfelResource = nullptr,
+		FRadianceVolumeProbeConfigs* ProbeConfig = nullptr);
+
+	void RenderFusionReflections(
+		FRDGBuilder& GraphBuilder,
+		const FSceneTextureParameters& SceneTextures,
+		const FViewInfo& View,
+		int DenoiserMode,
+		const FRayTracingReflectionOptions& Options,
+		IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs,
+		FSurfelBufResources* SurfelResource = nullptr,
+		FRadianceVolumeProbeConfigs* ProbeConfig = nullptr);
 
 	void RenderRayTracingDeferredReflections(
 		FRDGBuilder& GraphBuilder,
@@ -918,7 +930,9 @@ private:
 		const FViewInfo& View,
 		int DenoiserMode,
 		const FRayTracingReflectionOptions& Options,
-		IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs);
+		IScreenSpaceDenoiser::FReflectionsInputs* OutDenoiserInputs,
+		FSurfelBufResources* SurfelResource = nullptr,
+		FRadianceVolumeProbeConfigs* ProbeConfig = nullptr);
 
 	void RenderDitheredLODFadingOutMask(FRDGBuilder& GraphBuilder, const FViewInfo& View, FRDGTextureRef SceneDepthTexture);
 
@@ -1030,6 +1044,11 @@ private:
 		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
 		FSurfelBufResources& SurfelResource);
 
+	void RenderFusionSkyLight(
+		FRDGBuilder& GraphBuilder,
+		FRDGTextureRef SceneColorTexture,
+		FRDGTextureRef& OutSkyLightTexture,
+		FRDGTextureRef& OutHitDistanceTexture);
 
 #if RHI_RAYTRACING
 	template <int TextureImportanceSampling>
@@ -1107,7 +1126,7 @@ private:
 	static void PrepareFusionWRCGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionDeferedGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionReflections(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
-	
+	static void PrepareFusionSkyLight(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	// Versions for setting up the deferred material pipeline
 	static void PrepareFusionReflectionsDeferredMaterial(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 
@@ -1137,8 +1156,7 @@ private:
 	static void PrepareRayTracingDeferredReflectionsDeferredMaterial(const FViewInfo& View, const FScene& Scene, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareRayTracingGlobalIlluminationDeferredMaterial(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionDeferredGIDeferredMaterial(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
-
-	// Versions for setting up the lumen material pipeline
+	// Versions for setting up the deferred material pipeline
 	static void PrepareLumenHardwareRayTracingTranslucencyVolumeLumenMaterial(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareLumenHardwareRayTracingVisualizeLumenMaterial(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareLumenHardwareRayTracingReflectionsLumenMaterial(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);

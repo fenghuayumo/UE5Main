@@ -959,31 +959,25 @@ struct FGTAOTAAHistory
 	}
 };
 
-struct FSampledGIHistory
+// Structure for restir sky light direct lighting
+struct FRestirSkyLightHistory
 {
-	// Number of history render target to store.
-	static constexpr int32 RTCount = 5;
+	// Buffer holding a light reservoirs
+	TRefCountPtr<FRDGPooledBuffer> LightReservoirs;
 
-	// Scissor of valid data in the render target;
-	FIntRect Scissor;
+	FIntVector ReservoirDimensions;
 
-	// Render target specific to the history.
-	TStaticArray<TRefCountPtr<IPooledRenderTarget>, RTCount> RT;
-
-	// The texture for tile classification.
-	TRefCountPtr<IPooledRenderTarget> TileClassification;
-
+	// Map from light components to indices used this frame
+	TMap<const ULightComponent*, int32> LightRemapTable;
 
 	void SafeRelease()
 	{
-		for (int32 i = 0; i < RTCount; i++)
-			RT[i].SafeRelease();
-		TileClassification.SafeRelease();
+		LightReservoirs.SafeRelease();
 	}
 
 	bool IsValid() const
 	{
-		return RT[0].IsValid();
+		return LightReservoirs.IsValid();
 	}
 };
 
@@ -1174,7 +1168,8 @@ struct FPreviousViewInfo
 	// Scene color used for reprojecting next frame to verify the motion vector reprojects correctly.
 	TRefCountPtr<IPooledRenderTarget> VisualizeMotionVectors;
 	FIntRect VisualizeMotionVectorsRect;
-	FSampledGIHistory			SampledGIHistory;
+		// History for sampled lighting 
+	FRestirSkyLightHistory 		RestirSkyLightHistory;
 	FRestirGIHistory			RestirGIHistory;
 	FRestirReflectionHistory	RestirReflectionHistory;
 	FGridRestirHistory			GridRestirHistory;

@@ -12,7 +12,8 @@ static int32 GRayTracingSkyLight = 0;
 static FAutoConsoleVariableRef CVarRayTracingSkyLight(
 	TEXT("r.RayTracing.SkyLight"),
 	GRayTracingSkyLight,
-	TEXT("Enables ray tracing SkyLight (default = 0)"),
+	TEXT("Enables ray tracing SkyLight (default = 0)")
+	TEXT("Enables Fusion Restir Skylight (1)"),
 	ECVF_RenderThreadSafe | ECVF_Scalability
 );
 
@@ -47,14 +48,14 @@ static FAutoConsoleVariableRef CVarRayTracingSkyLightSamplesPerPixel(
 	TEXT("Sets the samples-per-pixel for ray tracing SkyLight (default = -1)")
 );
 
-static float GRayTracingSkyLightMaxRayDistance = 1.0e7;
+float GRayTracingSkyLightMaxRayDistance = 1.0e7;
 static FAutoConsoleVariableRef CVarRayTracingSkyLightMaxRayDistance(
 	TEXT("r.RayTracing.SkyLight.MaxRayDistance"),
 	GRayTracingSkyLightMaxRayDistance,
 	TEXT("Sets the max ray distance for ray tracing SkyLight (default = 1.0e7)")
 );
 
-static float GRayTracingSkyLightMaxShadowThickness = 1.0e3;
+float GRayTracingSkyLightMaxShadowThickness = 1.0e3;
 static FAutoConsoleVariableRef CVarRayTracingSkyLightMaxShadowThickness(
 	TEXT("r.RayTracing.SkyLight.MaxShadowThickness"),
 	GRayTracingSkyLightMaxShadowThickness,
@@ -75,14 +76,14 @@ static FAutoConsoleVariableRef CVarRayTracingSkyLightDenoiser(
 	TEXT("Denoising options (default = 1)")
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingSkyLightEnableTwoSidedGeometry(
+ TAutoConsoleVariable<int32> CVarRayTracingSkyLightEnableTwoSidedGeometry(
 	TEXT("r.RayTracing.SkyLight.EnableTwoSidedGeometry"),
 	1,
 	TEXT("Enables two-sided geometry when tracing shadow rays (default = 1)"),
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRayTracingSkyLightEnableMaterials(
+ TAutoConsoleVariable<int32> CVarRayTracingSkyLightEnableMaterials(
 	TEXT("r.RayTracing.SkyLight.EnableMaterials"),
 	1,
 	TEXT("Enables material shader binding for shadow rays. If this is disabled, then a default trivial shader is used. (default = 1)"),
@@ -109,6 +110,10 @@ static TAutoConsoleVariable<float> CVarRayTracingSkyLightScreenPercentage(
 	TEXT("Screen percentage at which to evaluate sky occlusion"),
 	ECVF_RenderThreadSafe
 );
+bool FusionSkyLightEnabled()
+{
+	return GRayTracingSkyLight == 2;
+}
 
 int32 GetRayTracingSkyLightDecoupleSampleGenerationCVarValue()
 {
@@ -257,7 +262,10 @@ void FDeferredShadingSceneRenderer::PrepareRayTracingSkyLight(const FViewInfo& V
 	{
 		return;
 	}
-
+	if( FusionSkyLightEnabled())
+	{
+		return PrepareFusionSkyLight(View, OutRayGenShaders);
+	}
 	// Declare all RayGen shaders that require material closest hit shaders to be bound
 	FRayTracingSkyLightRGS::FPermutationDomain PermutationVector;
 	for (uint32 TwoSidedGeometryIndex = 0; TwoSidedGeometryIndex < 2; ++TwoSidedGeometryIndex)
@@ -359,6 +367,9 @@ void FDeferredShadingSceneRenderer::RenderRayTracingSkyLight(
 	FRDGTextureRef& OutSkyLightTexture,
 	FRDGTextureRef& OutHitDistanceTexture)
 {
+	if( FusionSkyLightEnabled() )
+		return RenderFusionSkyLight(GraphBuilder, SceneColorTexture, OutSkyLightTexture, OutHitDistanceTexture);
+	
 	FSkyLightSceneProxy* SkyLight = Scene->SkyLight;
 	
 	// Fill Sky Light parameters
