@@ -1,6 +1,26 @@
-#ifndef RESERVOIR_USH
-#define RESERVOIR_USH
+/*
+* Copyright (c) 2021 NVIDIA CORPORATION.  All rights reserved.
+*
+* NVIDIA Corporation and its licensors retain all intellectual property and proprietary
+* rights in and to this software, related documentation and any modifications thereto.
+* Any use, reproduction, disclosure or distribution of this software and related
+* documentation without an express license agreement from NVIDIA Corporation is strictly
+* prohibited.
+*
+* TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THIS SOFTWARE IS PROVIDED *AS IS*
+* AND NVIDIA AND ITS SUPPLIERS DISCLAIM ALL WARRANTIES, EITHER EXPRESS OR IMPLIED,
+* INCLUDING, BUT NOT LIMITED TO, IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+* PARTICULAR PURPOSE.  IN NO EVENT SHALL NVIDIA OR ITS SUPPLIERS BE LIABLE FOR ANY
+* SPECIAL, INCIDENTAL, INDIRECT, OR CONSEQUENTIAL DAMAGES WHATSOEVER (INCLUDING, WITHOUT
+* LIMITATION, DAMAGES FOR LOSS OF BUSINESS PROFITS, BUSINESS INTERRUPTION, LOSS OF
+* BUSINESS INFORMATION, OR ANY OTHER PECUNIARY LOSS) ARISING OUT OF THE USE OF OR
+* INABILITY TO USE THIS SOFTWARE, EVEN IF NVIDIA HAS BEEN ADVISED OF THE POSSIBILITY OF
+* SUCH DAMAGES.
+*/
 
+#pragma once
+
+// Code for managing reads/writes to reservoirs
 RWStructuredBuffer<uint4> RWLightReservoirUAV;
 uint3 ReservoirBufferDim;
 
@@ -8,12 +28,19 @@ RWStructuredBuffer<uint4> RWLightReservoirHistoryUAV;
 StructuredBuffer<uint4> LightReservoirHistory;
 uint3 ReservoirHistoryBufferDim;
 
-
 uint ComputeReservoirAddress(int2 PixelCoord, int Slice, uint3 BufferDim)
 {
-	uint Address = Slice * BufferDim.x * BufferDim.y; 
-	Address += PixelCoord.y * BufferDim.x;
-	Address += PixelCoord.x;
+	static const uint TileSize = 4;
+	const uint RowStride = (BufferDim.x / TileSize) * TileSize * TileSize;
+
+	int2 Tile = PixelCoord / TileSize;
+	int2 TileCoord = PixelCoord % TileSize;
+
+	uint Address = Slice * BufferDim.x * BufferDim.y;
+	Address += Tile.y * RowStride;
+	Address += Tile.x * TileSize * TileSize;
+	Address += TileCoord.y * TileSize + TileCoord.x;
+
 	return Address;
 }
 
@@ -47,6 +74,14 @@ void WriteReservoirHistoryData(int2 PixelCoord, int Slice, uint4 Value)
 	RWLightReservoirHistoryUAV[Address] = Value;
 }
 
+
+/***************************************************************************************************
+ *
+ *  RTXDI SDK structures
+ *
+ * Strucxtures derived from the RTXDI SDK, but customized to UE4
+ *
+ ***************************************************************************************************/
 
 typedef uint4 RTXDI_SDK_PackedReservoir;
 
@@ -230,7 +265,7 @@ struct RTXDI_SDK_Reservoir
 		weightSum += risWeight;
 
 		// Decide if we will randomly pick this sample
-		bool selectSample = (random * weightSum <= risWeight);
+		bool selectSample = (random * weightSum < risWeight);
 
 		// If we did select this sample, update the relevant data
 		if (selectSample)
@@ -242,4 +277,3 @@ struct RTXDI_SDK_Reservoir
 		return selectSample;
 	}
 };
-#endif

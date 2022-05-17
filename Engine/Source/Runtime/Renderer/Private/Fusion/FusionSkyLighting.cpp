@@ -36,7 +36,7 @@ static TAutoConsoleVariable<int32> CVarRestirSkyLightNumReservoirs(
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightTemporal(
-	TEXT("r.Fusion.SkyLight.Temporal"), 0,
+	TEXT("r.Fusion.SkyLight.Temporal"), 1,
 	TEXT("Whether to apply Temporal resmapling"),
 	ECVF_RenderThreadSafe);
 
@@ -57,7 +57,7 @@ static TAutoConsoleVariable<int32> CVarRestirSkyLightTemporalApplySpatialHash(
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightSpatial(
-	TEXT("r.Fusion.SkyLight.Spatial"), 0,
+	TEXT("r.Fusion.SkyLight.Spatial"), 1,
 	TEXT("Whether to apply spatial resmapling"),
 	ECVF_RenderThreadSafe);
 
@@ -98,8 +98,8 @@ static TAutoConsoleVariable<int32> CVarRestirSkyLightSpatialDiscountNaiveSamples
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightTemporalMaxHistory(
-	TEXT("r.Fusion.SkyLight.Temporal.MaxHistory"), 10,
-	TEXT("Maximum temporal history for samples (default 10)"),
+	TEXT("r.Fusion.SkyLight.Temporal.MaxHistory"), 30,
+	TEXT("Maximum temporal history for samples (default 30)"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightTestInitialVisibility(
@@ -132,7 +132,6 @@ static TAutoConsoleVariable<float> CVarRestirSkyLightBoilingFilterStrength(
 	TEXT("Strength of Boiling filter"),
 	ECVF_RenderThreadSafe);
 
-
 static TAutoConsoleVariable<int32> CVarRestirSkyLightEnableHairVoxel(
 	TEXT("r.Fusion.SkyLight.EnableHairVoxel"),
 	1,
@@ -155,7 +154,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FRestirSkyLightCommonParameters, )
     SHADER_PARAMETER(int, bSkyLightTransmission)
     SHADER_PARAMETER(float, SkyLightMaxShadowThickness)
     
-    SHADER_PARAMETER_STRUCT_INCLUDE(FPathTracingSkylight, SkyLightParameters)
+     SHADER_PARAMETER_STRUCT_INCLUDE(FPathTracingSkylight, SkyLightParameters)
+	//SHADER_PARAMETER(int32, RISSkylightBufferTiles)
+	//SHADER_PARAMETER(int32, RISSkylightBufferTileSize)
+	//SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint2>, RISSkylightBuffer)
+	//SHADER_PARAMETER(float, InvSkylightSize)
+	//SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, SkylightTexture)
+	//SHADER_PARAMETER_SAMPLER(SamplerState, SkylightTextureSampler)
+
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugDiffuseUAV)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, RWDebugRayDistanceUAV)
 END_SHADER_PARAMETER_STRUCT()
@@ -761,11 +767,15 @@ void FDeferredShadingSceneRenderer::RenderFusionSkyLight(
         const bool bEnableSkylight = true, bUseMISCompensation = true;
         FPathTracingSkylight SkylightParameters;
         if( !PrepareSkyTexture(GraphBuilder, Scene, Views[0], bEnableSkylight, bUseMISCompensation, &SkylightParameters) )
-         {
-            OutSkyLightTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
-		    OutHitDistanceTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
-            return ;
-         }  
+		{
+			OutSkyLightTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+			OutHitDistanceTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+			return ;
+		}
+		
+		// const int32 SkyTiles = (Scene->SkyLight != nullptr ) ? 16 : 0;
+		// FSkylightRIS SkylightRIS = BuildSkylightRISStructures(GraphBuilder, 256, SkyTiles, ReferenceView);
+
 
         int32 UpscaleFactor = 1;//TODO: Calculate UpscaleFactor
         FRDGTextureDesc Desc = SceneColorTexture->Desc;
@@ -805,7 +815,15 @@ void FDeferredShadingSceneRenderer::RenderFusionSkyLight(
         CommonParameters.SkyLightMaxShadowThickness = GRayTracingSkyLightMaxShadowThickness;
         CommonParameters.RWDebugDiffuseUAV = GraphBuilder.CreateUAV(DebugDiffuse);
         CommonParameters.RWDebugRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
-        const bool bCameraCut = !ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs.IsValid() || ReferenceView.bCameraCut;
+       
+	   	// CommonParameters.RISSkylightBuffer = GraphBuilder.CreateSRV(SkylightRIS.RISBuffer, PF_R32G32_UINT);
+		// CommonParameters.RISSkylightBufferTiles = SkyTiles;
+		// CommonParameters.RISSkylightBufferTileSize = 256;
+		// CommonParameters.InvSkylightSize = SkylightRIS.InvSize;
+		// CommonParameters.SkylightTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SkylightRIS.EnvTexture));
+		// CommonParameters.SkylightTextureSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+
+	    const bool bCameraCut = !ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs.IsValid() || ReferenceView.bCameraCut;
         const int32 PrevHistoryCount = ReferenceView.PrevViewInfo.RestirSkyLightHistory.ReservoirDimensions.Z;
         int InitialCandidates = CVarRestirSkyLightInitialCandidates.GetValueOnRenderThread();
        	int32 InitialSlice = 0;

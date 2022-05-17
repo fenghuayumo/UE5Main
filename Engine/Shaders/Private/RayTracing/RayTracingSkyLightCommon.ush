@@ -15,7 +15,9 @@ SamplerState SkylightTextureSampler;
 float SkylightInvResolution;
 int SkylightMipCount;
 
+#ifndef USE_HIERARCHICAL_IMPORTANCE_SAMPLING
 #define USE_HIERARCHICAL_IMPORTANCE_SAMPLING		1
+#endif
 
 float SkyLight_Estimate()
 {

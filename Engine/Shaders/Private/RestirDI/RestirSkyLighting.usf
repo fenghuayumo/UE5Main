@@ -31,6 +31,7 @@
 
 #include "../SceneTextureParameters.ush"
 #include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#define USE_HIERARCHICAL_IMPORTANCE_SAMPLING 0
 #include "../RayTracing/RayTracingSkyLightCommon.ush"
 
 #include "ReservoirManagement.ush"
@@ -74,6 +75,14 @@ float TemporalNormalRejectionThreshold;
 
 uint NeighborOffsetMask;
 Buffer<float2> NeighborOffsets;
+
+// skylight data
+// int RISSkylightBufferTiles;
+// int RISSkylightBufferTileSize;
+// Buffer<uint2> RISSkylightBuffer;
+// float InvSkylightSize;
+// Texture2D<float4> SkylightTexture;
+// SamplerState SkylightTextureSampler;
 
 
 bool CheckApproximateVisibility(uint2 PixelCoord, float DeviceZ, float3 TranslatedWorldPosition, FGBufferData GBuffer,  RTXDI_SDK_LightSampleRef SampleRef)
@@ -151,9 +160,9 @@ float GetApproximateLightSampleWeight(float3 TranslatedWorldPosition, float3 Cam
 		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
 		LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
 	}
-	// float3 Brdf = LightingSample.Diffuse + LightingSample.Transmission + LightingSample.Specular;
-	float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
 
+	float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
+	// float3 Brdf = LightingSample.Diffuse + LightingSample.Transmission + LightingSample.Specular;
 	// float3 Color = IncomingRadiance * Brdf;
 	float3 DiffuseThroughput = LightingSample.Diffuse;
 	if (bSkyLightTransmission)
@@ -178,7 +187,7 @@ void ProduceInitialSample(
 	const int NumLightSamples = InitialCandidates;
 
 	RTXDI_SDK_Reservoir SkylightReservoir = RTXDI_SDK_Reservoir::Empty();
-	//for(uint SampleIndex = 0; SampleIndex < NumLightSamples; SampleIndex++)
+	for(uint SampleIndex = 0; SampleIndex < NumLightSamples; SampleIndex++)
 	{
 		// Select a tile of random samples for the thread using the coherent sampler improve coherence of local threads
 		float2 RandSample = RandContext.GenerateSample2D();
@@ -195,6 +204,27 @@ void ProduceInitialSample(
 
  		SkylightReservoir.StreamSample(sampleRef, risRnd, weight, pdfScale);
 	}
+	// if (RISSkylightBufferTiles > 0)
+	// {
+	// 	// Select a tile of random samples for the thread using the coherent sampler improve coherence of local threads
+	// 	uint Tile = uint(CoherentRandContext.GenerateSample1D() * RISSkylightBufferTiles) % RISSkylightBufferTiles;
+
+	// 	uint Sample = uint(RandContext.GenerateSample1D() * RISSkylightBufferTileSize) % RISSkylightBufferTileSize;
+	// 	uint2 SampleData = RISSkylightBuffer[Tile * RISSkylightBufferTileSize + Sample];
+	// 	uint SkyLightIdx = 0;
+
+	// 	float pdfScale = asfloat(SampleData.y);
+
+	// 	float2 SampleLocation = float2(SampleData.x & 0xffff, SampleData.x >> 16) * 1.0 / float(0xffff);
+
+	// 	RTXDI_SDK_LightSampleRef sampleRef = RTXDI_SDK_LightSampleRef::Create(SkyLightIdx, SampleLocation);
+
+	// 	float weight = GetApproximateLightSampleWeight(TranslatedWorldPosition, CameraDirection, GBuffer, sampleRef);
+
+	// 	float risRnd = RandContext.GenerateSample1D();
+
+	// 	bool selected = SkylightReservoir.StreamSample(sampleRef, risRnd, weight, pdfScale);
+	// }
 
 	SkylightReservoir.FinalizeResampling(1.0, SkylightReservoir.M);
 	SkylightReservoir.M = 1;
@@ -904,11 +934,11 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 				{
 					RayDistance += MinimalPayload.HitT;
 					HitCount += 1.0;
-					if (FeedbackVisibility)
-					{
-						risSample.weightSum = 0.0f;
-						risSample.targetPdf = 0.0f;
-					}
+					// if (FeedbackVisibility)
+					// {
+					// 	risSample.weightSum = 0.0f;
+					// 	risSample.targetPdf = 0.0f;
+					// }
 				}
 				else
 				{
@@ -946,12 +976,12 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 					RWDebugDiffuseUAV[PixelCoord] = float4(IncomingRadiance * View.PreExposure * risSample.weightSum, 1.0);
 				}
 			}
-			else
-			{
-				// sample occluded, kill it for the history
-				risSample = RTXDI_SDK_Reservoir::Empty();
-			}
-			WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
+			// else
+			// {
+			// 	// sample occluded, kill it for the history
+			// 	risSample = RTXDI_SDK_Reservoir::Empty();
+			// }
+			// WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
 			
 		}
 		//ExitantRadiance /= float(NumReservoirs);
@@ -961,12 +991,12 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 		const float SamplesPerPixelInv = rcp(NumReservoirs);
 		AmbientOcclusion = HitCount * SamplesPerPixelInv;
     }
-	else
+	// else
 	{
 		// Invalid pixel, write empty reservoir
 		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
-			//WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
+			// WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
 			WriteReservoirHistoryData(PixelCoord , Reservoir, ReadReservoirData(PixelCoord, 0));
 		}
 	}
