@@ -141,7 +141,7 @@ static TAutoConsoleVariable<int32> CVarRestirSkyLightEnableHairVoxel(
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightEnableSkyDenoiser(
 	TEXT("r.Fusion.SkyLight.Denoiser"),
-	1,
+	0,
 	TEXT("Whether to use restir sky denoiser (default = 1)\n"),
 	ECVF_RenderThreadSafe);
 	
