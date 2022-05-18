@@ -482,7 +482,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
 
 			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
-			PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
+			//PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
 
 			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
 
@@ -495,7 +495,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
 
 			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
-			PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
+			//PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
 
 			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
 

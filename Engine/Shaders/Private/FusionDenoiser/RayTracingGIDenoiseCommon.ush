@@ -1,0 +1,106 @@
+#ifndef SVGF_COMMON_H
+#define SVGF_COMMON_H
+
+#define f4red   float4(1,0,0,1)
+#define f4green float4(0,1,0,1)
+#define f4blue  float4(0,0,1,1)
+#define f4white float4(1,1,1,1)
+#define f4black float4(0,0,0,1)
+
+struct FullScreenPassVsOut
+{
+	float2 texC : TEXCOORD;
+#ifndef _VIEWPORT_MASK
+	float4 posH : SV_POSITION;
+#else
+	float4 posH : POSITION;
+#endif
+#ifdef _SINGLE_PASS_STEREO
+	float4 rightPosH : NV_X_RIGHT;
+	uint4 viewportMask : NV_VIEWPORT_MASK;
+	uint renderTargetIndex : SV_RenderTargetArrayIndex;
+#endif
+};
+
+
+float NormalDistanceCos(float3 n1, float3 n2, float power)
+{
+	return pow( saturate(dot(n1,n2)), power);
+}
+
+float NormalDistanceExp(float3 n1, float3 n2, float power)
+{
+	float x = max(0, 1 - dot(n1, n2));
+	return saturate(exp(-x * power));
+}
+
+float NormalDistanceTan(float3 a, float3 b)
+{
+	const float d = max(1e-8, dot(a, b));
+	return sqrt(max(0.0, 1.0 - d * d)) / d;
+}
+
+float2 ComputeWeight(
+	float depthCenter, float depthP, float phiDepth,
+	float3 normalCenter, float3 normalP, float normPower,
+	float luminanceDirectCenter, float luminanceDirectP, float phiDirect,
+	float luminanceIndirectCenter, float luminanceIndirectP, float phiIndirect)
+{
+	const float wNormal = NormalDistanceExp(normalCenter, normalP, normPower);
+	const float wZ = (phiDepth == 0) ? 0.0f : abs(depthCenter - depthP) / phiDepth;
+	const float wLdirect = abs(luminanceDirectCenter - luminanceDirectP) / phiDirect;
+	const float wLindirect = abs(luminanceIndirectCenter - luminanceIndirectP) / phiIndirect;
+
+	const float wDirect = exp(0.0 - max(wLdirect, 0.0) - max(wZ, 0.0)) * wNormal;
+	const float wIndirect = exp(0.0 - max(wLindirect, 0.0) - max(wZ, 0.0)) * wNormal;
+
+	return float2(wDirect, wIndirect);
+}
+
+float ComputeWeightNoLuminance(float depthCenter, float depthP, float phiDepth, float3 normalCenter, float3 normalP)
+{
+	const float wNormal = NormalDistanceCos(normalCenter, normalP, 128.0f);
+	const float wZ = abs(depthCenter - depthP) / phiDepth;
+
+	return exp(-max(wZ, 0.0)) * wNormal;
+}
+
+// With SH denoising, both C0 and C1 are used.
+// Otherwise, only C0 is used.
+uint4 PackColorData(float4 C0, float2 C1, float variance)
+{
+	uint4 Data;
+	Data.x = (f32tof16(C0.x) << 16) | f32tof16(C0.y);
+	Data.y = (f32tof16(C0.z) << 16) | f32tof16(C0.w);
+	Data.z = (f32tof16(C1.x) << 16) | f32tof16(C1.y);
+	Data.w = f32tof16(variance);
+	return Data;
+}
+
+void UnpackColorData(uint4 Data, out float4 C0, out float2 C1, out float variance)
+{
+	C0.x = f16tof32(Data.x >> 16);
+	C0.y = f16tof32(Data.x & 0xffff);
+	C0.z = f16tof32(Data.y >> 16);
+	C0.w = f16tof32(Data.y & 0xffff);
+
+	C1.x = f16tof32(Data.z >> 16);
+	C1.y = f16tof32(Data.z & 0xffff);
+
+	variance = f16tof32(Data.w & 0xffff);
+}
+
+float DenoiseLuminance(float4 Data, float3 Normal, bool UseSH)
+{
+	if (UseSH)
+	{
+		float d = dot(Normal.xyz, Data.xyz);
+		float Y = 2.0 * (1.023326 * d + 0.886226 * Data.w);
+		return max(Y, 0);
+	}
+	else
+	{
+		return Luminance(Data.rgb);
+	}
+}
+#endif

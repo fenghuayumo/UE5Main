@@ -104,7 +104,7 @@ static TAutoConsoleVariable<int32> CVarRayTracingSkyLightEnableHairVoxel(
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<float> CVarRayTracingSkyLightScreenPercentage(
+TAutoConsoleVariable<float> CVarRayTracingSkyLightScreenPercentage(
 	TEXT("r.RayTracing.SkyLight.ScreenPercentage"),
 	100.0f,
 	TEXT("Screen percentage at which to evaluate sky occlusion"),

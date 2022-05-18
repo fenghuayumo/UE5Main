@@ -1,0 +1,67 @@
+#pragma once
+
+uint2 UpscaleFactorBits;
+
+uint2 GetPixelCoord(uint2 DispatchThreadId)
+{
+	uint UpscaleArea = 1 << (UpscaleFactorBits.x + UpscaleFactorBits.y);
+
+	// TODO: find a way to not interfer with TAA's jittering.
+	uint SubPixelId = View.StateFrameIndex & (UpscaleArea - 1);
+
+	uint MaxUpscaleBits = max(UpscaleFactorBits.x, UpscaleFactorBits.y);
+
+	uint OffsetX = SubPixelId & ((1 << MaxUpscaleBits) - 1);
+	uint OffsetY = SubPixelId >> MaxUpscaleBits;
+
+	uint2 PixelOffset = (UpscaleFactorBits.x > UpscaleFactorBits.y) ? uint2(OffsetX, OffsetY) : uint2(OffsetY, OffsetX);
+
+	return (DispatchThreadId << UpscaleFactorBits) + PixelOffset;
+}
+
+uint2 GetPixelCoordFromFrame(uint2 DispatchThreadId, int FrameOffset)
+{
+	uint UpscaleArea = 1 << (UpscaleFactorBits.x + UpscaleFactorBits.y);
+
+	// TODO: find a way to not interfer with TAA's jittering.
+	uint SubPixelId = (View.StateFrameIndex + FrameOffset) & (UpscaleArea - 1);
+
+	uint MaxUpscaleBits = max(UpscaleFactorBits.x, UpscaleFactorBits.y);
+
+	uint OffsetX = SubPixelId & ((1 << MaxUpscaleBits) - 1);
+	uint OffsetY = SubPixelId >> MaxUpscaleBits;
+
+	uint2 PixelOffset = (UpscaleFactorBits.x > UpscaleFactorBits.y) ? uint2(OffsetX, OffsetY) : uint2(OffsetY, OffsetX);
+
+	return (DispatchThreadId << UpscaleFactorBits) + PixelOffset;
+}
+
+uint2 GetPixelCoordOffset(int FrameOffset)
+{
+	uint UpscaleArea = 1 << (UpscaleFactorBits.x + UpscaleFactorBits.y);
+
+	// TODO: find a way to not interfer with TAA's jittering.
+	uint SubPixelId = (View.StateFrameIndex + FrameOffset) & (UpscaleArea - 1);
+
+	uint MaxUpscaleBits = max(UpscaleFactorBits.x, UpscaleFactorBits.y);
+
+	uint OffsetX = SubPixelId & ((1 << MaxUpscaleBits) - 1);
+	uint OffsetY = SubPixelId >> MaxUpscaleBits;
+
+	uint2 PixelOffset = (UpscaleFactorBits.x > UpscaleFactorBits.y) ? uint2(OffsetX, OffsetY) : uint2(OffsetY, OffsetX);
+
+	return PixelOffset;
+}
+
+uint2 GetPixelCoordStep()
+{
+	return 1 << UpscaleFactorBits;
+}
+
+void GetBasePixelCoordFromUpscaledPixelCoord(int2 DispatchThreadId, int FrameOffset, out uint2 DownSampledPixelPosBase, out uint2 UpSampledPixelPosBase, out uint2 UpSamplePixelStep)
+{
+	int2 GBufferOffset = GetPixelCoordOffset(FrameOffset);
+	DownSampledPixelPosBase = max(0, (DispatchThreadId - GBufferOffset)) >> UpscaleFactorBits;
+	UpSampledPixelPosBase = max(0,(DownSampledPixelPosBase << UpscaleFactorBits) + GBufferOffset + View.ViewRectMin.xy);
+	UpSamplePixelStep = (1 << UpscaleFactorBits);
+}

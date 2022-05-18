@@ -1,0 +1,252 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../MonteCarlo.ush"
+#include "RayTracingUpscaleCommon.ush"
+#include "RayTracingGIDenoiseCommon.ush"
+
+float4x4 InverseWVPMatrix;
+float4x4 WVPMatrix;
+float4x4 InverseProjectionMatrix;
+
+int Enable;
+int UseSH;
+int Step;
+int FilterType;
+float FilterWidth;
+int SampleDepthAsNormal;
+
+int2 DenoiseDim;
+int2 GBufferDim;
+
+float NormalKernel;
+float DepthKernel;
+float AOKernel;
+float RandomRotation;
+float VarianceGain;
+
+Texture2D DepthTextureThis;
+
+Texture2D NormalTextureThis;
+
+Texture2D<uint4>   InputColor;
+Texture2D<float4>  InputMoment;
+
+RWTexture2D<uint4> OutputColor;
+
+SamplerState LinearSampler;
+
+float ToViewSpace(float4x4 invProj, float depth)
+{
+	return (invProj[2][2] * depth + invProj[3][2]) / (invProj[2][3] * depth + invProj[3][3]);
+}
+
+float3 GetViewSpaceNormal(int2 ipos, float4x4 invProj)
+{
+	if (SampleDepthAsNormal)
+	{
+		float2 duv = 2 / float2(GBufferDim);
+		float depth = DepthTextureThis[ipos].r;
+		float dp0 = DepthTextureThis[ipos + int2(1, 0)].r - depth;
+		float dn0 = depth - DepthTextureThis[ipos - int2(1, 0)].r;
+		float d0p = DepthTextureThis[ipos + int2(0, 1)].r - depth;
+		float d0n = depth - DepthTextureThis[ipos - int2(0, 1)].r;
+		float depthX = abs(dp0) < abs(dn0) ? dp0 : dn0;
+		float depthY = abs(d0p) < abs(d0n) ? d0p : d0n;
+
+		float4 ndc = float4(duv, depth, 1);
+		float4 view = mul(ndc, invProj);
+		view.xyz /= view.w;
+		float zX = ToViewSpace(invProj, depthX + depth);
+		float zY = ToViewSpace(invProj, depthY + depth);
+		float3 dirX = float3(view.x, 0, zX - view.z);
+		float3 dirY = float3(0, view.y, zY - view.z);
+		return normalize(cross(dirX, dirY));
+	}
+	else
+	{
+		return DecodeNormal(NormalTextureThis[ipos].xyz);
+	}
+}
+
+
+// computes a 3x3 gaussian blur of the variance, centered around
+// the current pixel
+float ComputeVarianceCenter(int2 ipos, Texture2D<uint4> sIndirect)
+{
+	float sum = 0;
+
+	const float kernel[2][2] = {
+		{ 1.0 / 4.0, 1.0 / 8.0  },
+		{ 1.0 / 8.0, 1.0 / 16.0 }
+	};
+
+	const int radius = 1;
+	for (int yy = -radius; yy <= radius; yy++)
+	{
+		for (int xx = -radius; xx <= radius; xx++)
+		{
+			int2 p = ipos + int2(xx, yy);
+
+			float k = kernel[abs(xx)][abs(yy)];
+
+			float4 C0;
+			float2 C1;
+			float V;
+			UnpackColorData(sIndirect.Load(int3(p, 0)), C0, C1, V);
+			sum += V * k;
+		}
+	}
+
+	return sum;
+}
+
+[numthreads(16, 16, 1)]
+void AtrousFilter_CS(uint3 threadIdx : SV_DispatchThreadID)
+{
+	float   gVarainceEpsilon = 1e-5f;
+	float   gPhiColor = VarianceGain * 10;
+	float   gPhiNormal = 400/(NormalKernel);
+
+	float4 fragCoord = float4(threadIdx.xy, 0, 0);
+	const int2 ipos = int2(fragCoord.xy);
+	const int2 screenSize = DenoiseDim;
+
+	const float epsVariance = 1e-4;
+	const float kernelWeights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
+
+	// constant samplers to prevent the compiler from generating code which
+	// fetches the sampler descriptor from memory for each texture access
+	float4  indirectCenter0;
+	float2  indirectCenter1;
+	float variance;
+	UnpackColorData(InputColor[ipos], indirectCenter0, indirectCenter1, variance);
+
+	// variance for direct and indirect, filtered using 3x3 gaussin blur
+	const float var = ComputeVarianceCenter(ipos, InputColor);
+
+	if (!Enable)
+	{
+		OutputColor[ipos] = PackColorData(indirectCenter0, indirectCenter1, variance);
+		return;
+	}
+	// number of temporally integrated pixels
+	float4 moment = InputMoment[ipos];
+	const float historyLength = moment.a;
+
+	uint2 pixelOffset = (1 << UpscaleFactorBits);
+	int2 iposG = GetPixelCoord(ipos);
+	float3 normalCenter = GetViewSpaceNormal(iposG, InverseProjectionMatrix);
+	const float lIndirectCenter = DenoiseLuminance(indirectCenter0, normalCenter, UseSH);
+	float depth = DepthTextureThis[iposG].r;
+	float dp0 = DepthTextureThis[iposG + int2(pixelOffset.x, 0)].r - depth;
+	float dn0 = depth - DepthTextureThis[iposG - int2(pixelOffset.x, 0)].r;
+	float d0p = DepthTextureThis[iposG + int2(0, pixelOffset.y)].r - depth;
+	float d0n = depth - DepthTextureThis[iposG - int2(0, pixelOffset.y)].r;
+	float deltaD = max(min(abs(dp0), abs(dn0)), min(abs(d0p), abs(d0n))) * 1;
+	float2 deltaD2;
+	deltaD2.x = abs(dp0) < abs(dn0) ? dp0 : dn0;
+	deltaD2.y = abs(d0p) < abs(d0n) ? d0p : d0n;
+	float2 zCenter = float2(depth, deltaD);
+
+	float hitDistance = moment.b;
+	float omega = (2 / hitDistance);
+	float radiusView = 2 / omega;
+	float depthView = ToViewSpace(InverseProjectionMatrix, depth);
+	float radiusScreen = max(1e-5, radiusView / depthView * 1e2 * AOKernel);
+
+	if (zCenter.x <= 0 || zCenter.x >= 1)
+	{
+		OutputColor[ipos] = PackColorData(indirectCenter0, indirectCenter1, variance);
+		return;
+	}
+
+	float gStepSize = 1<<Step;
+	const float phiLIndirect = gPhiColor * sqrt(max(epsVariance, var));
+	float phiDepth = max(zCenter.y, 1e-4) * gStepSize * DepthKernel;
+
+	// explicitly store/accumulate center pixel with weight 1 to prevent issues
+	// with the edge-stopping functions
+	float sumWIndirect = 0;
+	float4 sumIndirect0 = 0;
+	float2 sumIndirect1 = 0;
+	float sumVariance = 0;
+
+	int xRange=0, yRange=0;
+	float InvKernelWidth;
+	// FilterType
+	// 0: Atrous filter
+	// 1: Horizontal gaussian filter
+	// 2: Vertical gaussian filter
+	if (FilterType == 0)
+	{
+		xRange = yRange = FilterWidth;
+		InvKernelWidth = 16;
+	}
+	else if (FilterType == 1)
+	{
+		xRange = FilterWidth;
+		yRange = 0;
+		gStepSize = 1;
+		InvKernelWidth = 1024;
+	}
+	else if (FilterType == 2)
+	{
+		xRange = 0;
+		yRange = FilterWidth;
+		gStepSize = 1;
+		InvKernelWidth = 1024;
+	}
+	InvKernelWidth *= gStepSize / (radiusScreen * FilterWidth) * 3 / 16.0;
+	for (int yy = -yRange; yy <= yRange; yy++)
+	{
+		for (int xx = -xRange; xx <= xRange; xx++)
+		{
+			const int2 p = ipos + int2(xx, yy) * gStepSize;
+			const bool inside = all(p >= int2(0, 0)) && all(p < screenSize-1);
+
+			float kernel;
+			float r = (abs(xx) + abs(yy)) * InvKernelWidth;
+			kernel = exp((-r * r) / 2);
+
+			if (inside) // skip center pixel, it is already accumulated
+			{
+				float4 C0Last;
+				float2 C1Last;
+				float VarLast;
+				UnpackColorData(InputColor[p], C0Last, C1Last, VarLast);
+
+				float2 zP;
+				int2 pG = iposG + int2(xx, yy) * gStepSize * pixelOffset;
+				float3 normalP = GetViewSpaceNormal(pG, InverseProjectionMatrix);
+				zP.x = DepthTextureThis[pG].r;
+				if (zP.x <= 0 || zP.x >= 1)
+					continue;
+
+				const float lIndirectP = DenoiseLuminance(C0Last, normalCenter, UseSH);
+
+				phiDepth = gStepSize * DepthKernel * max(dot(deltaD2, float2(xx, yy)), 1e-10);
+				float zCenter2 = zCenter.x + dot(deltaD2, float2(xx, yy));
+
+				const float wNormal = NormalDistanceExp(normalCenter, normalP, gPhiNormal);
+				const float wZ = abs(zP.x - zCenter2) * 1e2 / DepthKernel;
+				const float wLindirect = abs(lIndirectCenter - lIndirectP) / phiLIndirect;
+				const float w0Indirect = exp(- wLindirect - wZ) * wNormal;
+
+				const float wIndirect = w0Indirect * kernel;
+
+				// alpha channel contains the variance, therefore the weights need to be squared, see paper for the formula
+				sumWIndirect += wIndirect;
+				sumIndirect0 += wIndirect * C0Last;
+				sumIndirect1 += wIndirect * C1Last;
+				sumVariance += VarLast * wIndirect * wIndirect;
+			}
+		}
+	}
+
+	// renormalization is different for variance, check paper for the formula
+	float4 outputColor0 = sumWIndirect == 0 ? 0 : float4(sumIndirect0 / sumWIndirect);
+	float2 outputColor1 = sumWIndirect == 0 ? 0 : float2(sumIndirect1 / sumWIndirect);
+	float outVariance = sumWIndirect == 0 ? 0 : sumVariance / (sumWIndirect * sumWIndirect);
+	OutputColor[ipos] = PackColorData(outputColor0, outputColor1, outVariance);
+
+}

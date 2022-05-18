@@ -1,0 +1,321 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "RayTracingUpscaleCommon.ush"
+#include "RayTracingGIDenoiseCommon.ush"
+
+float4x4 ReprojectionMatrix;
+float4x4 InverseProjectionMatrixThis;
+float4x4 InverseProjectionMatrixLast;
+
+int Enable;
+int UseSH;
+int2 DenoiseDim;
+int2 GBufferDim;
+float ColorClamp;
+int HistoryLength;
+
+float BlendWeight;
+float MomentBlendWeight;
+float NormalKernel;
+float DepthKernel;
+float ColorKernel;
+
+Texture2D DepthTextureThis;
+Texture2D DepthTextureLast;
+
+Texture2D NormalTextureThis;
+Texture2D NormalTextureLast;
+
+Texture2D<uint4>   ColorLast;
+Texture2D<float4>   ColorInput;
+
+Texture2D<float2>   DistanceInput;
+Texture2D<float4>   MomentLast;
+
+RWTexture2D<uint4> ColorThis;
+RWTexture2D<float4> MomentThis;
+
+SamplerState LinearSampler;
+
+float ToViewSpace(float4x4 invProj, float depth)
+{
+	return (invProj[2][2] * depth + invProj[3][2]) / (invProj[2][3] * depth + invProj[3][3]);
+}
+
+bool LoadDirectIndirect(int2 fragCoord, out float4 C0, out float2 C1, out float RayDist)
+{
+	float4 Input = ColorInput[fragCoord];
+	if (UseSH)
+	{
+		// Both C0 and C1 are used for SH denoising
+		float AO;
+		UnpackColorData(asuint(Input), C0, C1, AO);
+	}
+	else
+	{
+		// Only C0 is used for non-SH denoising.
+		C0 = float4(Input.xyz, 0);
+		C1 = 0;
+	}
+
+	float2 DistanceInfo = DistanceInput[fragCoord];
+	RayDist = DistanceInfo.r;
+	if (RayDist < 0 || RayDist > 10000)
+		RayDist = 10000;
+	return DistanceInfo.g > 0;
+}
+
+bool IsReprjValid(int2 coord, int2 imageDim, float Z, float Zprev, float fwidthZ, float3 normal, float3 normalPrev, float fwidthNormal)
+{
+	// check whether reprojected pixel is inside of the screen
+	if (any(coord < int2(0, 0)) || any(coord > imageDim - int2(1, 1))) return false;
+	// check if deviation of depths is acceptable
+	if (abs(Zprev - Z) / (fwidthZ + 1e-4) > 2.0) return false;
+	// check normals for compatibility
+	if (distance(normal, normalPrev) / (fwidthNormal + 1e-10) > 16.0) return false;
+
+	return true;
+}
+
+bool LoadPrevData(float2 fragCoord, out float4 prevIndirect0, out float2 prevIndirect1, out float4 prevMoments, out float historyLength)
+{
+	const int2 ipos = GetPixelCoord(fragCoord);// fragCoord / DenoiseDim.xy * GBufferDim.xy;
+	float4 motion = 0;
+	
+	uint2 GBufferStep = (1 << UpscaleFactorBits);
+	float2 pixelOffset = GBufferStep;
+	float depth = DepthTextureThis[ipos].r;
+	float deltaD = DepthKernel*1e-3;
+
+	float4 Velocity = GBufferVelocityTexture[ipos];
+	float2 uv = (float2(ipos) + 0.5) / GBufferDim.xy;
+	float4 ndc = float4(uv * float2(2, -2) + float2(-1, 1), depth, 1);
+	float depthLast;
+	float2 uvLast;
+	uint2 gBufferPixelPosLast;
+	if (Velocity.x > 0.0)
+	{
+		Velocity.xyz = DecodeVelocityFromTexture(Velocity);
+		float2 ndcLast = ndc.xy - Velocity.xy;
+		uvLast = (ndcLast.xy * float2(1, -1) + 1) * 0.5;
+		gBufferPixelPosLast = uvLast * GBufferDim;
+		depthLast = DepthTextureLast[gBufferPixelPosLast].r;
+	}
+	else
+	{
+		float4 ndcLast = mul(ndc, View.ClipToPrevClip);
+		ndcLast.xyz /= ndcLast.w;
+		depthLast = ndcLast.z;
+		uvLast = (ndcLast.xy * float2(1, -1) + 1) * 0.5;
+		gBufferPixelPosLast = uvLast * GBufferDim;
+	}
+
+	// stores: Z, fwidth(z), z_prev
+	float3 normal = DecodeNormal(NormalTextureThis[ipos].xyz);
+	float deltaN = NormalKernel * 0.1;
+
+	prevIndirect0 = 0;
+	prevIndirect1 = 0;
+	prevMoments = 0;
+
+	bool v[4];
+	const float2 posPrev = uvLast * GBufferDim - 0.5;
+	float2 posPrevColor = posPrev / float2(1 << UpscaleFactorBits);
+	uint2 iposPrev = posPrev;
+	uint2 posPrevColorI;
+	float2 GBufferPosLast = clamp(uvLast * GBufferDim - 0.5, 0, GBufferDim - 1);
+	GetBasePixelCoordFromUpscaledPixelCoord(GBufferPosLast, -1, posPrevColorI, iposPrev, GBufferStep);
+	int2 offset[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+
+	// check for all 4 taps of the bilinear filter for validity
+	bool valid = false;
+	for (int sampleIdx = 0; sampleIdx < 4; sampleIdx++)
+	{
+		int2 loc = iposPrev + offset[sampleIdx] * GBufferStep;
+		float depthPrev = DepthTextureLast[loc].r;
+		float3 normalPrev = DecodeNormal(NormalTextureLast[loc].xyz);
+
+		v[sampleIdx] = IsReprjValid(loc, GBufferDim, depthLast, depthPrev, deltaD, normal, normalPrev, deltaN);
+		valid = valid || v[sampleIdx];
+	}
+
+	if (valid)
+	{
+		float sumw = 0;
+		float x = saturate((GBufferPosLast.x - iposPrev.x) / float(GBufferStep.x));
+		float y = saturate((GBufferPosLast.y - iposPrev.y) / float(GBufferStep.y));
+
+		// bilinear weights
+		float w[4] = { (1 - x) * (1 - y),
+							x * (1 - y),
+					   (1 - x) * y,
+							x * y };
+
+		prevIndirect0 = 0;
+		prevIndirect1 = 0;
+		prevMoments = 0;
+
+		// perform the actual bilinear interpolation
+		for (int sampleIdx = 0; sampleIdx < 4; sampleIdx++)
+		{
+			int2 loc = clamp(posPrevColorI + offset[sampleIdx], 0, DenoiseDim - 1);
+			if (v[sampleIdx])
+			{
+				float Weight = w[sampleIdx];
+				float4 C0Last;
+				float2 C1Last;
+				float VarLast;
+				UnpackColorData(ColorLast[loc], C0Last, C1Last, VarLast);
+				prevIndirect0 += Weight * C0Last;
+				prevIndirect1 += Weight * C1Last;
+				prevMoments += Weight * MomentLast[loc];
+				sumw += Weight;
+			}
+		}
+
+		// redistribute weights in case not all taps were used
+		valid = (sumw >= 0.01);
+		prevIndirect0 = valid ? prevIndirect0 / sumw : 0;
+		prevIndirect1 = valid ? prevIndirect1 / sumw : 0;
+		prevMoments = valid ? prevMoments / sumw : 0;
+		historyLength = prevMoments.a;
+	}
+	if (!valid) // perform cross-bilateral filter in the hope to find some suitable samples somewhere
+	{
+		float cnt = 0.0;
+
+		// this code performs a binary descision for each tap of the cross-bilateral filter
+		const int radius = 1;
+		for (int yy = -radius; yy <= radius; yy++)
+		{
+			for (int xx = -radius; xx <= radius; xx++)
+			{
+				float2 p0 = posPrevColorI + int2(xx, yy);
+				int2 p = iposPrev + int2(xx, yy) * GBufferStep;
+				float depthFilter = DepthTextureLast[p].r;
+				float3 normalFilter = DecodeNormal(NormalTextureLast[p].xyz);
+
+				if (IsReprjValid(p0, DenoiseDim, depth, depthFilter, deltaD, normal, normalFilter, deltaN))
+				{
+					float4 C0Last;
+					float2 C1Last;
+					float VarLast;
+					UnpackColorData(ColorLast[int2(p0)], C0Last, C1Last, VarLast);
+					prevIndirect0 += C0Last;
+					prevIndirect1 += C1Last;
+					prevMoments += MomentLast[int2(p0)];
+					cnt += 1.0;
+				}
+			}
+		}
+		if (cnt > 0)
+		{
+			valid = true;
+			prevIndirect0 /= cnt;
+			prevIndirect1 /= cnt;
+			prevMoments /= cnt;
+			historyLength = prevMoments.a;
+		}
+
+	}
+
+	if (!valid)
+	{
+		prevIndirect0 = 0;
+		prevIndirect1 = 0;
+		prevMoments = float4(0, 0, 0, 0);
+		historyLength = 0;
+	}
+
+	if (any(uvLast <= 0) || any(uvLast >= 1))
+	{
+		valid = false;
+	}
+
+	return valid;
+}
+
+// not used currently
+float ComputeVarianceScale(float numSamples, float loopLength, float alpha)
+{
+	const float aa = (1.0 - alpha) * (1.0 - alpha);
+	return (1.0 - pow(aa, min(loopLength, numSamples))) / (1.0 - aa);
+}
+
+[numthreads(16, 16, 1)]
+void TemporalFilter_CS(uint3 threadIdx : SV_DispatchThreadID)
+{
+	float   gAlpha = BlendWeight;
+	float   gMomentsAlpha = MomentBlendWeight;
+
+	float4 fragCoord = float4(threadIdx.xy + 0.5, 0, 0);
+
+	const int2 ipos = fragCoord.xy;
+
+	float4 indirectLight0;
+	float2 indirectLight1;
+	float RayDist;
+	float AO;
+	bool IsValid = LoadDirectIndirect(ipos, indirectLight0, indirectLight1, RayDist);
+
+	// Scale (instead of clamp) input color in order to preserve hue
+	float indirectLength = UseSH ? length(indirectLight0) : dot(indirectLight0.rgb, 1);
+	if (indirectLength > ColorClamp)
+	{
+		indirectLight0 *= ColorClamp / indirectLength;
+		indirectLight1 *= ColorClamp / indirectLength;
+	}
+
+	float historyLength;
+	float4 prevIndirect0 = 0, prevMoments = 0;
+	float2 prevIndirect1 = 0;
+	bool success = LoadPrevData(fragCoord.xy, prevIndirect0, prevIndirect1, prevMoments, historyLength);
+	float prevAO = prevMoments.b;
+
+	bool enable = Enable;
+	if (enable && !IsValid && success)
+	{
+		ColorThis[ipos] = PackColorData(prevIndirect0, prevIndirect1, 1);
+		MomentThis[ipos] = float4(prevMoments.xyz, 1);
+		return;
+	}
+
+	if (enable == 0)
+	{
+		ColorThis[ipos] = PackColorData(indirectLight0, indirectLight1, 1);
+		MomentThis[ipos] = float4(0, 0, 100000, 1);
+		return;
+	}
+
+	historyLength = min(float(HistoryLength), success ? historyLength + 1.0f : 1.0f);
+
+	// this adjusts the alpha for the case where insufficient history is available.
+	// It boosts the temporal accumulation to give the samples equal weights in
+	// the beginning.
+	float alpha = success ? max(gAlpha, 1.0 / historyLength) : 1.0;
+	const float alphaMoments = success ? max(gMomentsAlpha, 1.0 / historyLength) : 1.0;
+
+	// compute first two moments of luminance
+	float4 moments;
+	const int2 iposG = GetPixelCoord(fragCoord.xy);
+	float3 normal = DecodeNormal(NormalTextureThis[iposG].xyz);
+	moments.r = DenoiseLuminance(indirectLight0, normal, UseSH);
+	moments.g = moments.r * moments.r;
+	moments.b = (1 + exp(-historyLength + 1) * 20) * RayDist;
+	moments.a = 0;
+
+	// temporal integration of the moments
+	moments = lerp(prevMoments, moments, alphaMoments);
+	float variance = max(0, moments.g - moments.r * moments.r);
+
+	// temporal integration of direct and indirect illumination
+	float4 OutIndirect0 = lerp(prevIndirect0, indirectLight0, alpha);
+	float2 OutIndirect1 = lerp(prevIndirect1, indirectLight1, alpha);
+
+	OutIndirect0 = clamp(OutIndirect0, -1e4, 1e4);
+	OutIndirect1 = clamp(OutIndirect1, -1e4, 1e4);
+	ColorThis[ipos] = PackColorData(OutIndirect0, OutIndirect1, variance);
+	MomentThis[ipos] = float4(moments.xyz, historyLength);
+}

@@ -23,6 +23,7 @@
 #include "PostProcess/PostProcessing.h"
 #include "PostProcess/SceneFilterRendering.h"
 #include "HairStrands/HairStrandsRendering.h"
+#include "Fusion/FusionDenoiser.h"
 
 static TAutoConsoleVariable<int32> CVarRestirSkyLightInitialCandidates(
 	TEXT("r.Fusion.SkyLight.InitialSamples"), 4,
@@ -137,6 +138,14 @@ static TAutoConsoleVariable<int32> CVarRestirSkyLightEnableHairVoxel(
 	1,
 	TEXT("Whether to test hair voxels for visibility when evaluating (default = 1)\n"),
 	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRestirSkyLightEnableSkyDenoiser(
+	TEXT("r.Fusion.SkyLight.Denoiser"),
+	1,
+	TEXT("Whether to use restir sky denoiser (default = 1)\n"),
+	ECVF_RenderThreadSafe);
+	
+extern TAutoConsoleVariable<float> CVarRayTracingSkyLightScreenPercentage;
 
 extern float GRayTracingSkyLightMaxRayDistance;
 extern float GRayTracingSkyLightMaxShadowThickness;
@@ -752,312 +761,317 @@ void FDeferredShadingSceneRenderer::PrepareFusionSkyLight(const FViewInfo& View,
 	}
 }
 
+DECLARE_GPU_STAT_NAMED(FusionSkyLighting, TEXT("FusionSkyLighting"));
+
 void FDeferredShadingSceneRenderer::RenderFusionSkyLight(
 	FRDGBuilder& GraphBuilder,
 	FRDGTextureRef SceneColorTexture,
 	FRDGTextureRef& OutSkyLightTexture,
 	FRDGTextureRef& OutHitDistanceTexture)
     {
-        RDG_EVENT_SCOPE(GraphBuilder, "RestirSkyLighting");
-
-      	FSceneTextureParameters SceneTextures = GetSceneTextureParameters(GraphBuilder, Views[0]);
+		FSceneTextureParameters SceneTextures = GetSceneTextureParameters(GraphBuilder, Views[0]);
 		auto& View = Views[0];
 
-        const FViewInfo& ReferenceView = Views[0];
-        const bool bEnableSkylight = true, bUseMISCompensation = true;
-        FPathTracingSkylight SkylightParameters;
-        if( !PrepareSkyTexture(GraphBuilder, Scene, Views[0], bEnableSkylight, bUseMISCompensation, &SkylightParameters) )
+		float	ResolutionFraction = FMath::Clamp(CVarRayTracingSkyLightScreenPercentage.GetValueOnRenderThread() / 100.0f, 0.25f, 1.0f);
+		int32 UpscaleFactor = int32(1.0 / ResolutionFraction);
+		int InitialCandidates = CVarRestirSkyLightInitialCandidates.GetValueOnRenderThread();
+
 		{
-			OutSkyLightTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
-			OutHitDistanceTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
-			return ;
-		}
+			RDG_EVENT_SCOPE(GraphBuilder, "RestirSkyLighting");
+			RDG_GPU_STAT_SCOPE(GraphBuilder, FusionSkyLighting);
+
+			const FViewInfo& ReferenceView = Views[0];
+			const bool bEnableSkylight = true, bUseMISCompensation = true;
+			FPathTracingSkylight SkylightParameters;
+			if( !PrepareSkyTexture(GraphBuilder, Scene, Views[0], bEnableSkylight, bUseMISCompensation, &SkylightParameters) )
+			{
+				OutSkyLightTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+				OutHitDistanceTexture = GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+				return ;
+			}
+			
+			// const int32 SkyTiles = (Scene->SkyLight != nullptr ) ? 16 : 0;
+			// FSkylightRIS SkylightRIS = BuildSkylightRISStructures(GraphBuilder, 256, SkyTiles, ReferenceView);
+
+			FRDGTextureDesc Desc = SceneColorTexture->Desc;
+			Desc.Format = PF_FloatRGBA;
+			Desc.Flags &= ~(TexCreate_FastVRAM);
+			Desc.Extent /= UpscaleFactor;
+			OutSkyLightTexture = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingSkylight"));
+			auto DebugDiffuse = GraphBuilder.CreateTexture(Desc, TEXT("DebugSkylight"));
+
+			Desc.Format = PF_G16R16;
+			OutHitDistanceTexture = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingSkyLightHitDistance"));
+			auto DebugRayDist = GraphBuilder.CreateTexture(Desc, TEXT("DebugSkylightDist"));
+			FIntPoint LightingResolution = ReferenceView.ViewRect.Size();
+
+			const int32 RequestedReservoirs = CVarRestirSkyLightNumReservoirs.GetValueOnAnyThread();
+			const int32 NumReservoirs = FMath::Max(RequestedReservoirs, 1);
+			FIntPoint PaddedSize = Desc.Extent;
+
+			FIntVector ReservoirBufferDim = FIntVector(PaddedSize.X, PaddedSize.Y, NumReservoirs + 1);
+			FRDGBufferDesc ReservoirDesc = FRDGBufferDesc::CreateStructuredDesc(16, ReservoirBufferDim.X * ReservoirBufferDim.Y * ReservoirBufferDim.Z);
+
+			FRDGBufferRef LightReservoirs = GraphBuilder.CreateBuffer(ReservoirDesc, TEXT("SkyLightReservoirs"));
+			
+			FIntVector ReservoirHistoryBufferDim = FIntVector(PaddedSize.X, PaddedSize.Y, NumReservoirs);
+			FRDGBufferDesc ReservoirHistoryDesc = FRDGBufferDesc::CreateStructuredDesc(16, ReservoirHistoryBufferDim.X * ReservoirHistoryBufferDim.Y * ReservoirHistoryBufferDim.Z);
+			FRDGBufferRef LightReservoirsHistory = GraphBuilder.CreateBuffer(ReservoirHistoryDesc, TEXT("SkyLightReservoirsHistory"));
+
+			FRestirSkyLightCommonParameters CommonParameters;
+			CommonParameters.MaxNormalBias = GetRaytracingMaxNormalBias();
+			CommonParameters.TLAS = View.GetRayTracingSceneViewChecked();
+			CommonParameters.RWLightReservoirUAV = GraphBuilder.CreateUAV(LightReservoirs);
+			CommonParameters.ReservoirBufferDim = ReservoirBufferDim;
+			CommonParameters.MaxTemporalHistory = FMath::Max(1, CVarRestirSkyLightTemporalMaxHistory.GetValueOnRenderThread());
+			CommonParameters.SkyLightParameters = SkylightParameters;
+			CommonParameters.SkyLightMaxRayDistance = GRayTracingSkyLightMaxRayDistance;
+			CommonParameters.bSkyLightTransmission = Scene->SkyLight->bTransmission;
+			CommonParameters.SkyLightMaxShadowThickness = GRayTracingSkyLightMaxShadowThickness;
+			CommonParameters.RWDebugDiffuseUAV = GraphBuilder.CreateUAV(DebugDiffuse);
+			CommonParameters.RWDebugRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
 		
-		// const int32 SkyTiles = (Scene->SkyLight != nullptr ) ? 16 : 0;
-		// FSkylightRIS SkylightRIS = BuildSkylightRISStructures(GraphBuilder, 256, SkyTiles, ReferenceView);
+			// CommonParameters.RISSkylightBuffer = GraphBuilder.CreateSRV(SkylightRIS.RISBuffer, PF_R32G32_UINT);
+			// CommonParameters.RISSkylightBufferTiles = SkyTiles;
+			// CommonParameters.RISSkylightBufferTileSize = 256;
+			// CommonParameters.InvSkylightSize = SkylightRIS.InvSize;
+			// CommonParameters.SkylightTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SkylightRIS.EnvTexture));
+			// CommonParameters.SkylightTextureSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 
+			const bool bCameraCut = !ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs.IsValid() || ReferenceView.bCameraCut;
+			const int32 PrevHistoryCount = ReferenceView.PrevViewInfo.RestirSkyLightHistory.ReservoirDimensions.Z;
 
-        int32 UpscaleFactor = 1;//TODO: Calculate UpscaleFactor
-        FRDGTextureDesc Desc = SceneColorTexture->Desc;
-        Desc.Format = PF_FloatRGBA;
-        Desc.Flags &= ~(TexCreate_FastVRAM);
-        Desc.Extent /= UpscaleFactor;
-        OutSkyLightTexture = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingSkylight"));
-        auto DebugDiffuse = GraphBuilder.CreateTexture(Desc, TEXT("DebugSkylight"));
+			int32 InitialSlice = 0;
+			const bool bUseHairLighting = false;
+			for (int32 Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+			{
+				{
+					FSkyLightInitialSamplesRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightInitialSamplesRGS::FParameters>();
 
-        Desc.Format = PF_G16R16;
-		OutHitDistanceTexture = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingSkyLightHitDistance"));
-        auto DebugRayDist = GraphBuilder.CreateTexture(Desc, TEXT("DebugSkylightDist"));
-        FIntPoint LightingResolution = ReferenceView.ViewRect.Size();
+					PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+					PassParameters->SceneTextures = SceneTextures; //SceneTextures;
+					PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
+					PassParameters->OutputSlice = Reservoir;
+					PassParameters->HistoryReservoir = Reservoir;
+					PassParameters->InitialCandidates = FMath::Max(1, InitialCandidates);
+					PassParameters->InitialSampleVisibility = CVarRestirSkyLightTestInitialVisibility.GetValueOnRenderThread();
 
-        const int32 RequestedReservoirs = CVarRestirSkyLightNumReservoirs.GetValueOnAnyThread();
-        const int32 NumReservoirs = FMath::Max(RequestedReservoirs, 1);
-        FIntPoint PaddedSize = Desc.Extent;
+					PassParameters->RestirSkyLightCommonParameters = CommonParameters;
+					FSkyLightInitialSamplesRGS::FPermutationDomain PermutationVector;
+					PermutationVector.Set<FSkyLightInitialSamplesRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
+					PermutationVector.Set<FSkyLightInitialSamplesRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
+					PermutationVector.Set<FSkyLightInitialSamplesRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
 
-        FIntVector ReservoirBufferDim = FIntVector(PaddedSize.X, PaddedSize.Y, NumReservoirs + 1);
-        FRDGBufferDesc ReservoirDesc = FRDGBufferDesc::CreateStructuredDesc(16, ReservoirBufferDim.X * ReservoirBufferDim.Y * ReservoirBufferDim.Z);
+					TShaderMapRef<FSkyLightInitialSamplesRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+					ClearUnusedGraphResources(RayGenShader, PassParameters);
 
-        FRDGBufferRef LightReservoirs = GraphBuilder.CreateBuffer(ReservoirDesc, TEXT("SkyLightReservoirs"));
-        
-        FIntVector ReservoirHistoryBufferDim = FIntVector(PaddedSize.X, PaddedSize.Y, NumReservoirs);
-        FRDGBufferDesc ReservoirHistoryDesc = FRDGBufferDesc::CreateStructuredDesc(16, ReservoirHistoryBufferDim.X * ReservoirHistoryBufferDim.Y * ReservoirHistoryBufferDim.Z);
-        FRDGBufferRef LightReservoirsHistory = GraphBuilder.CreateBuffer(ReservoirHistoryDesc, TEXT("SkyLightReservoirsHistory"));
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("CreateInitialSamples"),
+						PassParameters,
+						ERDGPassFlags::Compute,
+						[PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
+					{
+						FRayTracingShaderBindingsWriter GlobalResources;
+						SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
 
-        FRestirSkyLightCommonParameters CommonParameters;
-		CommonParameters.MaxNormalBias = GetRaytracingMaxNormalBias();
-		CommonParameters.TLAS = View.GetRayTracingSceneViewChecked();
-		CommonParameters.RWLightReservoirUAV = GraphBuilder.CreateUAV(LightReservoirs);
-		CommonParameters.ReservoirBufferDim = ReservoirBufferDim;
-		CommonParameters.MaxTemporalHistory = FMath::Max(1, CVarRestirSkyLightTemporalMaxHistory.GetValueOnRenderThread());
-        CommonParameters.SkyLightParameters = SkylightParameters;
-        CommonParameters.SkyLightMaxRayDistance = GRayTracingSkyLightMaxRayDistance;
-        CommonParameters.bSkyLightTransmission = Scene->SkyLight->bTransmission;
-        CommonParameters.SkyLightMaxShadowThickness = GRayTracingSkyLightMaxShadowThickness;
-        CommonParameters.RWDebugDiffuseUAV = GraphBuilder.CreateUAV(DebugDiffuse);
-        CommonParameters.RWDebugRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
-       
-	   	// CommonParameters.RISSkylightBuffer = GraphBuilder.CreateSRV(SkylightRIS.RISBuffer, PF_R32G32_UINT);
-		// CommonParameters.RISSkylightBufferTiles = SkyTiles;
-		// CommonParameters.RISSkylightBufferTileSize = 256;
-		// CommonParameters.InvSkylightSize = SkylightRIS.InvSize;
-		// CommonParameters.SkylightTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SkylightRIS.EnvTexture));
-		// CommonParameters.SkylightTextureSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+						FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
+						RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
+					});
+				}
 
-	    const bool bCameraCut = !ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs.IsValid() || ReferenceView.bCameraCut;
-        const int32 PrevHistoryCount = ReferenceView.PrevViewInfo.RestirSkyLightHistory.ReservoirDimensions.Z;
-        int InitialCandidates = CVarRestirSkyLightInitialCandidates.GetValueOnRenderThread();
-       	int32 InitialSlice = 0;
-        const bool bUseHairLighting = false;
-        for (int32 Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
-        {
-            {
-                FSkyLightInitialSamplesRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightInitialSamplesRGS::FParameters>();
+				// Temporal candidate merge pass, optionally merged with initial candidate pass
+				if (CVarRestirSkyLightTemporal.GetValueOnRenderThread() != 0 && !bCameraCut && Reservoir < PrevHistoryCount)
+				{
+					{
+						FSkyLightTemporalResamplingRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightTemporalResamplingRGS::FParameters>();
 
-                PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-                PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-                PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
-                PassParameters->OutputSlice = Reservoir;
-                PassParameters->HistoryReservoir = Reservoir;
-                PassParameters->InitialCandidates = FMath::Max(1, InitialCandidates);
-                PassParameters->InitialSampleVisibility = CVarRestirSkyLightTestInitialVisibility.GetValueOnRenderThread();
+						PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+						PassParameters->SceneTextures = SceneTextures; //SceneTextures;
+						PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
 
-                PassParameters->RestirSkyLightCommonParameters = CommonParameters;
-                FSkyLightInitialSamplesRGS::FPermutationDomain PermutationVector;
-                PermutationVector.Set<FSkyLightInitialSamplesRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
-                PermutationVector.Set<FSkyLightInitialSamplesRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
-                PermutationVector.Set<FSkyLightInitialSamplesRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
+						PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
+						PassParameters->InputSlice = Reservoir;
+						PassParameters->OutputSlice = Reservoir;
+						PassParameters->HistoryReservoir = Reservoir;
+						PassParameters->TemporalDepthRejectionThreshold = FMath::Clamp(CVarRestirSkyLightTemporalDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
+						PassParameters->TemporalNormalRejectionThreshold = FMath::Clamp(CVarRestirSkyLightTemporalNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
+						PassParameters->ApplyApproximateVisibilityTest = CVarRestirSkyLightTemporalApplyApproxVisibility.GetValueOnAnyThread();
+						PassParameters->InitialCandidates = FMath::Max(1, InitialCandidates);
+						PassParameters->InitialSampleVisibility = CVarRestirSkyLightTestInitialVisibility.GetValueOnRenderThread();
 
-                TShaderMapRef<FSkyLightInitialSamplesRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
-                ClearUnusedGraphResources(RayGenShader, PassParameters);
+						PassParameters->SpatiallyHashTemporalReprojection = FMath::Clamp(CVarRestirSkyLightTemporalApplySpatialHash.GetValueOnRenderThread(), 0, 1);
 
-                GraphBuilder.AddPass(
-                    RDG_EVENT_NAME("CreateInitialSamples"),
-                    PassParameters,
-                    ERDGPassFlags::Compute,
-                    [PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
-                {
-                    FRayTracingShaderBindingsWriter GlobalResources;
-                    SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
+						PassParameters->LightReservoirHistory = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs));
+						PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, ReferenceView.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+						PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, ReferenceView.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
 
-                    FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
-                    RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
-                });
-            }
+						PassParameters->RestirSkyLightCommonParameters = CommonParameters;
 
-            // Temporal candidate merge pass, optionally merged with initial candidate pass
-            if (CVarRestirSkyLightTemporal.GetValueOnRenderThread() != 0 && !bCameraCut && Reservoir < PrevHistoryCount)
-            {
-                {
-					FSkyLightTemporalResamplingRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightTemporalResamplingRGS::FParameters>();
+						FSkyLightTemporalResamplingRGS::FPermutationDomain PermutationVector;
+						PermutationVector.Set<FSkyLightTemporalResamplingRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
+						PermutationVector.Set<FSkyLightTemporalResamplingRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
+						PermutationVector.Set<FSkyLightTemporalResamplingRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
+						TShaderMapRef<FSkyLightTemporalResamplingRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
 
-                    PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-                    PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-                    PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
+						ClearUnusedGraphResources(RayGenShader, PassParameters);
 
-                    PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
-                    PassParameters->InputSlice = Reservoir;
-                    PassParameters->OutputSlice = Reservoir;
-                    PassParameters->HistoryReservoir = Reservoir;
-                    PassParameters->TemporalDepthRejectionThreshold = FMath::Clamp(CVarRestirSkyLightTemporalDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
-                    PassParameters->TemporalNormalRejectionThreshold = FMath::Clamp(CVarRestirSkyLightTemporalNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
-                    PassParameters->ApplyApproximateVisibilityTest = CVarRestirSkyLightTemporalApplyApproxVisibility.GetValueOnAnyThread();
-                    PassParameters->InitialCandidates = FMath::Max(1, InitialCandidates);
-                    PassParameters->InitialSampleVisibility = CVarRestirSkyLightTestInitialVisibility.GetValueOnRenderThread();
+						GraphBuilder.AddPass(
+							RDG_EVENT_NAME("%sTemporalResample", TEXT("FusedInitialCandidateAnd") ),
+							PassParameters,
+							ERDGPassFlags::Compute,
+							[PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
+						{
+							FRayTracingShaderBindingsWriter GlobalResources;
+							SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
 
-                    PassParameters->SpatiallyHashTemporalReprojection = FMath::Clamp(CVarRestirSkyLightTemporalApplySpatialHash.GetValueOnRenderThread(), 0, 1);
+							FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
+							RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
 
-                    PassParameters->LightReservoirHistory = GraphBuilder.CreateSRV(GraphBuilder.RegisterExternalBuffer(ReferenceView.PrevViewInfo.RestirSkyLightHistory.LightReservoirs));
-                    PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, ReferenceView.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
-                    PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, ReferenceView.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+						});
+					}
+					// Boiling filter pass to prevent runaway samples
+					if (CVarRestirSkyLightApplyBoilingFilter.GetValueOnRenderThread() != 0)
+					{
+						FSkyLightBoilingFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightBoilingFilterCS::FParameters>();
 
-                    PassParameters->RestirSkyLightCommonParameters = CommonParameters;
+						PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
 
-					FSkyLightTemporalResamplingRGS::FPermutationDomain PermutationVector;
-                    PermutationVector.Set<FSkyLightTemporalResamplingRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
-                    PermutationVector.Set<FSkyLightTemporalResamplingRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
-                    PermutationVector.Set<FSkyLightTemporalResamplingRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
-                    TShaderMapRef<FSkyLightTemporalResamplingRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+						PassParameters->RWLightReservoirUAV = GraphBuilder.CreateUAV(LightReservoirs);
+						PassParameters->ReservoirBufferDim = ReservoirBufferDim;
+						PassParameters->InputSlice = Reservoir;
+						PassParameters->OutputSlice = Reservoir;
+						PassParameters->BoilingFilterStrength = FMath::Clamp(CVarRestirSkyLightBoilingFilterStrength.GetValueOnRenderThread(), 0.00001f, 1.0f);
 
-                    ClearUnusedGraphResources(RayGenShader, PassParameters);
+						auto ComputeShader = View.ShaderMap->GetShader<FSkyLightBoilingFilterCS>();
 
-                    GraphBuilder.AddPass(
-                        RDG_EVENT_NAME("%sTemporalResample", TEXT("FusedInitialCandidateAnd") ),
-                        PassParameters,
-                        ERDGPassFlags::Compute,
-                        [PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
-                    {
-                        FRayTracingShaderBindingsWriter GlobalResources;
-                        SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
+						ClearUnusedGraphResources(ComputeShader, PassParameters);
+						FIntPoint GridSize = FMath::DivideAndRoundUp<FIntPoint>(View.ViewRect.Size(), 16);
 
-                        FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
-                        RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
+						FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BoilingFilter"), ComputeShader, PassParameters, FIntVector(GridSize.X, GridSize.Y, 1));
+					}
+				}
+			}
+			// Spatial resampling passes, one per reservoir
+			for (int32 Reservoir = NumReservoirs; Reservoir > 0; Reservoir--)
+			{
+				if (CVarRestirSkyLightSpatial.GetValueOnRenderThread() != 0)
+				{
+					FSkyLightSpatialResamplingRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightSpatialResamplingRGS::FParameters>();
 
-                    });
-                }
-                // Boiling filter pass to prevent runaway samples
-                if (CVarRestirSkyLightApplyBoilingFilter.GetValueOnRenderThread() != 0)
-                {
-                    FSkyLightBoilingFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightBoilingFilterCS::FParameters>();
+					PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+					PassParameters->SceneTextures = SceneTextures; //SceneTextures;
+					PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
 
-                    PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+					PassParameters->InputSlice = Reservoir - 1;
+					PassParameters->OutputSlice = Reservoir;
+					PassParameters->HistoryReservoir = Reservoir - 1;
+					PassParameters->SpatialSamples = FMath::Max(CVarRestirSkyLightSpatialSamples.GetValueOnRenderThread(), 1);
+					PassParameters->SpatialSamplesBoost = FMath::Max(CVarRestirSkyLightSpatialSamplesBoost.GetValueOnRenderThread(), 1);
+					PassParameters->SpatialSamplingRadius = FMath::Max(1.0f, CVarRestirSkyLightSpatialSamplingRadius.GetValueOnRenderThread());
+					PassParameters->SpatialDepthRejectionThreshold = FMath::Clamp(CVarRestirSkyLightSpatialDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
+					PassParameters->SpatialNormalRejectionThreshold = FMath::Clamp(CVarRestirSkyLightSpatialNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
+					PassParameters->ApplyApproximateVisibilityTest = CVarRestirSkyLightSpatialApplyApproxVisibility.GetValueOnRenderThread();
+					PassParameters->DiscountNaiveSamples = CVarRestirSkyLightSpatialDiscountNaiveSamples.GetValueOnRenderThread();
 
-                    PassParameters->RWLightReservoirUAV = GraphBuilder.CreateUAV(LightReservoirs);
-                    PassParameters->ReservoirBufferDim = ReservoirBufferDim;
-                    PassParameters->InputSlice = Reservoir;
-                    PassParameters->OutputSlice = Reservoir;
-                    PassParameters->BoilingFilterStrength = FMath::Clamp(CVarRestirSkyLightBoilingFilterStrength.GetValueOnRenderThread(), 0.00001f, 1.0f);
+					PassParameters->NeighborOffsetMask = GDiscSampleBuffer.NumSamples - 1;
+					PassParameters->NeighborOffsets = GDiscSampleBuffer.DiscSampleBufferSRV;
+					PassParameters->RestirSkyLightCommonParameters = CommonParameters;
 
-                    auto ComputeShader = View.ShaderMap->GetShader<FSkyLightBoilingFilterCS>();
+					FSkyLightSpatialResamplingRGS::FPermutationDomain PermutationVector;
+					PermutationVector.Set<FSkyLightSpatialResamplingRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
+						PermutationVector.Set<FSkyLightSpatialResamplingRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
+						PermutationVector.Set<FSkyLightSpatialResamplingRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
+					TShaderMapRef<FSkyLightSpatialResamplingRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+					ClearUnusedGraphResources(RayGenShader, PassParameters);
 
-                    ClearUnusedGraphResources(ComputeShader, PassParameters);
-                    FIntPoint GridSize = FMath::DivideAndRoundUp<FIntPoint>(View.ViewRect.Size(), 16);
+					GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SpatialResample"),
+						PassParameters,
+						ERDGPassFlags::Compute,
+						[PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
+					{
+						FRayTracingShaderBindingsWriter GlobalResources;
+						SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
 
-                    FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("BoilingFilter"), ComputeShader, PassParameters, FIntVector(GridSize.X, GridSize.Y, 1));
-                }
-            }
-        }
-        // Spatial resampling passes, one per reservoir
-        for (int32 Reservoir = NumReservoirs; Reservoir > 0; Reservoir--)
-        {
-            if (CVarRestirSkyLightSpatial.GetValueOnRenderThread() != 0)
-            {
-                FSkyLightSpatialResamplingRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightSpatialResamplingRGS::FParameters>();
+						FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
+						RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
 
-                PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-                PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-                PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
+					});
+					InitialSlice = Reservoir;
+				}
+			}
 
-                PassParameters->InputSlice = Reservoir - 1;
-                PassParameters->OutputSlice = Reservoir;
-                PassParameters->HistoryReservoir = Reservoir - 1;
-                PassParameters->SpatialSamples = FMath::Max(CVarRestirSkyLightSpatialSamples.GetValueOnRenderThread(), 1);
-                PassParameters->SpatialSamplesBoost = FMath::Max(CVarRestirSkyLightSpatialSamplesBoost.GetValueOnRenderThread(), 1);
-                PassParameters->SpatialSamplingRadius = FMath::Max(1.0f, CVarRestirSkyLightSpatialSamplingRadius.GetValueOnRenderThread());
-                PassParameters->SpatialDepthRejectionThreshold = FMath::Clamp(CVarRestirSkyLightSpatialDepthRejectionThreshold.GetValueOnRenderThread(), 0.0f, 1.0f);
-                PassParameters->SpatialNormalRejectionThreshold = FMath::Clamp(CVarRestirSkyLightSpatialNormalRejectionThreshold.GetValueOnRenderThread(), -1.0f, 1.0f);
-                PassParameters->ApplyApproximateVisibilityTest = CVarRestirSkyLightSpatialApplyApproxVisibility.GetValueOnRenderThread();
-                PassParameters->DiscountNaiveSamples = CVarRestirSkyLightSpatialDiscountNaiveSamples.GetValueOnRenderThread();
+			//Shading evaluation pass
+			{
 
-                PassParameters->NeighborOffsetMask = GDiscSampleBuffer.NumSamples - 1;
-                PassParameters->NeighborOffsets = GDiscSampleBuffer.DiscSampleBufferSRV;
-                PassParameters->RestirSkyLightCommonParameters = CommonParameters;
+				FSkyLightEvaluateRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightEvaluateRGS::FParameters>();
 
-				FSkyLightSpatialResamplingRGS::FPermutationDomain PermutationVector;
-                 PermutationVector.Set<FSkyLightSpatialResamplingRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
-                    PermutationVector.Set<FSkyLightSpatialResamplingRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
-                    PermutationVector.Set<FSkyLightSpatialResamplingRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
-                TShaderMapRef<FSkyLightSpatialResamplingRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
-                ClearUnusedGraphResources(RayGenShader, PassParameters);
+				PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+				PassParameters->SceneTextures = SceneTextures; //SceneTextures;
+				PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
+				PassParameters->RWDiffuseUAV = GraphBuilder.CreateUAV(OutSkyLightTexture);
+				PassParameters->RWRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
+				PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
+				PassParameters->RWLightReservoirHistoryUAV = GraphBuilder.CreateUAV(LightReservoirsHistory);
+				PassParameters->InputSlice = InitialSlice;
+				PassParameters->NumReservoirs = NumReservoirs;
+				PassParameters->FeedbackVisibility = CVarRestirSkyLightFeedbackVisibility.GetValueOnRenderThread();
 
-                GraphBuilder.AddPass(
-                    RDG_EVENT_NAME("SpatialResample"),
-                    PassParameters,
-                    ERDGPassFlags::Compute,
-                    [PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
-                {
-                    FRayTracingShaderBindingsWriter GlobalResources;
-                    SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
+				// if (bUseHairLighting)
+				// {
+				//     const bool bUseHairVoxel = CVarRestirSkyLightEnableHairVoxel.GetValueOnRenderThread() > 0;
+				//     PassParameters->bUseHairVoxel = (bUseHairDeepShadow && bUseHairVoxel) ? 1 : 0;
+					
+				//     //EHartNV ToDo: change to strand data
+				//     // old PassParameters->HairCategorizationTexture = HairResources.CategorizationTexture;
+				//     // new? PassParameters->HairStrands = HairStrands::BindHairStrandsViewUniformParameters(View);
+				//     PassParameters->HairLightChannelMaskTexture = View.HairStrandsViewData.VisibilityData.LightChannelMaskTexture;
+				//     PassParameters->VirtualVoxel = HairStrands::BindHairStrandsVoxelUniformParameters(View);
+				// }
 
-                    FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
-                    RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
+				PassParameters->RestirSkyLightCommonParameters = CommonParameters;
+				FSkyLightEvaluateRGS::FPermutationDomain PermutationVector;
+				PermutationVector.Set<FSkyLightEvaluateRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
+				PermutationVector.Set<FSkyLightEvaluateRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
+				PermutationVector.Set<FSkyLightEvaluateRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
+				TShaderMapRef<FSkyLightEvaluateRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
 
-                });
-                InitialSlice = Reservoir;
-            }
-        }
+				ClearUnusedGraphResources(RayGenShader, PassParameters);
 
-        //Shading evaluation pass
-        {
+				GraphBuilder.AddPass(
+					RDG_EVENT_NAME("ShadeSamples"),
+					PassParameters,
+					ERDGPassFlags::Compute,
+					[PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
+				{
+					FRayTracingShaderBindingsWriter GlobalResources;
+					SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
 
-            FSkyLightEvaluateRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FSkyLightEvaluateRGS::FParameters>();
+					FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
+					RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
+				});
+			}
 
-            PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-            PassParameters->SceneTextures = SceneTextures; //SceneTextures;
-            PassParameters->SSProfilesTexture = View.RayTracingSubSurfaceProfileTexture;
-            PassParameters->RWDiffuseUAV = GraphBuilder.CreateUAV(OutSkyLightTexture);
-            PassParameters->RWRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
-            PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
-            PassParameters->RWLightReservoirHistoryUAV = GraphBuilder.CreateUAV(LightReservoirsHistory);
-            PassParameters->InputSlice = InitialSlice;
-            PassParameters->NumReservoirs = NumReservoirs;
-            PassParameters->FeedbackVisibility = CVarRestirSkyLightFeedbackVisibility.GetValueOnRenderThread();
+			if( !ReferenceView.bStatePrevViewInfoIsReadOnly)
+			{
+				//Extract history feedback here
+				GraphBuilder.QueueBufferExtraction(LightReservoirsHistory, &ReferenceView.ViewState->PrevFrameViewInfo.RestirSkyLightHistory.LightReservoirs);
 
-            // if (bUseHairLighting)
-            // {
-            //     const bool bUseHairVoxel = CVarRestirSkyLightEnableHairVoxel.GetValueOnRenderThread() > 0;
-            //     PassParameters->bUseHairVoxel = (bUseHairDeepShadow && bUseHairVoxel) ? 1 : 0;
-                
-            //     //EHartNV ToDo: change to strand data
-            //     // old PassParameters->HairCategorizationTexture = HairResources.CategorizationTexture;
-            //     // new? PassParameters->HairStrands = HairStrands::BindHairStrandsViewUniformParameters(View);
-            //     PassParameters->HairLightChannelMaskTexture = View.HairStrandsViewData.VisibilityData.LightChannelMaskTexture;
-            //     PassParameters->VirtualVoxel = HairStrands::BindHairStrandsVoxelUniformParameters(View);
-            // }
+				//Extract scene textures as each effect potentially using them most do so to ensure it happens
+				GraphBuilder.QueueTextureExtraction(SceneTextures.GBufferATexture, &ReferenceView.ViewState->PrevFrameViewInfo.GBufferA);
+				GraphBuilder.QueueTextureExtraction(SceneTextures.SceneDepthTexture, &ReferenceView.ViewState->PrevFrameViewInfo.DepthBuffer);
 
-            PassParameters->RestirSkyLightCommonParameters = CommonParameters;
-            FSkyLightEvaluateRGS::FPermutationDomain PermutationVector;
-            PermutationVector.Set<FSkyLightEvaluateRGS::FEnableTwoSidedGeometryDim>(CVarRayTracingSkyLightEnableTwoSidedGeometry.GetValueOnRenderThread() != 0);
-            PermutationVector.Set<FSkyLightEvaluateRGS::FEnableMaterialsDim>(CVarRayTracingSkyLightEnableMaterials.GetValueOnRenderThread() != 0);
-            PermutationVector.Set<FSkyLightEvaluateRGS::FHairLighting>(bUseHairLighting ? 1 : 0);
-            TShaderMapRef<FSkyLightEvaluateRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
-
-            ClearUnusedGraphResources(RayGenShader, PassParameters);
-
-            GraphBuilder.AddPass(
-                RDG_EVENT_NAME("ShadeSamples"),
-                PassParameters,
-                ERDGPassFlags::Compute,
-                [PassParameters, this, &View, RayGenShader, LightingResolution](FRHIRayTracingCommandList& RHICmdList)
-            {
-                FRayTracingShaderBindingsWriter GlobalResources;
-                SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
-
-                FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
-                RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, LightingResolution.X, LightingResolution.Y);
-            });
-        }
-
-        if( !ReferenceView.bStatePrevViewInfoIsReadOnly)
-        {
-            //Extract history feedback here
-            GraphBuilder.QueueBufferExtraction(LightReservoirsHistory, &ReferenceView.ViewState->PrevFrameViewInfo.RestirSkyLightHistory.LightReservoirs);
-
-            //Extract scene textures as each effect potentially using them most do so to ensure it happens
-            GraphBuilder.QueueTextureExtraction(SceneTextures.GBufferATexture, &ReferenceView.ViewState->PrevFrameViewInfo.GBufferA);
-            GraphBuilder.QueueTextureExtraction(SceneTextures.SceneDepthTexture, &ReferenceView.ViewState->PrevFrameViewInfo.DepthBuffer);
-
-            ReferenceView.ViewState->PrevFrameViewInfo.RestirSkyLightHistory.ReservoirDimensions = ReservoirHistoryBufferDim;
-        }
-
+				ReferenceView.ViewState->PrevFrameViewInfo.RestirSkyLightHistory.ReservoirDimensions = ReservoirHistoryBufferDim;
+			}
+		}
         //Denoise
         {
             const IScreenSpaceDenoiser* DefaultDenoiser = IScreenSpaceDenoiser::GetDefaultDenoiser();
-            const IScreenSpaceDenoiser* DenoiserToUse = DefaultDenoiser;// GRayTracingGlobalIlluminationDenoiser == 1 ? DefaultDenoiser : GScreenSpaceDenoiser;
+            const IScreenSpaceDenoiser* DenoiserToUse = CVarRestirSkyLightEnableSkyDenoiser.GetValueOnRenderThread() ? FFusionDenoiser::GetDenoiser() : DefaultDenoiser;// GRayTracingGlobalIlluminationDenoiser == 1 ? DefaultDenoiser : GScreenSpaceDenoiser;
 
             IScreenSpaceDenoiser::FDiffuseIndirectInputs DenoiserInputs;
             DenoiserInputs.Color = OutSkyLightTexture;
             DenoiserInputs.RayHitDistance = OutHitDistanceTexture;
-	        float ResolutionFraction = 1.0f / UpscaleFactor;
             {
                 IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig RayTracingConfig;
                 RayTracingConfig.ResolutionFraction = ResolutionFraction;

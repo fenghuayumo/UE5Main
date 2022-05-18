@@ -912,6 +912,7 @@ void FDeferredShadingSceneRenderer::PrepareRayTracingGlobalIllumination(const FV
 	{
 		return;
 	}
+	CheckCameraSwitch(View);
 	bool bValidateReservoir = ShouldValidateReservoir(View);
 	const bool bSortMaterials = CVarRayTracingGlobalIlluminationFinalGatherSortMaterials.GetValueOnRenderThread() != 0 && !bValidateReservoir;
 	const bool bReservoirResampling = CVarRayTracingGlobalIlluminationFinalGatherUseReservoirResampling.GetValueOnRenderThread() != 0;
