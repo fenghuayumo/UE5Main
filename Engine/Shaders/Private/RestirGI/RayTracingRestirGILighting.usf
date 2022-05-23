@@ -1280,26 +1280,26 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 					// when use uniformhemisphere sampling, the pdf is 1.0 / 2pi, where brdf is nol / pi  
 					DiffuseExitantRadiance +=  risSample.sampleRef.Irradiance * risSample.weightSum  ;
 				}
-				// else
-				// {
-				// 	if (FeedbackVisibility)
-				// 	{
-				// 		risSample.weightSum = 0.0f;
-				// 		risSample.targetPdf = 0.0f;
-                //         risSample.M = 0;
-				// 	}
-				// }
+				else
+				{
+					if (FeedbackVisibility)
+					{
+						risSample.weightSum = 0.0f;
+						risSample.targetPdf = 0.0f;
+                        risSample.M = 0;
+					}
+				}
 			}
-			// else
-			// {
-			// 	// sample occluded, kill it for the history
-			// 	risSample = RTXGI_Reservoir::Empty();
-			// }
+			else
+			{
+				// sample occluded, kill it for the history
+				risSample = RTXGI_Reservoir::Empty();
+			}
 			// if (UseFireflySuppression)
 			// {
 			// 	DiffuseExitantRadiance *= rcp(1.0 + Luminance(DiffuseExitantRadiance));
 			// }
-			// WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+			WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
 		}
 
 		// Apply the pre-exposure scale to the resulting shaded value
@@ -1309,12 +1309,13 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 
 		DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance);
 	}
-	// else
+	else
 	{
 		// Invalid pixel, write empty reservoir
-		//for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
+		// for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
-			WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0 + 0));
+			WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+			//WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0 + 0));
 		}
 	}
 
