@@ -163,7 +163,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FRestirSkyLightCommonParameters, )
     SHADER_PARAMETER(int, bSkyLightTransmission)
     SHADER_PARAMETER(float, SkyLightMaxShadowThickness)
     
-     SHADER_PARAMETER_STRUCT_INCLUDE(FPathTracingSkylight, SkyLightParameters)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FPathTracingSkylight, SkyLightParameters)
 	//SHADER_PARAMETER(int32, RISSkylightBufferTiles)
 	//SHADER_PARAMETER(int32, RISSkylightBufferTileSize)
 	//SHADER_PARAMETER_RDG_BUFFER_SRV(Buffer<uint2>, RISSkylightBuffer)
@@ -173,6 +173,8 @@ BEGIN_SHADER_PARAMETER_STRUCT(FRestirSkyLightCommonParameters, )
 
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugDiffuseUAV)
     SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, RWDebugRayDistanceUAV)
+	SHADER_PARAMETER(uint32, UpscaleFactor)
+	
 END_SHADER_PARAMETER_STRUCT()
 
 class FSkyLightInitialSamplesRGS : public FGlobalShader
@@ -246,7 +248,7 @@ class FSkyLightTemporalResamplingRGS : public FGlobalShader
 		SHADER_PARAMETER(int32, InitialCandidates)
 		SHADER_PARAMETER(int32, InitialSampleVisibility)
 		SHADER_PARAMETER(int32, SpatiallyHashTemporalReprojection)
-
+		
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
 
 		SHADER_PARAMETER(FIntVector, ReservoirHistoryBufferDim)
@@ -803,7 +805,7 @@ void FDeferredShadingSceneRenderer::RenderFusionSkyLight(
 			Desc.Format = PF_G16R16;
 			OutHitDistanceTexture = GraphBuilder.CreateTexture(Desc, TEXT("RayTracingSkyLightHitDistance"));
 			auto DebugRayDist = GraphBuilder.CreateTexture(Desc, TEXT("DebugSkylightDist"));
-			FIntPoint LightingResolution = ReferenceView.ViewRect.Size();
+			FIntPoint LightingResolution = ReferenceView.ViewRect.Size() / UpscaleFactor;
 
 			const int32 RequestedReservoirs = CVarRestirSkyLightNumReservoirs.GetValueOnAnyThread();
 			const int32 NumReservoirs = FMath::Max(RequestedReservoirs, 1);
@@ -830,7 +832,7 @@ void FDeferredShadingSceneRenderer::RenderFusionSkyLight(
 			CommonParameters.SkyLightMaxShadowThickness = GRayTracingSkyLightMaxShadowThickness;
 			CommonParameters.RWDebugDiffuseUAV = GraphBuilder.CreateUAV(DebugDiffuse);
 			CommonParameters.RWDebugRayDistanceUAV = GraphBuilder.CreateUAV(OutHitDistanceTexture);
-		
+			CommonParameters.UpscaleFactor	= UpscaleFactor;
 			// CommonParameters.RISSkylightBuffer = GraphBuilder.CreateSRV(SkylightRIS.RISBuffer, PF_R32G32_UINT);
 			// CommonParameters.RISSkylightBufferTiles = SkyTiles;
 			// CommonParameters.RISSkylightBufferTileSize = 256;

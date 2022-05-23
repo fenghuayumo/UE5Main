@@ -67,6 +67,7 @@ int 	bSkyLightTransmission;
 float 	SkyLightMaxShadowThickness;
 int 	FeedbackVisibility;
 int 	InitialSampleVisibility;
+uint 	UpscaleFactor;
 
 float SpatialDepthRejectionThreshold;
 float SpatialNormalRejectionThreshold;
@@ -175,6 +176,7 @@ float GetApproximateLightSampleWeight(float3 TranslatedWorldPosition, float3 Cam
 
 
 void ProduceInitialSample(
+	uint2 DispatchThreadId,
 	uint2 PixelCoord,
 	FGBufferData GBuffer,
 	float DeviceZ,
@@ -304,7 +306,7 @@ void ProduceInitialSample(
 			RayHitDist = MinimalPayload.HitT;
 		}
 	}
-	RWDebugRayDistanceUAV[PixelCoord] = float2(RayHitDist, 1.0);
+	RWDebugRayDistanceUAV[DispatchThreadId] = float2(RayHitDist, 1.0);
 	state.FinalizeResampling(1.0, 1.0);
 	state.M = 1;
 }
@@ -320,8 +322,11 @@ void ProduceInitialSample(
  ***************************************************************************************************/
 RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
 {
-	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
-	RWDebugRayDistanceUAV[PixelCoord] = float2(0,0);
+	//uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+
+	RWDebugRayDistanceUAV[DispatchThreadId] = float2(0,0);
 
 	uint LinearIndex = CalcLinearIndex(PixelCoord);
 	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + INITIAL_SAMPLE_PASS_NUM * 63);
@@ -357,47 +362,47 @@ RAY_TRACING_ENTRY_RAYGEN(GenerateInitialSamplesRGS)
 
 	if (bIsValidPixel)
 	{
-		ProduceInitialSample(PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, CoherentRandContext, state);
+		ProduceInitialSample(DispatchThreadId,PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, CoherentRandContext, state);
 	}
 
-	WriteReservoirData(PixelCoord,OutputSlice, state.Store());
+	WriteReservoirData(DispatchThreadId,OutputSlice, state.Store());
 
-	// float2 LightUV = state.sampleRef.GetUV();
-	// float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
-	// const half3 N = GBuffer.WorldNormal;
-	// const half3 V = -CameraDirection;
-	// const half3 L = normalize(EquiAreaSphericalMapping(LightUV).zxy);
-	// const float NoL = saturate(dot(N,L));
-	// FDirectLighting LightingSample;
-	// if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
-	// {
-	// 	float Shadow = 0.0;
-	// 	float Backlit = 0.0;
-	// 	float Area = 0.0;
-	// 	uint2 Random = 0;
-	// 	FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
-	// 	LightingSample.Diffuse = HairShading(GBuffer, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
-	// 	LightingSample.Transmission = 0;
-	// 	LightingSample.Specular = 0;
-	// }
-	// else
-	// {
-	// 	FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
-	// 	LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
-	// }
-	// float3 DiffuseThroughput = LightingSample.Diffuse;
-	// if (bSkyLightTransmission)
-	// {
-	// 	DiffuseThroughput += LightingSample.Transmission;
-	// }
-	// float3 DiffuseExitantRadiance = IncomingRadiance * DiffuseThroughput *  state.weightSum;
-	// DiffuseExitantRadiance.r = Albedo.r > 0.0 ? DiffuseExitantRadiance.r / Albedo.r : DiffuseExitantRadiance.r;
-	// DiffuseExitantRadiance.g = Albedo.g > 0.0 ? DiffuseExitantRadiance.g / Albedo.g : DiffuseExitantRadiance.g;
-	// DiffuseExitantRadiance.b = Albedo.b > 0.0 ? DiffuseExitantRadiance.b / Albedo.b : DiffuseExitantRadiance.b;
-	// DiffuseExitantRadiance.rgb *= View.PreExposure;
+	float2 LightUV = state.sampleRef.GetUV();
+	float3 IncomingRadiance =  SkylightTexture.SampleLevel(SkylightTextureSampler, LightUV, 0).xyz;
+	const half3 N = GBuffer.WorldNormal;
+	const half3 V = -CameraDirection;
+	const half3 L = normalize(EquiAreaSphericalMapping(LightUV).zxy);
+	const float NoL = saturate(dot(N,L));
+	FDirectLighting LightingSample;
+	if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR)
+	{
+		float Shadow = 0.0;
+		float Backlit = 0.0;
+		float Area = 0.0;
+		uint2 Random = 0;
+		FHairTransmittanceData HairTransmittance = InitHairTransmittanceData(false);
+		LightingSample.Diffuse = HairShading(GBuffer, L, V, N, Shadow, HairTransmittance, Backlit, Area, Random);
+		LightingSample.Transmission = 0;
+		LightingSample.Specular = 0;
+	}
+	else
+	{
+		FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		LightingSample = EvaluateBxDF(GBuffer, N, V, L, NoL, ShadowTerms);
+	}
+	float3 DiffuseThroughput = LightingSample.Diffuse;
+	if (bSkyLightTransmission)
+	{
+		DiffuseThroughput += LightingSample.Transmission;
+	}
+	float3 DiffuseExitantRadiance = IncomingRadiance * DiffuseThroughput *  state.weightSum;
+	DiffuseExitantRadiance.r = Albedo.r > 0.0 ? DiffuseExitantRadiance.r / Albedo.r : DiffuseExitantRadiance.r;
+	DiffuseExitantRadiance.g = Albedo.g > 0.0 ? DiffuseExitantRadiance.g / Albedo.g : DiffuseExitantRadiance.g;
+	DiffuseExitantRadiance.b = Albedo.b > 0.0 ? DiffuseExitantRadiance.b / Albedo.b : DiffuseExitantRadiance.b;
+	DiffuseExitantRadiance.rgb *= View.PreExposure;
 
-	// DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance.rgb);
-	// RWDebugDiffuseUAV[PixelCoord] = float4(IncomingRadiance * View.PreExposure * state.weightSum, 1.0);
+	DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance.rgb);
+	RWDebugDiffuseUAV[DispatchThreadId] = float4(DiffuseExitantRadiance * View.PreExposure * state.weightSum, 1.0);
 }
 
 // Permutation for temporal sampling to increase noise
@@ -428,7 +433,10 @@ int2 ApplyPermutationSampling(int2 InPosition)
  ***************************************************************************************************/
 RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 {
-	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	//uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchDimension = DispatchRaysDimensions().xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
 
 	if (any(DispatchRaysIndex().xy > View.ViewSizeAndInvSize.xy))
 	{
@@ -437,10 +445,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 
 	uint LinearIndex = CalcLinearIndex(PixelCoord);
 	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + 63 * TEMPORAL_SAMPLE_PASS_NUM);
-
-	// seed an RNG to be coherent across a small tile
-	uint CoherentLinearIndex = CalcLinearIndex(DispatchRaysIndex().xy / 8);
-	FRandomContext CoherentRandContext = FRandomContext::Create(CoherentLinearIndex, View.StateFrameIndex + HistoryReservoir * 32 + 63 * INITIAL_SAMPLE_PASS_NUM);
 
 	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
@@ -455,21 +459,19 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 
 	if (bIsValidPixel)
 	{
-		RTXDI_SDK_Reservoir curSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice));
+		RTXDI_SDK_Reservoir curSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
 		int historyLimit = min(RTXDI_SDK_Reservoir::MaxM,MaxTemporalHistory * curSample.M);
 
 		state.CombineReservoirs(curSample, /* random = */ 0.5, curSample.targetPdf);
 
 		// Backproject this pixel to last frame
 
-		// start by just using our sample position
+			// start by just using our sample position
 		int2 prevPos = PixelCoord;
-		float ExpectedPrevLinearDepth = GBuffer.Depth;
-
-		float2 ViewUV = (DispatchRaysIndex().xy + 0.5) * View.ViewSizeAndInvSize.zw;
-		float4 NDC = float4(ViewUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
-
-
+		float SceneDepth =  GBuffer.Depth;
+		float ExpectedPrevLinearDepth = SceneDepth;
+		float2 BufferUV = (PixelCoord + 0.5) * View.ViewSizeAndInvSize.zw;
+		float4 NDC = float4(BufferUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
 #if GBUFFER_HAS_VELOCITY && 0
 		// Some objects can get marked as not having velocities, which leads to DecodeGBuffer zeroing them
 		// This appears to be errant under some conditions, so overriding the rejection produces better results
@@ -480,12 +482,7 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			float2 Velocity = DecodeVelocityFromTexture(GBuffer.Velocity).xy;
 			float2 PrevNDC = NDC.xy - Velocity;
 			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
-
-			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
-			//PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
-
 			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
-
 			ExpectedPrevLinearDepth = ConvertFromDeviceZ(DeviceZ - DecodeVelocityFromTexture(GBuffer.Velocity).z);
 		}
 		else
@@ -493,10 +490,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 			float4 PrevNDC = mul(NDC, View.ClipToPrevClip);
 			PrevNDC.xyz /= PrevNDC.w;
 			float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
-
-			// randomize selection within the footprint of the back-projected sample and clamp to the viewport extents
-			//PrevUV = saturate(PrevUV + (RandContext.GenerateSample2D() - 0.5) * View.ViewSizeAndInvSize.zw);
-
 			prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
 
 			ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
@@ -504,7 +497,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 
 		//ToDo - full GBuffer not available for last frame, so we're going to need to approximate using current + channels we have
 		// could make a better approximation than what is used here
-		FGBufferData PrevGBuffer = GBuffer;
 		bool foundNeighbor = false;
 		const float radius = 3;
 
@@ -518,10 +510,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 				offset = int2((RandContext.GenerateSample2D() - 0.5f) * radius);
 				idx = prevPos + offset;
 			}
-			// else
-			// {
-			// 	idx = ApplyPermutationSampling(idx);
-			// }
 
 			float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
 			float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
@@ -537,9 +525,6 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 				continue;
 			}
 
-			PrevGBuffer.WorldNormal = PrevWorldNormal;
-			PrevGBuffer.Depth = PrevDepth;
-
 			prevPos = idx;
 			foundNeighbor = true;
 			break;
@@ -553,7 +538,9 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 		{
 			// Resample the previous frame sample into the current reservoir, but reduce the light's weight
 			// according to the bilinear weight of the current pixel
-			RTXDI_SDK_Reservoir prevSample = RTXDI_SDK_Reservoir::Load(ReadReservoirHistoryData(prevPos, HistoryReservoir));
+			const uint2 prePosId = clamp(floor(prevPos / float(UpscaleFactor)  ), uint2(0,0), ReservoirHistoryBufferDim.xy - 1);
+
+			RTXDI_SDK_Reservoir prevSample = RTXDI_SDK_Reservoir::Load(ReadReservoirHistoryData(prePosId, HistoryReservoir));
 			prevSample.M = min(prevSample.M, historyLimit);
 
 			if (prevSample.sampleRef.IsValid())
@@ -616,10 +603,10 @@ RAY_TRACING_ENTRY_RAYGEN(ApplyTemporalResamplingRGS)
 // #endif
 	}
 
-	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
 }
 
-void ApplySpatialResampling(uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 TranslatedWorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXDI_SDK_Reservoir state)
+void ApplySpatialResampling(uint2 DispatchThreadId,uint2 PixelCoord, FGBufferData GBuffer, float DeviceZ, float3 TranslatedWorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout RTXDI_SDK_Reservoir state)
 {
 	// We loop through neighbors twice.  Cache the validity / edge-stopping function
 	//   results for the 2nd time through.
@@ -628,7 +615,7 @@ void ApplySpatialResampling(uint2 PixelCoord, FGBufferData GBuffer, float Device
 	// This is the weight we'll use (instead of 1/M) to make our estimate unbaised (see paper).
 	float normalizationWeight = 1.0f;
 
-	RTXDI_SDK_Reservoir centerSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice));
+	RTXDI_SDK_Reservoir centerSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
 
 	int selected = -1;
 
@@ -699,8 +686,8 @@ void ApplySpatialResampling(uint2 PixelCoord, FGBufferData GBuffer, float Device
 		{
 			continue;
 		}
-
-		RTXDI_SDK_Reservoir neighborSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(SampleCoord, InputSlice));
+		uint2 samplePosID = clamp(floor(SampleCoord / float(UpscaleFactor) ), uint2(0,0), ReservoirBufferDim.xy - 1);
+		RTXDI_SDK_Reservoir neighborSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(samplePosID, InputSlice));
 
 		float WeightScale = 1.0;
 		if (DiscountNaiveSamples && neighborSample.M <= 2)
@@ -802,7 +789,9 @@ void ApplySpatialResampling(uint2 PixelCoord, FGBufferData GBuffer, float Device
 
 RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
 {
-	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	//uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
 
 	if (any(DispatchRaysIndex().xy > View.ViewSizeAndInvSize.xy))
 	{
@@ -825,10 +814,10 @@ RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
 
 	if (bIsValidPixel)
 	{
-		ApplySpatialResampling(PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, state);
+		ApplySpatialResampling(DispatchThreadId,PixelCoord, GBuffer, DeviceZ, TranslatedWorldPosition, CameraDirection, RandContext, state);
 	}
 
-	WriteReservoirData(PixelCoord, OutputSlice, state.Store());
+	WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
 }
 
 /***************************************************************************************************
@@ -840,9 +829,11 @@ RAY_TRACING_ENTRY_RAYGEN(ApplySpatialResamplingRGS)
  ***************************************************************************************************/
 RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 {
+	// uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+	uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
 
-	uint2 PixelCoord = DispatchRaysIndex().xy + View.ViewRectMin.xy;
-	RWDebugDiffuseUAV[PixelCoord] = float4(0,0,0,0);
+	//RWDebugDiffuseUAV[DispatchThreadId] = float4(0,0,0,0);
 	uint LinearIndex = CalcLinearIndex(PixelCoord);
 	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + EVALUATION_PASS_NUM * 63);
 
@@ -880,7 +871,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 	{
 		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
-			risSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(PixelCoord, InputSlice + Reservoir));
+			risSample = RTXDI_SDK_Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice + Reservoir));
 
 			if (risSample.sampleRef.IsValid())
 			{
@@ -973,7 +964,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 					}
 					DiffuseExitantRadiance += IncomingRadiance * DiffuseThroughput *  risSample.weightSum;
 
-					RWDebugDiffuseUAV[PixelCoord] = float4(IncomingRadiance * View.PreExposure * risSample.weightSum, 1.0);
+					//RWDebugDiffuseUAV[DispatchThreadId] = float4(IncomingRadiance * View.PreExposure * risSample.weightSum, 1.0);
 				}
 			}
 			// else
@@ -981,7 +972,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 			// 	// sample occluded, kill it for the history
 			// 	risSample = RTXDI_SDK_Reservoir::Empty();
 			// }
-			// WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
+			// WriteReservoirHistoryData(DispatchThreadId, Reservoir, risSample.Store());
 			
 		}
 		//ExitantRadiance /= float(NumReservoirs);
@@ -997,7 +988,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 		for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
 			// WriteReservoirHistoryData(PixelCoord, Reservoir, risSample.Store());
-			WriteReservoirHistoryData(PixelCoord , Reservoir, ReadReservoirData(PixelCoord, 0));
+			WriteReservoirHistoryData(DispatchThreadId , Reservoir, ReadReservoirData(DispatchThreadId, 0));
 		}
 	}
 	// Pre-divide by albedo, to be recovered in compositing
@@ -1007,6 +998,6 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateSampledLightingRGS)
 	DiffuseExitantRadiance.rgb *= View.PreExposure;
 
 	DiffuseExitantRadiance = ClampToHalfFloatRange(DiffuseExitantRadiance.rgb);
-	RWDiffuseUAV[PixelCoord] = float4(DiffuseExitantRadiance, AmbientOcclusion);
+	RWDiffuseUAV[DispatchThreadId] = float4(DiffuseExitantRadiance, AmbientOcclusion);
 	// RWRayDistanceUAV[PixelCoord] = float2(HitDistance, 1.0);
 }
