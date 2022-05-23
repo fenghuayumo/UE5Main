@@ -20,6 +20,10 @@
     #include "RayTracingTypes.h"
     #include "PathTracingDefinitions.h"
     #include "PathTracing.h"
+	
+	#include "LightCutRendering.h"
+	#include "LightTreeTypes.h"
+	#include <limits>
 
     static TAutoConsoleVariable<int32> CVarRestirGISpatial(
     	TEXT("r.Fusion.RestirGI.Spatial"), 1,
@@ -485,12 +489,12 @@ class FRestirGIInitialSamplesForDeferedRGS : public FGlobalShader
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FDeferredMaterialPayload>, MaterialBuffer)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ReprojectedHistory)
 		//mesh light
-		// SHADER_PARAMETER_STRUCT_INCLUDE(FLightCutCommonParameter, LightCutCommonParameters)
-		// SHADER_PARAMETER(uint32, DistanceType)
-		// SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, MeshLightCutBuffer)
-		// SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FLightNode>, MeshLightNodesBuffer)
-		// SHADER_PARAMETER(uint32, MeshLightLeafStartIndex)
-		// SHADER_PARAMETER_STRUCT_INCLUDE(FMeshLightCommonParameter, MeshLightCommonParam)
+		 SHADER_PARAMETER_STRUCT_INCLUDE(FLightCutCommonParameter, LightCutCommonParameters)
+		 SHADER_PARAMETER(uint32, DistanceType)
+		 SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, MeshLightCutBuffer)
+		 SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FLightNode>, MeshLightNodesBuffer)
+		 SHADER_PARAMETER(uint32, MeshLightLeafStartIndex)
+		 SHADER_PARAMETER_STRUCT_INCLUDE(FMeshLightCommonParameter, MeshLightCommonParam)
 
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDebugDiffuseUAV)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, RWGlobalIlluminationRayDistanceUAV)
@@ -1090,6 +1094,172 @@ class FRestirGISpatialFilterCS : public FGlobalShader
 IMPLEMENT_GLOBAL_SHADER(FRestirGISpatialFilterCS, "/Engine/Private/RestirGI/SpatialFilter.usf", "SpatialFilter", SF_Compute);
 
 
+extern MeshLightTree MeshTree;
+void SetupMeshLightParamters(FScene* Scene,const FViewInfo& View, FRDGBuilder& GraphBuilder, const FSceneTextureParameters& SceneTextures,	FMeshLightCommonParameter* PassParameters,float UpscaleFactor,
+	FBox3f& OutMeshLightBounds)
+{
+	///mesh light
+	/// The following code should be excuted on the case of scene has been changed for efficiency, such as add meshlight, removemeshlight etc. like path tracer
+	/// When the scene has many meshlight ,the construction of the whole position buffer will be expensive
+	static TArray<FVector3f>	Positions;
+	static TArray<uint32>	IndexList;
+	static TArray<MeshLightInstanceTriangle>	meshLightTriangles;
+	static TArray<MeshLightInstance>	meshLights;
+	uint32 InstID = 0, indexOffset = 0;
+	uint32 VertexOffset = 0;
+	const float Inf = std::numeric_limits<float>::infinity();
+	static FBox3f MeshLightBounds;
+	if (Scene->MeshLightChaged)
+	{
+		Positions.Empty();
+		IndexList.Empty();
+		meshLightTriangles.Empty();
+		meshLights.Empty();
+
+		MeshLightBounds.Max = FVector3f(-Inf, -Inf, -Inf);
+		MeshLightBounds.Min = FVector3f(Inf, Inf, Inf);
+		FEmissiveLightMesh* CurrentEMesh = nullptr;
+		for (auto LightProxIndex = 0; LightProxIndex < Scene->EmissiveLightProxies.Num(); LightProxIndex++)
+		{
+			const auto& lightProxy = Scene->EmissiveLightProxies[LightProxIndex];
+			MeshLightInstance lightInstance;
+			lightInstance.Transform = lightProxy->Transform;
+			lightInstance.Emission = lightProxy->Emission;
+			meshLights.Add(lightInstance);
+
+			MeshLightBounds += lightProxy->Bounds;
+			if (CurrentEMesh != lightProxy->EmissiveMesh)
+			{
+				CurrentEMesh = lightProxy->EmissiveMesh;
+				for (const auto& p : CurrentEMesh->Positions)
+				{
+					Positions.Add(p);
+				}
+				for (int32 idx = 0; idx < CurrentEMesh->IndexList.Num(); idx++)
+				{
+					auto idx0 = CurrentEMesh->IndexList[idx] + VertexOffset;
+					IndexList.Add(idx0);
+				}
+
+			}
+			for (int32 i = 0; i < CurrentEMesh->IndexList.Num() / 3; i++)
+			{
+				MeshLightInstanceTriangle tri;
+				tri.IndexOffset = i * 3 + indexOffset;
+				tri.InstanceID = InstID;
+				meshLightTriangles.Add(tri);
+			}
+			if (LightProxIndex < (Scene->EmissiveLightProxies.Num() - 1) && CurrentEMesh != Scene->EmissiveLightProxies[LightProxIndex + 1]->EmissiveMesh)
+			{
+				indexOffset += CurrentEMesh->IndexList.Num();
+				VertexOffset += CurrentEMesh->Positions.Num();
+			}
+			InstID++;
+		}
+		Scene->MeshLightChaged = false;
+	}
+	static FBufferRHIRef MeshTriBuffer = nullptr;
+	static FBufferRHIRef MeshPosBuffer = nullptr;
+	static FBufferRHIRef MeshIndexBuffer = nullptr;
+	static FBufferRHIRef MeshInstanceBuffer = nullptr;
+	//if (Scene->MeshLightChaged)
+	{
+		{
+			// Upload the buffer of lights to the GPU (send at least one)
+			//meshTRi
+			FRHIResourceCreateInfo CreateInfo_MeshLightTri(TEXT("MeshLightTri"));
+			uint32 dataSize = FMath::Max<uint32>(meshLightTriangles.Num(), 1u) * sizeof(MeshLightInstanceTriangle);
+			MeshTriBuffer = RHICreateStructuredBuffer(sizeof(MeshLightInstanceTriangle), dataSize,  BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightTri);
+			uint32 OffsetFloat = 0;
+			void* BasePtr = RHILockBuffer(MeshTriBuffer, OffsetFloat, dataSize, RLM_WriteOnly);
+			if (meshLightTriangles.Num() > 0)
+				FPlatformMemory::Memcpy(BasePtr, meshLightTriangles.GetData(), dataSize);
+
+			RHIUnlockBuffer(MeshTriBuffer);
+		}
+
+		{
+			//meshPos
+			FRHIResourceCreateInfo CreateInfo_MeshLightPos(TEXT("MeshLightPos"));
+			uint32 dataSize = FMath::Max<uint32>(Positions.Num(), 1u) * sizeof(FVector3f);
+			MeshPosBuffer = RHICreateStructuredBuffer(sizeof(FVector3f), dataSize, BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightPos);
+			uint32 OffsetFloat = 0;
+			void* BasePtr = RHILockBuffer(MeshPosBuffer, OffsetFloat, dataSize, RLM_WriteOnly);
+			if (Positions.Num() > 0)
+				FPlatformMemory::Memcpy(BasePtr, Positions.GetData(), dataSize);
+			RHIUnlockBuffer(MeshPosBuffer);
+		}
+
+		{
+			//Mesh Index
+			FRHIResourceCreateInfo CreateInfo_MeshLightIndex(TEXT("MeshLightIndex"));
+			uint32 dataSize = FMath::Max<uint32>(IndexList.Num(), 1u) * sizeof(uint32);
+			MeshIndexBuffer = RHICreateStructuredBuffer(sizeof(uint32), dataSize,  BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightIndex);
+			uint32 OffsetFloat = 0;
+			void* BasePtr = RHILockBuffer(MeshIndexBuffer, OffsetFloat, dataSize, RLM_WriteOnly);
+			if (IndexList.Num() > 0)
+				FPlatformMemory::Memcpy(BasePtr, IndexList.GetData(), dataSize);
+			RHIUnlockBuffer(MeshIndexBuffer);
+
+		}
+
+		{
+			//Mesh Inst
+			FRHIResourceCreateInfo CreateInfo_MeshLightInstance(TEXT("MeshLightInstance"));
+			uint32 dataSize = FMath::Max<uint32>(meshLights.Num(), 1u) * sizeof(MeshLightInstance);
+			MeshInstanceBuffer = RHICreateStructuredBuffer(sizeof(MeshLightInstance), dataSize,  BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightInstance);
+			uint32 OffsetFloat = 0;
+			void* BasePtr = RHILockBuffer(MeshInstanceBuffer, OffsetFloat, dataSize, RLM_WriteOnly);
+			if (meshLights.Num() > 0)
+				FPlatformMemory::Memcpy(BasePtr, meshLights.GetData(), dataSize);
+			RHIUnlockBuffer(MeshInstanceBuffer);
+		}
+
+		//Scene->MeshLightChaged = false;
+	}
+	if ( !MeshTriBuffer)
+	{
+		{
+			FRHIResourceCreateInfo CreateInfo_MeshLightTri(TEXT("MeshLightTri"));
+			uint32 dataSize = sizeof(MeshLightInstanceTriangle);
+			MeshTriBuffer = RHICreateStructuredBuffer(sizeof(MeshLightInstanceTriangle), dataSize, BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightTri);
+		}
+		{
+			FRHIResourceCreateInfo CreateInfo_MeshLightPos(TEXT("MeshLightPos"));
+			uint32 dataSize = 1u * sizeof(FVector3f);
+			MeshPosBuffer = RHICreateStructuredBuffer(sizeof(FVector3f), dataSize,BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightPos);
+		}
+		{
+			FRHIResourceCreateInfo CreateInfo_MeshLightIndex(TEXT("MeshLightIndex"));
+			uint32 dataSize = 1u * sizeof(uint32);
+			MeshIndexBuffer = RHICreateStructuredBuffer(sizeof(uint32), dataSize, BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightIndex);
+		}
+		{
+			FRHIResourceCreateInfo CreateInfo_MeshLightInstance(TEXT("MeshLightInstance"));
+			uint32 dataSize =  sizeof(MeshLightInstance);
+			MeshInstanceBuffer = RHICreateStructuredBuffer(sizeof(MeshLightInstance), dataSize,  BUF_FastVRAM | BUF_ShaderResource | BUF_UnorderedAccess, CreateInfo_MeshLightInstance);
+		}
+	}
+	PassParameters->MeshLightInstancePrimitiveBuffer = RHICreateShaderResourceView(MeshTriBuffer);
+	PassParameters->MeshLightInstanceBuffer = RHICreateShaderResourceView(MeshInstanceBuffer);
+	PassParameters->MeshLightIndexBuffer = RHICreateShaderResourceView(MeshIndexBuffer);
+	PassParameters->MeshLightVertexBuffer = RHICreateShaderResourceView(MeshPosBuffer);
+	PassParameters->NumLightTriangles = meshLightTriangles.Num();
+
+	MeshTree.Build(GraphBuilder,
+		meshLightTriangles.Num(),
+		MeshLightBounds.Min,
+		MeshLightBounds.Max,
+		PassParameters->MeshLightIndexBuffer,
+		PassParameters->MeshLightVertexBuffer,
+		PassParameters->MeshLightInstanceBuffer,
+		PassParameters->MeshLightInstancePrimitiveBuffer);
+
+	MeshTree.FindLightCuts(*Scene, View, GraphBuilder, SceneTextures,MeshLightBounds.Min, MeshLightBounds.Max, 1.0 / UpscaleFactor);
+	OutMeshLightBounds = MeshLightBounds;
+
+}
+
 void PrefilterRestirGI(FRDGBuilder& GraphBuilder,
 	const FViewInfo& View,
 	FPreviousViewInfo* PreviousViewInfos,
@@ -1458,6 +1628,7 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 	{
 		RDG_GPU_STAT_SCOPE(GraphBuilder, RestirGenerateSampleDefered);
 		RDG_EVENT_SCOPE(GraphBuilder, "RestirGI: GenerateSampleDefered");
+		float UpscaleFactor = RestirGICommonParameters.UpscaleFactor;
 		FIntPoint RayTracingResolution = FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), RestirGICommonParameters.UpscaleFactor);
 		const bool bGenerateRaysWithRGS = CVarRayTracingGIGenerateRaysWithRGS.GetValueOnRenderThread() == 1;
 
@@ -1554,22 +1725,22 @@ void DenoiseRestirGI(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPrevious
 			SetupLightParameters(Scene, View, GraphBuilder, &PassParameters->SceneLights, &PassParameters->SceneLightCount, &PassParameters->SkylightParameters,
 			&PassParameters->LightGridParameters);
 			
-			// FMeshLightCommonParameter MeshLightCommonParam;
-			// FBox MeshLightBounds;
-			// SetupMeshLightParamters(Scene, View, GraphBuilder, &MeshLightCommonParam, UpscaleFactor, MeshLightBounds);
-			// PassParameters->MeshLightCommonParam = MeshLightCommonParam;
+			 FMeshLightCommonParameter MeshLightCommonParam;
+			 FBox3f MeshLightBounds;
+			 SetupMeshLightParamters(Scene, View, GraphBuilder, SceneTextures, &MeshLightCommonParam, UpscaleFactor, MeshLightBounds);
+			 PassParameters->MeshLightCommonParam = MeshLightCommonParam;
 
-			// FLightCutCommonParameter	LightCutCommonParameters;
-			// LightCutCommonParameters.CutShareGroupSize = GetCVarCutBlockSize().GetValueOnRenderThread();
-			// LightCutCommonParameters.MaxCutNodes = GetMaxCutNodes();
-			// LightCutCommonParameters.ErrorLimit = GetCVarErrorLimit().GetValueOnRenderThread();
-			// LightCutCommonParameters.UseApproximateCosineBound = GetCVarUseApproximateCosineBound().GetValueOnRenderThread();
-			// LightCutCommonParameters.InterleaveRate = GetCVarInterleaveRate().GetValueOnRenderThread();
-			// PassParameters->LightCutCommonParameters = LightCutCommonParameters;
-			// PassParameters->DistanceType = GetCVarLightTreeDistanceType().GetValueOnRenderThread();
-			// PassParameters->MeshLightLeafStartIndex = MeshTree.GetLeafStartIndex();
-			// PassParameters->MeshLightCutBuffer = GraphBuilder.CreateSRV(MeshTree.LightCutBuffer);
-			// PassParameters->MeshLightNodesBuffer = GraphBuilder.CreateSRV(MeshTree.LightNodesBuffer);
+			 FLightCutCommonParameter	LightCutCommonParameters;
+			 LightCutCommonParameters.CutShareGroupSize = GetCVarCutBlockSize().GetValueOnRenderThread();
+			 LightCutCommonParameters.MaxCutNodes = GetMaxCutNodes();
+			 LightCutCommonParameters.ErrorLimit = GetCVarErrorLimit().GetValueOnRenderThread();
+			 LightCutCommonParameters.UseApproximateCosineBound = GetCVarUseApproximateCosineBound().GetValueOnRenderThread();
+			 LightCutCommonParameters.InterleaveRate = GetCVarInterleaveRate().GetValueOnRenderThread();
+			 PassParameters->LightCutCommonParameters = LightCutCommonParameters;
+			 PassParameters->DistanceType = GetCVarLightTreeDistanceType().GetValueOnRenderThread();
+			 PassParameters->MeshLightLeafStartIndex = MeshTree.GetLeafStartIndex();
+			 PassParameters->MeshLightCutBuffer = GraphBuilder.CreateSRV(MeshTree.LightCutBuffer);
+			 PassParameters->MeshLightNodesBuffer = GraphBuilder.CreateSRV(MeshTree.LightNodesBuffer);
 
 			FRDGTextureDesc Desc = FRDGTextureDesc::Create2D(
 			RayTracingResolution,

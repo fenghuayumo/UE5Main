@@ -92,7 +92,7 @@ class FLumenSceneData;
 class FVirtualShadowMapArrayCacheManager;
 struct FHairStrandsInstance;
 struct FPathTracingState;
-
+struct FMeshLightProxy;
 /** Holds information about a single primitive's occlusion. */
 class FPrimitiveOcclusionHistory
 {
@@ -2735,6 +2735,10 @@ public:
 	TArray<FPrimitiveVirtualTextureFlags> PrimitiveVirtualTextureFlags;
 	/** Packed array of runtime virtual texture lod info. */
 	TArray<FPrimitiveVirtualTextureLodInfo> PrimitiveVirtualTextureLod;
+
+		/*MeshLight*/
+	TArray<FMeshLightProxy*>			EmissiveLightProxies;
+	bool								MeshLightChaged = true;
 #if RHI_RAYTRACING
 	/** Packed array of ray tracing primitive caching flags*/
 	TArray<ERayTracingPrimitiveFlags> PrimitiveRayTracingFlags;
@@ -3040,6 +3044,9 @@ public:
 	using FSceneInterface::UpdateAllPrimitiveSceneInfos;
 
 	// FSceneInterface interface.
+	virtual	void AddMeshLight(FMeshLightProxy* meshLight) override;
+	virtual	void RemoveMeshLight(FMeshLightProxy* meshLight) override;
+
 	virtual void AddPrimitive(UPrimitiveComponent* Primitive) override;
 	virtual void RemovePrimitive(UPrimitiveComponent* Primitive) override;
 	virtual void ReleasePrimitive(UPrimitiveComponent* Primitive) override;

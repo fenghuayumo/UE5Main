@@ -33,6 +33,21 @@ struct FNavigableGeometryExport;
 struct FNavigationRelevantData;
 struct FStaticLightingPrimitiveInfo;
 
+struct FEmissiveLightMesh
+{
+	TArray<FVector3f>		Positions;
+	TArray<uint32_t>	IndexList;
+};
+struct FMeshLightProxy
+{
+public:
+	FEmissiveLightMesh* EmissiveMesh = nullptr;
+	FMatrix				Transform;
+	FVector3f			Emission;
+	FBox3f				Bounds;
+};
+
+
 /** Whether FStaticMeshSceneProxy should to store data and enable codepaths needed for debug rendering */
 #define STATICMESH_ENABLE_DEBUG_RENDERING			ENABLE_DRAW_DEBUG
 
@@ -497,14 +512,16 @@ public:
 #endif
 	//~ End USceneComponent Interface
 
-
+	TArray<FMeshLightProxy*> MeshLightProxies;
 
 	//~ Begin UActorComponent Interface.
+	virtual	void DestroyRenderState_Concurrent() override;
 protected: 
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
 	virtual bool RequiresGameThreadEndOfFrameRecreate() const override;
 	virtual void CreateRenderState_Concurrent(FRegisterComponentContext* Context) override;
+
 	virtual void OnCreatePhysicsState() override;
 	virtual void OnDestroyPhysicsState() override;
 	virtual bool ShouldCreatePhysicsState() const override;

@@ -37,7 +37,7 @@ class FSceneRenderer;
 class FInstanceCullingManager;
 struct FHairStrandsInstance;
 struct FLightRenderParameters;
-
+struct FMeshLightProxy;
 enum EBasePassDrawListType
 {
 	EBasePass_Default=0,
@@ -58,6 +58,8 @@ public:
 
 	// FSceneInterface interface
 
+	virtual	void AddMeshLight(FMeshLightProxy* meshLight)  = 0 ;
+	virtual	void RemoveMeshLight(FMeshLightProxy* meshLight) = 0;
 	/** 
 	 * Adds a new primitive component to the scene
 	 * 

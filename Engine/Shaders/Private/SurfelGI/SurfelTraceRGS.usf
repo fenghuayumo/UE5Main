@@ -28,28 +28,34 @@ void PreDispatchTrace()
 #include "../RayTracing/RayTracingDeferredShadingCommon.ush"
 #include "../RayTracing/RayTracingHitGroupCommon.ush"
 
-// #define LIGHT_GRID 1
-// #define LIGHT_TREE 2
-// #define LIGHT_CUT  3
-// #define LIGHT_UNIFROM 4
+#define LIGHT_GRID 1
+#define LIGHT_TREE 2
+#define LIGHT_CUT  3
+#define LIGHT_UNIFROM 4
 
-// // #define LIGHT_SAMPLING_TYPE 1
-// #ifndef LIGHT_SAMPLING_TYPE
-// #define LIGHT_SAMPLING_TYPE 1
-// #endif
+// #define LIGHT_SAMPLING_TYPE 2
 
-// #if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
-// #define UNIFORM_LIGHT_SELECTION
-// #endif
-// #if LIGHT_SAMPLING_TYPE == LIGHT_GRID
-// #define USE_PATH_TRACING_LIGHT_GRID 1
-// #else
-// #define USE_PATH_TRACING_LIGHT_GRID 0
-// #endif
+#ifndef LIGHT_SAMPLING_TYPE
+#define LIGHT_SAMPLING_TYPE 1
+#endif
+
+#if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
+#define UNIFORM_LIGHT_SELECTION
+#endif
+#if LIGHT_SAMPLING_TYPE == LIGHT_GRID
+#define USE_PATH_TRACING_LIGHT_GRID 1
+#else
+#define USE_PATH_TRACING_LIGHT_GRID 0
+#endif
 
 #include "../PathTracing/Material/PathTracingMaterialSampling.ush"
 #include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
-// #include "../PathTracing/Light/PathTracingLightGrid.ush"
+#include "../PathTracing/Light/PathTracingLightGrid.ush"
+#if LIGHT_SAMPLING_TYPE > LIGHT_GRID
+#define MESH_LIGHT_SAMPLING     1
+#include "../LightCut/LightTreeSampling.ush"
+#endif
+
 #include "../PathTracing/Light/PathTracingLightSampling.ush"
 
 #include "SurfelCommon.ush"
@@ -87,6 +93,27 @@ RWStructuredBuffer<uint> SurfelEntryCellBuf;
 
 #include "SurfelLookUp.ush"
 
+#if MESH_LIGHT_SAMPLING  
+//lightcut common
+int DistanceType;
+int MaxCutNodes;
+int CutShareGroupSize;
+float ErrorLimit;
+int UseApproximateCosineBound;
+int InterleaveRate;
+//mesh light cut
+StructuredBuffer<int> MeshLightCutBuffer;
+StructuredBuffer<FLightNode> MeshLightNodesBuffer;
+int 						 MeshLightLeafStartIndex;
+
+//mesh light param
+StructuredBuffer<float3>       MeshLightVertexBuffer;
+StructuredBuffer<uint>         MeshLightIndexBuffer;
+StructuredBuffer<MeshLightInstanceTriangle>    MeshLightInstancePrimitiveBuffer;
+StructuredBuffer<MeshLightInstance>   MeshLightInstanceBuffer;
+uint 							NumLightTriangles;
+#endif
+
 void GenerateCosineNormalRay(
 	float3 WorldPosition,
 	float3 WorldNormal,
@@ -109,6 +136,113 @@ void GenerateCosineNormalRay(
 	RayPdf = Direction_Tangent.w;
 }
 
+#if MESH_LIGHT_SAMPLING  
+bool SampleTriangleLight(float2 RandSample,
+	float3 WorldPos,
+	float3 WorldNormal,
+	int triId,
+	float PickPdf,
+	out float3 OutDirection,
+	out float  OutDistance,
+	out float3 OutRadianceOverPdf,
+	out float OutPdf)
+{
+
+	OutDirection = 0;
+	OutDistance = 0;
+	OutRadianceOverPdf = 0;
+
+	MeshLightInstanceTriangle prim = MeshLightInstancePrimitiveBuffer[triId];
+    const float4x4 transform = MeshLightInstanceBuffer[prim.InstanceID].Transform;
+
+	// const uint v0 = MeshLightIndexBuffer[triId * 3];
+	// const uint v1 = MeshLightIndexBuffer[triId * 3 + 1];
+	// const uint v2 = MeshLightIndexBuffer[triId * 3 + 2];
+	uint v0 = MeshLightIndexBuffer[prim.IndexOffset];
+	uint v1 = MeshLightIndexBuffer[prim.IndexOffset + 1];
+	uint v2 = MeshLightIndexBuffer[prim.IndexOffset + 2];
+
+	const float3 p0 = mul(float4(MeshLightVertexBuffer[v0],1.0f), transform).xyz;
+	const float3 p1 = mul(float4(MeshLightVertexBuffer[v1],1.0f), transform).xyz;
+	const float3 p2 = mul(float4(MeshLightVertexBuffer[v2],1.0f), transform).xyz;
+	
+	float3  Emission = MeshLightInstanceBuffer[prim.InstanceID].Emission;
+
+	float3 LightN = cross(p2 - p0,p1 - p0);
+	float Area = 0.5 * length(LightN);
+	
+	//sample a point in triangle
+	float e1 = RandSample.x;
+	float e2 = RandSample.y;
+	float beta = e2 * sqrt(1 - e1);
+	float gamma = 1 - sqrt(1 - e1);
+
+	float3 SampleLightPos = p0 + beta * (p1 - p0) + gamma * (p2 - p0);
+
+	float3 Direction = (SampleLightPos - WorldPos);
+	float dSquared = max(dot(Direction, Direction), 1e-1) ;
+	float LightDist = sqrt(dSquared);
+	Direction /= LightDist;
+	// Direction = normalize(Direction);
+	// float LightDist = length(Direction);
+
+	float dDotn = abs(dot(-Direction, normalize(LightN))) + 1e-4;
+	//float Pdf = dSquared;
+	//if( Area > 1e-4)
+	float Pdf = dSquared / (Area * dDotn );
+	//if( Pdf <= 0) return false;
+	OutDirection = Direction;
+	OutDistance =  LightDist - 8e-1;
+	OutPdf = Pdf * PickPdf;
+	OutRadianceOverPdf = Emission / OutPdf;
+
+	return true;
+}
+
+bool SampleMeshLight(float3 RandSample,
+	float3 WorldPos,
+	float3 WorldNormal,
+	int NodeID,
+	out float3 OutDirection,
+	out float  OutDistance,
+	out float3 OutRadianceOverPdf,
+	out float OutPdf)
+{
+	if( NumLightTriangles == 0)
+		return false;
+#if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
+	// pick a triangle
+	int triId = min(int(floor(RandSample.x * NumLightTriangles)), NumLightTriangles - 1);
+	float LightPickPdf = 1.0 / NumLightTriangles;
+#elif LIGHT_SAMPLING_TYPE == LIGHT_TREE
+	float LightPickPdf = 1.0;
+	int triId = 0;
+	bool deadBranch = TraverseLightTree(WorldPos, WorldNormal, 1, MeshLightNodesBuffer, 
+				MeshLightLeafStartIndex, UseApproximateCosineBound, DistanceType,
+				RandSample.x,LightPickPdf,triId);
+	if( deadBranch ) return false;
+#else
+	float LightPickPdf = 1.0;
+	int triId = 0;
+	bool deadBranch = TraverseLightTree(WorldPos, WorldNormal, NodeID, MeshLightNodesBuffer, 
+				MeshLightLeafStartIndex, UseApproximateCosineBound, DistanceType,
+				RandSample.x,LightPickPdf,triId);
+	if( deadBranch ) return false;
+#endif
+	return SampleTriangleLight(
+		RandSample.yz,
+		WorldPos,
+		WorldNormal,
+		triId,
+		LightPickPdf,
+		OutDirection,
+		OutDistance,
+		OutRadianceOverPdf,
+		OutPdf
+	);
+
+}
+#endif
 
 #define TARGET_SAMPLE_COUNT 128
 static const uint SHORT_ESTIMATOR_SAMPLE_COUNT = 4;
@@ -146,6 +280,15 @@ RAY_TRACING_ENTRY_RAYGEN(SurfelTraceRGS)
     float  ValidSampleCount = 0;
 	float3 Irradiance = 0;
 	float3 Sample0Irradiance = 0.0;
+#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+	// uint2 BufferSize = View.BufferSizeAndInvSize.xy;
+	uint2 BufferSize = ceil(View.BufferSizeAndInvSize.xy / UpscaleFactor);
+	uint2 Pixel = PixelCoord;
+	// uint2 Pixel = PixelCoord;
+	int startAddr =  MAX_CUT_NODES * ( (Pixel.y / CutShareGroupSize) * ((BufferSize.x + CutShareGroupSize - 1) / CutShareGroupSize) + Pixel.x / CutShareGroupSize );
+
+	uint numPass = ceil(float(MaxCutNodes) / (InterleaveRate * InterleaveRate));
+#endif
 
     for (uint SampleIndex = 0; SampleIndex < SamplesPerPixel; ++SampleIndex)
 	{
@@ -240,12 +383,129 @@ RAY_TRACING_ENTRY_RAYGEN(SurfelTraceRGS)
 			GBufferData.ShadingModelID = Payload.ShadingModelID;
 			GBufferData.CustomData = Payload.CustomData;
 
-			Irradiance += Payload.Radiance * RayThroughput / RayPdf;
-// #if !MESH_LIGHT_SAMPLING
-// 			{
-// 				Irradiance += Payload.Radiance * RayThroughput / RayPdf;
-// 			}
-// #endif
+			{
+	#if !MESH_LIGHT_SAMPLING
+				Irradiance += Payload.Radiance * RayThroughput / RayPdf;
+	#else
+		#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+				for(uint NeeID = 0; NeeID < numPass; ++NeeID)
+		#else
+				for (uint NeeID = 0; NeeID < NextEventEstimationSamples; ++NeeID)
+		#endif
+				{
+					float3 LightRadianceOverPdf = 0;
+					float NeePdf = 0.0;
+
+					float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+					RayDesc LightRay;
+					int nodeID = 1;
+				#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+					if( CutShareGroupSize > 0)
+					{
+						int cutNodeId = NeeID;
+
+						int startId = 0;
+						int endId = MaxCutNodes;
+
+						if (InterleaveRate > 1)
+						{
+							int interleaveGroupSize = InterleaveRate * InterleaveRate;
+							int interleaveSamplingId = ( View.StateFrameIndex + InterleaveRate * (Pixel.y % InterleaveRate) + (Pixel.x % InterleaveRate)) % interleaveGroupSize;
+
+							float ratio = float(MaxCutNodes) / interleaveGroupSize;
+							startId = int(interleaveSamplingId * ratio);  
+							endId = interleaveSamplingId == interleaveGroupSize - 1 ? MaxCutNodes : int((interleaveSamplingId + 1) * ratio);
+
+							if (startId + NeeID >= endId) break;
+							else
+							{
+								cutNodeId = startId + NeeID;
+							}
+						}
+						else
+						{
+							if (cutNodeId >= MaxCutNodes) break;
+						}
+						int cutID = cutNodeId + startAddr;
+						nodeID = MeshLightCutBuffer[cutID];
+						if (nodeID < 0) break;
+					}
+				#endif
+					if( SampleMeshLight(RandSample3,
+								Ray.Origin,
+								Payload.WorldNormal,
+								nodeID,
+								LightRay.Direction,
+								LightRay.TMax,
+								LightRadianceOverPdf,
+								NeePdf) )
+					{
+			#if LIGHT_SAMPLING_TYPE == LIGHT_CUT
+				LightRadianceOverPdf *= ( InterleaveRate * InterleaveRate);
+			#endif
+						LightRay.Origin = Ray.Origin;
+						LightRay.TMin = 0;
+						LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+						bool bTransmission = true;
+						float3 BiasNormal = Payload.WorldNormal;
+						if ( dot(BiasNormal, LightRay.Direction) < 0.0)
+						{
+							BiasNormal = -BiasNormal;
+						}
+						ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+						// Trace visibility ray
+						uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+						const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+		#if !ENABLE_TWO_SIDED_GEOMETRY
+						NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+		#endif
+
+						FMinimalPayload NeePayload = TraceVisibilityRay(
+							TLAS,
+							NeeRayFlags,
+							NeeInstanceInclusionMask,
+							PixelCoord,
+							LightRay);
+
+						// No hit indicates successful next-event connection
+						if (NeePayload.IsMiss())
+						{
+							// Evaluate material
+							float3 MaterialThroughput;
+		#if USE_PATHTRACING_MATERIALS
+							FMaterialEval MaterialEval = EvalMaterial(CameraDirection, LightRay.Direction, Payload, false);
+							MaterialThroughput = MaterialEval.Weight * MaterialEval.Pdf;
+		#else
+							half3 N = Payload.WorldNormal;
+							half3 V = -Ray.Direction;
+							half3 L = LightRay.Direction;
+							float NoL = saturate(dot(N, L));
+							FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+							FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+							MaterialThroughput = LightingSample.Diffuse;
+							if (bTransmission)
+							{
+								MaterialThroughput += LightingSample.Transmission;
+							}
+		#endif
+
+							// Record the contribution
+							float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput* RayThroughput * factor / RayPdf;
+							// float3 ExitantRadianceSample = float3(1,0,0);
+							// Tonemap for firefly suppression
+							if (UseFireflySuppression)
+							{
+								ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+							}
+
+							Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+						}
+					}
+				}
+	#endif //MESH_LIGHT_SAMPLING
+			}
 			float SplitFactor = 1.0 / NextEventEstimationSamples;
 			for (uint NeeID = 0; NeeID < NextEventEstimationSamples; ++NeeID)
 			{

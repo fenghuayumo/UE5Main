@@ -956,7 +956,7 @@ void ProduceInitialSampleForDeferedGI(uint2 PixelCoord,FSortedGIRay GIRay,uint P
 		}
          
 #if USE_SURFEL
-		float3 SurfeLighting =  GBufferData.DiffuseColor * GetSurfelGI(Ray.Origin, GBufferData.WorldNormal, 0, RandSequence);
+		float3 SurfeLighting =  GBufferData.DiffuseColor * GetSurfelGI(Ray.Origin - LWCHackToFloat(PrimaryView.PreViewTranslation), GBufferData.WorldNormal, 0, RandSequence);
 		Irradiance += SurfeLighting;
 		RWDebugDiffuseUAV[PixelCoord] = float4(SurfeLighting,1.0);
 #endif

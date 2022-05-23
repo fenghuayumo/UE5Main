@@ -697,6 +697,42 @@ void FScene::UpdateSceneSettings(AWorldSettings* WorldSettings)
 	});
 }
 
+void FScene::AddMeshLight(FMeshLightProxy* meshLight)
+{
+	// Send a command to the rendering thread to remove the primitive from the scene.
+	FScene* Scene = this;
+	ENQUEUE_RENDER_COMMAND(FAddMeshLightProxyCommand)(
+		[Scene, meshLight](FRHICommandList&)
+		{
+			Scene->EmissiveLightProxies.Add(meshLight);
+			Scene->EmissiveLightProxies.Sort([](const FMeshLightProxy& A, const FMeshLightProxy& B) {
+				return A.EmissiveMesh < B.EmissiveMesh;
+				});
+			Scene->MeshLightChaged = true;
+		});
+
+}
+
+bool operator==(const FMeshLightProxy& p1, const FMeshLightProxy& p2)
+{
+	return p1.Emission == p2.Emission &&
+		p1.EmissiveMesh == p2.EmissiveMesh &&
+		p1.Bounds == p2.Bounds &&
+		p1.Transform == p2.Transform;
+}
+
+void FScene::RemoveMeshLight(FMeshLightProxy* meshLight)
+{
+	FScene* Scene = this;
+	ENQUEUE_RENDER_COMMAND(FRemoveMeshLightProxyCommand)(
+		[Scene, meshLight](FRHICommandList&)
+		{
+			Scene->EmissiveLightProxies.Remove(meshLight);
+			delete meshLight;
+			Scene->MeshLightChaged = true;
+		});
+}
+
 /**
  * Sets the FX system associated with the scene.
  */
@@ -5318,7 +5354,8 @@ public:
 			SetFXSystem(NULL);
 		}
 	}
-
+	virtual	void AddMeshLight(FMeshLightProxy* meshLight) override {}
+	virtual	void RemoveMeshLight(FMeshLightProxy* meshLight) override {}
 	virtual void AddPrimitive(UPrimitiveComponent* Primitive) override {}
 	virtual void RemovePrimitive(UPrimitiveComponent* Primitive) override {}
 	virtual void ReleasePrimitive(UPrimitiveComponent* Primitive) override {}
