@@ -2,6 +2,7 @@
 
 #define RAY_TRACING_DEFERRED_REFLECTIONS_SHADER_VERSION 0xC1669BC2  // Change to force shader compilation of this shader
 
+// #define USE_IES_TERM 0
 // EDeferredMaterialMode
 #define DEFERRED_MATERIAL_MODE_NONE   0
 #define DEFERRED_MATERIAL_MODE_GATHER 1
@@ -22,6 +23,25 @@
 
 #define PreIntegratedGF				ReflectionStruct.PreIntegratedGF
 #define PreIntegratedGFSampler		GlobalBilinearClampedSampler
+
+// #include "../RectLight.ush"
+// //#include "../MonteCarlo.ush"
+// #include "../DeferredShadingCommon.ush"
+// #include "../ShadingModels.ush"
+// #include "../SceneTextureParameters.ush"
+// #include "../RayTracing/RayTracingCommon.ush"
+// #include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+// #include "../RayTracing/RayTracingHitGroupCommon.ush"
+// #include "../ScreenSpaceDenoise/SSDPublic.ush"
+// #include "../SobolRandom.ush"
+
+// #include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+// #include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+// #include "../PathTracing/Light/PathTracingLightSampling.ush"
+// #include "../RayTracing/RayTracingReflectionsCommon.ush"
+// #include "../RayTracing/RayTracingDeferredMaterials.ush"
+// #include "../RayTracing/RayTracingDeferredReflections.ush"
+// #include "../RayTracing/RayTracingReflectionEnvironment.ush"
 
 #include "../DeferredShadingCommon.ush"
 #include "../DeferredLightingCommon.ush"
@@ -78,6 +98,80 @@ FPackedMaterialClosestHitPayload InitializePackedPayload(uint2 PixelPos, bool bS
 	return PackedPayload;
 }
 
+FSortedReflectionRay GenerateRestirReflectionRay(uint2 PixelPos, float2 UpscaleFactor, float ReflectionMaxNormalBias, float SmoothBias)
+{
+	// NOTE: GetPixelCoord() helper is currently intentionally not used here, as it introduces noticeable jitter when upscale factor is used.
+	// Subpixels could potentially be taken into account at a later point, if denoiser can compensate for the jitter.
+	float2 SvPosition = floor(float2(PixelPos) * UpscaleFactor);
+	const float2 BufferUV = (SvPosition + 0.5) * View.BufferSizeAndInvSize.zw;
+
+    // not 'const', may need to be modified below
+	FGBufferData GBuffer         = GetGBufferDataFromSceneTextures(BufferUV);
+	float DeviceZ                = SampleDeviceZFromSceneTextures(BufferUV);
+
+	float3 TranslatedWorldPosition;
+	float3 CameraDirection;
+	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(SvPosition, DeviceZ, TranslatedWorldPosition, CameraDirection);
+	float3 V = -CameraDirection;
+
+	ModifyGGXAnisotropicNormalRoughness(GBuffer.WorldTangent, GBuffer.Anisotropy, GBuffer.Roughness, GBuffer.WorldNormal, V);
+
+	FSortedReflectionRay Ray = (FSortedReflectionRay)0;
+	Ray.PixelCoordinates = PackPixelCoordinates(PixelPos);
+
+	if (GBuffer.ShadingModelID == SHADINGMODELID_HAIR 
+	 || GBuffer.ShadingModelID == SHADINGMODELID_UNLIT)
+	{
+		return Ray;
+	}
+
+	GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
+
+	float2 E = Rand1SPPDenoiserInput(PixelPos);
+	
+	const bool bOutputForDenoiser = true; // #todo: pass this in via constants when denoiser is on
+	if (bOutputForDenoiser)
+	{
+		E.y *= 1 - GGX_IMPORTANT_SAMPLE_BIAS;
+	}
+
+	float3 N = GBuffer.WorldNormal;
+	float3x3 TangentBasis = GetTangentBasis(N);
+	float3 TangentV       = mul(TangentBasis, V);
+
+	float3 L = (float3)0;
+
+	float SampleRoughness = ApplySmoothBias(GBuffer.Roughness, SmoothBias);
+
+	if (SampleRoughness > 0)
+	{
+		// Biased roughness is used for GGX sampling, but original value is still used to compute roughness threshold / fade.
+		// This means that biased roughness will never cause more rays to be traced, so will never cause performance drop.
+		float a2 = Pow4(SampleRoughness);
+		float4 BRDFSample = ImportanceSampleVisibleGGX(UniformSampleDisk(E), a2, TangentV);
+		float3 H = mul(BRDFSample.xyz, TangentBasis);
+		L = 2 * dot(V, H) * H - V;
+		// float4 BRDFSample = UniformSampleHemisphere(UniformSampleDisk(E));
+		// L = TangentToWorld(BRDFSample.xyz, N);
+		Ray.Pdf = BRDFSample.w;
+	}
+	else
+	{
+		L = reflect(-V, GBuffer.WorldNormal);
+		Ray.Pdf = 1;
+	}
+
+	Ray.Origin = TranslatedWorldPosition;
+	Ray.SetDirection(L);
+
+	ApplyCameraRelativeDepthBias(Ray.Origin, L, SvPosition, DeviceZ, GBuffer.WorldNormal, ReflectionMaxNormalBias);
+
+	Ray.Roughness = GBuffer.Roughness;
+
+	return Ray;
+}
+
+
 RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 {
 	const uint DispatchThreadId = DispatchRaysIndex().x; // This shader is dispatched in 1D configuration
@@ -99,7 +193,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 		const uint2 TileBasePixelPos = uint2(TileIndex % NumTiles.x, TileIndex / NumTiles.x) * TileSize;
 		const uint2 PixelPos         = View.ViewRectMin.xy + TileBasePixelPos + uint2(RayIndexInTile % TileSize.x, RayIndexInTile / TileSize.x);
 
-		ReflectionRay = GenerateDeferredReflectionRay(PixelPos, UpscaleFactor, ReflectionMaxNormalBias, ReflectionSmoothBias);
+		ReflectionRay = GenerateRestirReflectionRay(PixelPos, UpscaleFactor, ReflectionMaxNormalBias, ReflectionSmoothBias);
 		RayBuffer[DispatchThreadId] = ReflectionRay; // Store the ray to be used in shading phase
 	}	
 	#else
@@ -165,7 +259,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 
 	FPackedMaterialClosestHitPayload PackedPayload = InitializePackedPayload(PixelPos, bSkyLightAffectReflection);
 	float3 RayHitWorldPos = ReflectionRay.Origin + ReflectionRay.GetDirection() * DENOISER_MISS_HIT_DISTANCE;
-
+	const float3 V = normalize(View.TranslatedWorldCameraOrigin - RayHitWorldPos);
 	float2 SvPosition = floor(float2(PixelPos) * UpscaleFactor);
 	const float2 BufferUV = (SvPosition + 0.5) * View.BufferSizeAndInvSize.zw;
 
@@ -225,7 +319,9 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 			bool bDecoupleSampleGeneration             = false;
 			uint ReflectedShadowsType                  = 1; // Hard shadows
 			
-			RandomSequence RandSequence = (RandomSequence) 0; // Not actually used, since hard shadows are forced
+			//RandomSequence RandSequence = (RandomSequence) 0; // Not actually used, since hard shadows are forced
+			RandomSequence RandSequence;
+			RandomSequence_Initialize(RandSequence, PixelPos, 0, View.StateFrameIndex, 1);
 
 			float3 LightingViewDirection = Ray.Direction;
 			RayHitWorldPos = Ray.Origin + Ray.Direction * PackedPayload.HitT;
@@ -275,6 +371,88 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 						0,
 						bSkyLightAffectReflection);
 			}
+		// 	FGBufferData GBufferData = (FGBufferData)0;
+		// 	GBufferData.Depth = 1.f; // Do not use depth
+		// 	GBufferData.WorldNormal = Payload.WorldNormal;
+		// 	GBufferData.BaseColor = Payload.BaseColor;
+		// 	GBufferData.CustomData = Payload.CustomData;
+		// 	GBufferData.GBufferAO = Payload.GBufferAO;
+		// 	GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+		// 	GBufferData.SpecularColor = Payload.SpecularColor;
+		// 	GBufferData.DiffuseColor = Payload.DiffuseColor;
+		// 	GBufferData.Metallic = Payload.Metallic;
+		// 	GBufferData.Specular = Payload.Specular;
+		// 	GBufferData.Roughness = Payload.Roughness;
+		// 	GBufferData.ShadingModelID = Payload.ShadingModelID;
+		// 	GBufferData.CustomData = Payload.CustomData;
+
+		// 	const uint NextEventEstimationSamples = 1;
+		// 	float SplitFactor = 1.0 / NextEventEstimationSamples;
+		// 	for (uint NeeTrial = 0; NeeTrial < NextEventEstimationSamples; ++NeeTrial)
+		// 	{
+		// 		// Light selection
+		// 		int LightId;
+		// 		float3 LightRadianceOverPdf = 0;
+		// 		float NeePdf = 0.0;
+
+		// 		float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+
+		// 		RayDesc LightRay;
+		// 		if (SampleLight(RandSample3,
+		// 						RayHitWorldPos,
+		// 						Payload.WorldNormal,
+		// 						Payload.PrimitiveLightingChannelMask,
+		// 						ENABLE_TRANSMISSION,
+		// 						LightId,
+		// 						LightRay.Direction,
+		// 						LightRay.TMax,
+		// 						LightRadianceOverPdf,
+		// 						NeePdf))
+		// 		{
+		// 			LightRay.Origin = RayHitWorldPos;
+		// 			LightRay.TMin = 0;
+		// 			LightRay.TMax = min(LightRay.TMax, 1e27);
+		// 			bool bTransmission = HasTransmission(LightId);
+		// 			float3 BiasNormal = Payload.WorldNormal;
+		// 			if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+		// 			{
+		// 				BiasNormal = -BiasNormal;
+		// 			}
+		// 			ApplyPositionBias(LightRay, BiasNormal, ReflectionMaxNormalBias);
+
+		// 			// Trace visibility ray
+		// 			uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+		// 			const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+		// #if !ENABLE_TWO_SIDED_GEOMETRY
+		// 			NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+		// #endif
+
+		// 			FMinimalPayload NeePayload = TraceVisibilityRay(
+		// 				TLAS,
+		// 				NeeRayFlags,
+		// 				NeeInstanceInclusionMask,
+		// 				SvPosition,
+		// 				LightRay);
+
+		// 			// No hit indicates successful next-event connection
+		// 			if (NeePayload.IsMiss())
+		// 			{
+		// 				// Evaluate material
+		// 				half3 N = Payload.WorldNormal;
+		// 				half3 V = -Ray.Direction;
+		// 				half3 L = LightRay.Direction;
+		// 				float NoL = saturate(dot(N, L));
+		// 				FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+		// 				FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+		// 				float3 MaterialThroughput = LightingSample.Specular + LightingSample.Diffuse;
+
+		// 				// Record the contribution
+		// 				float3 ExitantRadianceSample =  LightRadianceOverPdf * MaterialThroughput * SplitFactor / ReflectionRay.Pdf;
+		// 				ResultColor.rgb += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+		// 			}
+		// 		}
+		// 	}
 
 			ResultColor.rgb *= View.PreExposure;
 
@@ -288,20 +466,33 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 			sampleRef.Irradiance = ResultColor.xyz;
 			float RayPdf = min(200, ReflectionRay.Pdf > 0 ? ReflectionRay.Pdf : 0.0);
 			float InvRayPdf = RayPdf > 0 ? min(1.0 / RayPdf, 65504) : 0.0;
+			
+			const float a2 = max(1e-5, Pow4(ReflectionRay.Roughness));
+			const float NoV = max(0, dot(GBufferData.WorldNormal, V));
 
-            float targetPdf = max(1e-3, Luminance(sampleRef.Irradiance)) * RayPdf;
+			const float3 SampleL = Ray.Direction;
+            const float3 SampleH = normalize(V + SampleL);
+            const float SampleNoH = max(0, dot(GBufferData.WorldNormal, SampleH));
+			const float SampleNoL = max(0, dot(GBufferData.WorldNormal, SampleL));
+
+            const float LocalBRDF = D_GGX(a2, SampleNoH) * Vis_Smith(a2, NoV, SampleNoL) * SampleNoL;
+
+            float targetPdf = max(1e-3, Luminance(sampleRef.Irradiance * LocalBRDF));
             float invSourcePdf =  InvRayPdf;
 	
             float risRnd =  RandomSequence_GenerateSample1D(RandSequence);
 
-            // LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
+            LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
+			// LocalReservoir.M = 1;
+			// LocalReservoir.weightSum = targetPdf * invSourcePdf;
+			// LocalReservoir.targetPdf = targetPdf;
+			// LocalReservoir.sampleRef = sampleRef;
+			// LocalReservoir.sourcePdf = RayPdf;
+			// LocalReservoir.W = invSourcePdf;
+			LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
 			LocalReservoir.M = 1;
-			LocalReservoir.weightSum = targetPdf * invSourcePdf;
-			LocalReservoir.targetPdf = targetPdf;
-			LocalReservoir.sampleRef = sampleRef;
-			LocalReservoir.sourcePdf = RayPdf;
-			LocalReservoir.W = invSourcePdf;
 		}
+
 		state = LocalReservoir;
 	}
 
@@ -316,7 +507,7 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 
 	// NOTE: Written a ternary operator to work around shader compiler crash as of 2020-11-19
 	ReflectionDenoiserData[PixelPos] = DenoisingOutputFormat == 1 ? RayParams : (float4)ResultDistance;
-
+	WriteReservoirData(PixelPos, 0, state.Store());
 #endif // DIM_DEFERRED_MATERIAL_MODE
 }
 

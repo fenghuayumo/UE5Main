@@ -1,0 +1,155 @@
+#include "../Common.ush"
+
+#define SUPPORT_CONTACT_SHADOWS		0
+
+#include "../DeferredShadingCommon.ush"
+#include "../DeferredLightingCommon.ush"
+#include "../ReflectionEnvironmentShared.ush"
+#include "../Montecarlo.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
+#include "../SceneTextureParameters.ush"
+
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "../RayTracing/RayTracingReflectionsCommon.ush"
+
+
+#include "ReservoirManagement.ush"
+
+RWTexture2D<float4>                             ColorOutput;
+
+int    InputSlice;
+
+RaytracingAccelerationStructure                 TLAS;
+float ReflectionMaxNormalBias;
+float ReflectionMaxRoughness;
+float2 UpscaleFactor;
+int    ApproxVisibility;
+int  FeedbackVisibility;
+
+RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
+{
+
+    uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+    uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor.x);
+
+    // Get G-Buffer surface data
+    FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+
+    float Depth = GBuffer.Depth;
+    float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+    float3 TranslatedWorldPosition;
+    float3 CameraDirection;
+    ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+    float3 V = -CameraDirection;
+    const bool bIsDepthValid = DeviceZ > 0.0;
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+
+    Reservoir risSample = Reservoir::Empty();
+	float3 ExitantRadiance = 0.0;
+	float RayDistance = 0.0;
+	float HitCount = 0.0;
+
+	if (bIsValidPixel)
+	{
+		{
+			risSample = Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
+
+			if (risSample.sampleRef.IsValid())
+			{
+                const float NoV = max(0, dot(GBuffer.WorldNormal, V));
+
+		        const float a2 = max(1e-5, Pow4(GBuffer.Roughness));
+
+
+                float3 LightPosition = risSample.sampleRef.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+				float3 Direction = (LightPosition - TranslatedWorldPosition);
+				
+				RayDesc Ray;	
+				Ray.Origin = TranslatedWorldPosition;
+				Ray.Direction = normalize(Direction);
+				Ray.TMin = 0;
+				Ray.TMax = length(Direction) - 1e-1;
+				Ray.TMax = min(Ray.TMax, 1e27);
+
+				float3 BiasNormal = GBuffer.WorldNormal;
+				if ( dot(BiasNormal, Ray.Direction) < 0.0)
+				{
+					BiasNormal = -BiasNormal;
+				}
+				ApplyPositionBias(Ray, BiasNormal, ReflectionMaxNormalBias);
+
+				uint RayFlags = 0;
+				const uint InstanceInclusionMask = RAY_TRACING_MASK_SHADOW;
+
+
+                RayFlags |= RAY_FLAG_FORCE_OPAQUE;
+
+                // #if !ENABLE_TWO_SIDED_GEOMETRY
+                //         RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+                // #endif
+				bool Visible = true;
+				FMinimalPayload MinimalPayload = (FMinimalPayload)0;
+				if ( ApproxVisibility )
+				{
+					MinimalPayload = TraceVisibilityRay(
+						TLAS,
+						RayFlags,
+						InstanceInclusionMask,
+						PixelCoord,
+						Ray);
+					Visible = !MinimalPayload.IsHit();
+				}
+				if ( Visible )
+				{
+                    const float3 SampleL = Ray.Direction;
+                    const float3 SampleH = normalize(V + SampleL);
+                    const float SampleNoH = max(0, dot(GBuffer.WorldNormal, SampleH));
+                    const float SampleNoL = max(0, dot(GBuffer.WorldNormal, SampleL));
+                    const float VoH = saturate(dot(V, SampleH));
+
+                    const float D = D_GGX(a2, SampleNoH);
+                    float Vis = Vis_Smith(a2, NoV, SampleNoL);
+                    const float LocalBRDF = D * Vis * SampleNoL;
+
+					ExitantRadiance +=  risSample.sampleRef.Irradiance * risSample.weightSum * LocalBRDF;
+
+					RayDistance += Ray.TMax;
+					HitCount += 1.0f;
+				}
+				else
+				{
+					HitCount += 1.0f;
+					RayDistance += MinimalPayload.HitT;
+					if (FeedbackVisibility)
+					{
+						risSample.weightSum = 0.0f;
+						risSample.targetPdf = 0.0f;
+						risSample.M = 0;
+					}
+				}
+            }
+            else
+			{
+				// sample occluded, kill it for the history
+				risSample = Reservoir::Empty();
+			}
+            WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+        }
+        ExitantRadiance /= float(1);
+
+		RayDistance /= max(HitCount, 1.0);
+
+		// Apply the pre-exposure scale to the resulting shaded value
+#if USE_PREEXPOSURE
+		ExitantRadiance *= View.PreExposure;
+#endif
+    }
+    else
+	{
+		// Invalid pixel, write empty reservoir
+		WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+	}
+    ColorOutput[DispatchThreadId] = float4(ExitantRadiance,1.0);
+}

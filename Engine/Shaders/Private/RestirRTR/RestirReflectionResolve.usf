@@ -208,36 +208,36 @@ void ReflectionResolveCS(
 
 			risSample = Reservoir::Load(ReadReservoirData(SamplePixelId, 0));
 
-			const float4 DenoiserData = ReflectionDenoiserData.Load(uint3(SamplePixelId, 0));
-			float InvRayPdf = DenoiserData.w;
+			// const float4 DenoiserData = ReflectionDenoiserData.Load(uint3(SamplePixelId, 0));
+			// float InvRayPdf = DenoiserData.w;
 
-			const float3 RayOriginRelativeHitPosition = DenoiserData.xyz;
-			const float RayLength = length(RayOriginRelativeHitPosition);
+			// const float3 RayOriginRelativeHitPosition = DenoiserData.xyz;
+			// const float RayLength = length(RayOriginRelativeHitPosition);
 
-			ReflectionHitDistance += RayLength;
+			// ReflectionHitDistance += RayLength;
 
 			float4 SampleColor = RawReflectionColor.Load(uint3(SamplePixelId, 0));
 			SampleColor.xyz = risSample.sampleRef.Irradiance;
 
-			float NeiborSamplingPdf = 1.0 / risSample.weightSum;
-			float3 CenterToHit = risSample.sampleRef.Position - lerp(PositionTranslatedWorld - LWCHackToFloat(PrimaryView.PreViewTranslation), risSample.sampleRef.CreationPoint, 0.5);
-			float3 SampleHit = CenterToHit + risSample.sampleRef.CreationPoint;
+			// float NeiborSamplingPdf = 1.0 / risSample.weightSum;
+			// float3 CenterToHit = risSample.sampleRef.Position - lerp(WorldPosition, risSample.sampleRef.CreationPoint, 0.5);
+			// float3 SampleHit = CenterToHit + risSample.sampleRef.CreationPoint;
 			
-            const float CenterToHitDist = length(CenterToHit);
-            const float SampleToHitDist = length(risSample.sampleRef.Position - risSample.sampleRef.CreationPoint);
+            // const float CenterToHitDist = length(CenterToHit);
+            // const float SampleToHitDist = length(risSample.sampleRef.Position - risSample.sampleRef.CreationPoint);
 
-			NeiborSamplingPdf *= max(1.0,pow(CenterToHitDist / SampleToHitDist, 2));
+			// NeiborSamplingPdf *= max(1.0,pow(CenterToHitDist / SampleToHitDist, 2));
 
-			const float3 SampleL = RayOriginRelativeHitPosition * rcp(RayLength);
+			// float CenterToHitVis = dot(risSample.sampleRef.Position, -normalize(CenterToHit));
+            // float SampleToHitVis = dot(risSample.sampleRef.Position, -normalize(risSample.sampleRef.Position - risSample.sampleRef.CreationPoint));
+            // NeiborSamplingPdf /= clamp(CenterToHitVis / SampleToHitVis, 1e-1, 1e1);
+			// ReflectionHitDistance += CenterToHitDist;
+			// const float3 SampleL =  CenterToHit * rcp(CenterToHitDist);
+			const float3 SampleL = normalize(risSample.sampleRef.Position - risSample.sampleRef.CreationPoint);
 			const float3 SampleH = normalize(V + SampleL);
-
 			const float SampleNoH = max(0, dot(N, SampleH));
 			const float SampleNoL = max(0, dot(N, SampleL));
 			const float VoH = saturate(dot(V, SampleH));
-			// const float LocalBRDF = D_GGX(a2, SampleNoH) * Vis_Smith(a2, NoV, SampleNoL) * SampleNoL;
-
-			// Clamping PDF like this avoids some of the artifacts on mirror-like surfaces
-			InvRayPdf = lerp(1e-5, InvRayPdf, GBuffer.Roughness);
 
 			const float D = D_GGX(a2, SampleNoH);
 			// float3 F = F_Schlick( GBuffer.SpecularColor, VoH );
@@ -247,9 +247,11 @@ void ReflectionResolveCS(
 			// const float SpecPdf = D * SampleNoH; //Pdf GGX
 			const float SpecPdf = 2 * VoH * D / (NoV + sqrt(NoV * (NoV - NoV * a2) + a2)); //PdfVGGX
 
+			// float InvRayPdf =  1.0 / risSample.sourcePdf;
+
 		#if USE_RAY_PDF
-			const float Weight = LocalBRDF * risSample.W;
-			//const float Weight = LocalBRDF * InvRayPdf; // more accurate, but some objectionable halos around some objects / light leaking
+			const float Weight = LocalBRDF * risSample.weightSum;
+            // const float Weight = LocalBRDF * InvRayPdf; // more accurate, but some objectionable halos around some objects / light leaking
 		#else // USE_RAY_PDF
 			const float Weight = LocalBRDF; // hacky / incorrect, loses definition of roughness maps, but significantly reduces light leaking
 		#endif // USE_RAY_PDF
@@ -260,7 +262,7 @@ void ReflectionResolveCS(
 			WeightSum += Weight;
 		}
 
-		ReflectionHitDistance = ReflectionHitDistance / (float)NUM_SAMPLES;
+		// ReflectionHitDistance = ReflectionHitDistance / (float)NUM_SAMPLES;
 
 		ReflectionColor.rgb = INV_TONEMAP(ReflectionColor.rgb / WeightSum);
 		ReflectionColor.a = ReflectionColor.a / WeightSum;

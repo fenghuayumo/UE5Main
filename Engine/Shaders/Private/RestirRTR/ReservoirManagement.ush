@@ -9,7 +9,7 @@ struct PackedReservoir
 	uint4 HitGeometry;
 	uint4 LightInfo;
 
-	float4 PdfInfo;
+	// float4 PdfInfo;
 };
 
 RWStructuredBuffer<PackedReservoir> RWRTReservoirUAV;
@@ -150,20 +150,16 @@ struct Reservoir
 	SampleRef sampleRef;
 	float weightSum;
 	float targetPdf;
-	float sourcePdf;
 	uint M;
-	// float cosTheta;
-	float W;
 	static Reservoir Empty()
 	{
 		Reservoir s;
 		s.sampleRef = SampleRef::Invalid();
 		s.targetPdf = 0;
 		s.weightSum = 0;
-		s.sourcePdf = 0.0;
 		s.M = 0;
 		// s.cosTheta = 0.0;
-		s.W = 0.0;
+		// s.W = 0.0;
 		return s;
 	}
 
@@ -179,23 +175,13 @@ struct Reservoir
 		res.sampleRef.Normal = UnpackNormal(HitGeometry.w);
 
 		uint4 LightInfo = data.LightInfo;
-		// UnpackIrradiance(LightInfo.xy, res.sampleRef.Irradiance, res.M);
-		res.sampleRef.Irradiance = asfloat(LightInfo.xyz);
-		res.M = LightInfo.w;
+		UnpackIrradiance(LightInfo.xy, res.sampleRef.Irradiance, res.M);
 		res.sampleRef.Valid = res.M ;
 
-		// res.weightSum = asfloat(LightInfo.z );
-		// res.sourcePdf = f16tof32(LightInfo.w);
-		// res.targetPdf = f16tof32(LightInfo.w >> 16);
-		// res.targetPdf =  asfloat(LightInfo.w );
-
-		res.weightSum = (data.PdfInfo.x);
-		res.targetPdf = (data.PdfInfo.y);
-		res.sourcePdf = (data.PdfInfo.z);
-		// res.cosTheta = (data.PdfInfo.w);
-		res.W = (data.PdfInfo.w);
+		res.weightSum = asfloat(LightInfo.z);
+		res.targetPdf = asfloat(LightInfo.w);
 		// Discard reservoirs that have Inf/NaN
-		if (isinf(res.W) || isnan(res.W)) {
+		if (isinf(res.weightSum) || isnan(res.weightSum)) {
 			res = Empty();
 		}
 
@@ -216,32 +202,22 @@ struct Reservoir
 		data.HitGeometry = HitGeometry;
 
 		uint4 LightInfo;
-		// LightInfo.xy = PackIrradiance(sampleRef.Irradiance, M);
-		// LightInfo.z = asuint(weightSum);
-		LightInfo.xyz = asuint(sampleRef.Irradiance);
-		LightInfo.w = M;
-
-		// LightInfo.w = asuint(targetPdf);
-		// LightInfo.w = f32tof16(sourcePdf) | (f32tof16(targetPdf) << 16);
-		float4 PdfInfo;
-
-		PdfInfo.x = (weightSum);
-		PdfInfo.y = (targetPdf);
-		PdfInfo.z = (sourcePdf);
-		PdfInfo.w = W;
+		LightInfo.xy = PackIrradiance(sampleRef.Irradiance, M);
+		LightInfo.z = asuint(weightSum);
+		LightInfo.w = asuint(targetPdf);
 		data.LightInfo = LightInfo;
-		data.PdfInfo = PdfInfo;
 
 		return data;
 	}
 
-	// void FinalizeResampling(float normalizationNumerator, float normalizationDenominator)
-	// {
-	// 	float denominator = targetPdf * normalizationDenominator;
+	void FinalizeResampling(float normalizationNumerator, float normalizationDenominator)
+	{
+		float denominator = targetPdf * normalizationDenominator;
 
-	// 	weightSum = (denominator == 0.0) ? 0.0 : (weightSum * normalizationNumerator) / denominator;
-	// 	weightSum = min(weightSum, RESTIR_RESERVOIR_W_CLAMP);
-	// }
+		weightSum = (denominator == 0.0) ? 0.0 : (weightSum * normalizationNumerator) / denominator;
+		weightSum = min(weightSum, RESTIR_RESERVOIR_W_CLAMP);
+		// W = (denominator == 0.0) ? 0.0 : (weightSum * normalizationNumerator) / denominator;
+	}
 
 	bool StreamSample(SampleRef newSampleRef, float random, float newTargetPdf, float invSourcePdf)
 	{
@@ -263,16 +239,15 @@ struct Reservoir
 		{
 			sampleRef = newSampleRef;
 			targetPdf = newTargetPdf;
-			sourcePdf = 1.0 / invSourcePdf;
 		}
 
 		return selectSample;
 	}
 
-	bool CombineReservoirs(Reservoir newReservoir, float random, float newTargetPdf, float newSourcePdf)
+	bool CombineReservoirs(Reservoir newReservoir, float random, float newTargetPdf)
 	{
 		// What's the current weight (times any prior-step RIS normalization factor)
-		float risWeight = newTargetPdf * newReservoir.W * newReservoir.M;
+		float risWeight = newTargetPdf * newReservoir.weightSum * newReservoir.M;
 
 		// Our *effective* candidate pool is the sum of our candidates plus those of our neighbors
 		M += newReservoir.M;
@@ -288,7 +263,6 @@ struct Reservoir
 		{
 			sampleRef = newReservoir.sampleRef;
 			targetPdf = newTargetPdf;
-			sourcePdf = newSourcePdf;
 		}
 
 		return selectSample;
