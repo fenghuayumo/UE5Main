@@ -1,0 +1,185 @@
+
+#include "../Common.ush"
+
+#include "LightTreeCommon.ush"
+// #include "/Engine/Shared/RayTracingTypes.h"
+// #include "/Engine/Shared/PathTracingDefinitions.h"
+#include "../PathTracing/Light/PathTracingLightCommon.ush"
+// #define LIGHT_CUT_THREAD_BLOCK_SIZE 512
+
+#if GEN_MORTONCODE
+inline uint3 BitExpansion(uint3 x)
+{
+	//https://fgiesen.wordpress.com/2009/12/13/decoding-morton-codes/
+	x = (x | x << 16) & 0x30000ff;
+	x = (x | x << 8) & 0x300f00f;
+	x = (x | x << 4) & 0x30c30c3;
+	x = (x | x << 2) & 0x9249249;
+	return x;
+}
+
+RWByteAddressBuffer keyIndexList;
+int QuantLevels;
+float3 SceneLightBoundsMin;
+float3 SceneLightDimension;
+uint SceneInfiniteLightCount;
+// StructuredBuffer<FLightNode> LeafNodes;
+// uint NumTriangleLights;
+[numthreads(THREAD_BLOCK_SIZE, 1, 1)]
+void GenMortonCode(uint3 DTid : SV_DispatchThreadID)
+{
+	uint FiniteLightCount = SceneLightCount - SceneInfiniteLightCount;
+	if (DTid.x < (FiniteLightCount) )
+	{
+		//normalize position to [0,1]
+		float3 normPos = (SceneLights[DTid.x + SceneInfiniteLightCount].TranslatedWorldPosition.xyz - SceneLightBoundsMin) / SceneLightDimension;
+		uint3 quantPos = min(max(0, uint3(normPos * QuantLevels)), QuantLevels - 1);
+		quantPos = BitExpansion(quantPos);
+		uint mortonCode = quantPos.x * 4 + quantPos.y * 2 + quantPos.z;
+
+		uint2 KeyIndexPair = uint2(DTid.x, mortonCode);
+		keyIndexList.Store2(8 * DTid.x, KeyIndexPair);
+	}
+}
+
+#endif
+
+
+#if GEN_LEVEL_ZERO
+
+int LevelLightCount;
+int LevelsNumber;
+ByteAddressBuffer keyIndexList;
+RWStructuredBuffer<FLightNode> LightNodes;
+uint SceneInfiniteLightCount;
+
+// float SurfaceArea(float3 pMin, float3 pMax)
+// {
+// }
+
+[numthreads(THREAD_BLOCK_SIZE, 1, 1)]
+void GenerateLevelZeroFromLights(uint3 DTid : SV_DispatchThreadID)
+{
+	int levelNodeId = DTid.x;
+
+	if (levelNodeId < LevelLightCount)
+	{
+		FLightNode node;
+		int nodeArr = (1 << (LevelsNumber - 1)) + levelNodeId;
+
+		if (levelNodeId < (SceneLightCount - SceneInfiniteLightCount) )
+		{
+			uint2 KeyIndexPair = keyIndexList.Load2(8 * levelNodeId);
+			int LightId = KeyIndexPair.x + SceneInfiniteLightCount;
+			float3 lightPos = SceneLights[LightId].TranslatedWorldPosition.xyz;
+			float3 lightN = SceneLights[LightId].Normal.xyz;
+			float3 lightColor = SceneLights[LightId].Color.xyz;
+			node.ID = KeyIndexPair.x ;
+
+			float3 boundMin = 1e10;
+			float3 boundMax = -1e10;
+			node.Intensity = GetColorIntensity(lightColor.xyz);
+
+			if( IsSpotLight(LightId) || IsPointLight(LightId) )
+			{
+				node.BoundMin = node.BoundMax = lightPos;
+#ifdef LIGHT_CONE
+				if (IsSpotLight(LightId) > 0)
+				{
+					node.Cone.xyz = lightN.xyz;
+					float2 CosConeAngles = GetCosConeAngles(LightId);
+					node.Cone.w = acos(CosConeAngles.x);
+				}
+				else
+				{
+					node.Cone.xyz = lightN.xyz;
+					node.Cone.w = PI;
+				}
+#endif
+			}
+			else
+			{
+				float3 LightdPdu = GetdPdu(LightId);
+				float3 LightdPdv = GetdPdv(LightId);
+				float2 LightExtent = 0.5 * GetRectSize(LightId);
+				node.BoundMin = lightPos - (LightExtent.x * LightdPdu + LightExtent.y * LightdPdv);
+                node.BoundMax = lightPos + (LightExtent.x * LightdPdu + LightExtent.y * LightdPdv);
+				node.Intensity *= 2 * LightExtent.x * LightExtent.y;
+	#ifdef LIGHT_CONE
+				node.Cone.xyz = lightN.xyz;
+				node.Cone.w = 0.5 * PI;
+	#endif
+
+			}
+		}
+		else
+		{
+			node.Intensity = 0;
+			node.BoundMin = 1e10;
+			node.BoundMax = -1e10;
+		}
+
+		LightNodes[nodeArr] = node;
+	}
+}
+
+#endif
+
+#if GEN_LEVEL_UP
+
+int SrcLevel;
+int DstLevelStart;
+int DstLevelEnd;
+int NumLevels;
+int NumDstLevelsLights;
+// todo: add dstLevelStart and dstLevelEnd
+
+RWStructuredBuffer<FLightNode> LightNodes;
+
+[numthreads(THREAD_BLOCK_SIZE, 1, 1)]
+void GenerateLevelsFromsLevelZero( uint3 DTid : SV_DispatchThreadID )
+{
+	int nodeId = DTid.x;
+	if (nodeId < NumDstLevelsLights)
+	{
+		int dstNodeArr, dstLevel;
+		if (DstLevelEnd == DstLevelStart + 1)
+		{
+			dstLevel = DstLevelStart;
+			dstNodeArr = (1 << (NumLevels - dstLevel - 1)) + nodeId;
+		}
+		else
+		{
+			int offset = 1 << (NumLevels - DstLevelEnd);
+			dstNodeArr = offset + nodeId;
+			dstLevel = NumLevels - 1 - uintLog2(dstNodeArr);
+		}
+
+		int startNodeId = dstNodeArr << (dstLevel - SrcLevel);
+		int endNodeId = startNodeId + (1 << (dstLevel - SrcLevel));
+
+		FLightNode node = LightNodes[startNodeId];
+
+		for (int nodeId = startNodeId + 1; nodeId < endNodeId; nodeId++)
+		{
+			FLightNode srcNode = LightNodes[nodeId];
+			if (srcNode.Intensity > 0) //actual light
+			{
+				node.Intensity += srcNode.Intensity;
+				node.BoundMin = min(srcNode.BoundMin, node.BoundMin);
+				node.BoundMax = max(srcNode.BoundMax, node.BoundMax);
+			}
+
+#ifdef LIGHT_CONE
+			if (srcNode.Intensity > 0) //actual light
+			{
+				node.Cone = MergeCones(node.Cone, srcNode.Cone);
+			}
+#endif
+		}
+
+		LightNodes[dstNodeArr] = node;
+	}
+}
+
+#endif
