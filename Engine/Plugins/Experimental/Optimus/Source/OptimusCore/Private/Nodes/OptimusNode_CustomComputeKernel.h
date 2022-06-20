@@ -1,0 +1,155 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "OptimusDataDomain.h"
+#include "OptimusNode_ComputeKernelBase.h"
+#include "OptimusShaderText.h"
+#include "IOptimusShaderTextProvider.h"
+#include "OptimusBindingTypes.h"
+#include "IOptimusParameterBindingProvider.h"
+#include "IOptimusNodeAdderPinProvider.h"
+
+#include "OptimusNode_CustomComputeKernel.generated.h"
+
+
+enum class EOptimusNodePinDirection : uint8;
+
+
+UCLASS()
+class UOptimusNode_CustomComputeKernel :
+	public UOptimusNode_ComputeKernelBase,
+	public IOptimusShaderTextProvider,
+	public IOptimusParameterBindingProvider,
+	public IOptimusNodeAdderPinProvider
+{
+	GENERATED_BODY()
+
+public:
+	UOptimusNode_CustomComputeKernel();
+
+	// UOptimusNode overrides
+	FName GetNodeCategory() const override 
+	{
+		return CategoryName::Deformers;
+	}
+
+	// UOptimusNode_ComputeKernelBase overrides
+	FString GetKernelName() const override;
+	FIntVector GetGroupSize() const override;
+	FString GetKernelSourceText() const override;
+
+	// IOptiusComputeKernelProvider overrides
+	void SetCompilationDiagnostics(
+		const TArray<FOptimusCompilerDiagnostic>& InDiagnostics
+		) override;
+
+	// IOptimusShaderTextProvider overrides
+	virtual FString GetNameForShaderTextEditor() const override;
+	
+	virtual FString GetDeclarations() const override;
+	
+	virtual FString GetShaderText() const override;
+
+	virtual void SetShaderText(const FString& NewText) override;
+
+	virtual const TArray<FOptimusCompilerDiagnostic>& GetCompilationDiagnostics() const override;
+
+	// IOptimusParameterBindingProvider
+	virtual FString GetBindingDeclaration(FName BindingName) const override;
+
+	// IOptimusNodeAdderPinProvider
+	virtual bool CanAddPinFromPin(const UOptimusNodePin* InSourcePin, EOptimusNodePinDirection InNewPinDirection, FString* OutReason = nullptr) const override;
+
+	virtual UOptimusNodePin* TryAddPinFromPin(UOptimusNodePin* InSourcePin, FName InNewPinName) override;
+	
+	virtual bool RemoveAddedPin(UOptimusNodePin* InAddedPinToRemove) override;
+	
+	// FIXME: Use drop-down with a preset list + allow custom entry.
+	UPROPERTY(EditAnywhere, Category=Settings)
+	FName Category = CategoryName::Deformers;
+	
+	/** Name of kernel. This is also used as the entry point function name in generated code. */
+	UPROPERTY(EditAnywhere, Category=Settings)
+	FString KernelName = "MyKernel";
+
+	/** 
+	 * Number of threads in a thread group. 
+	 * Thread groups have 3 dimensions. 
+	 * It's better to have the total threads (X*Y*Z) be a value divisible by 32. 
+	 */
+	UPROPERTY(EditAnywhere, Category=Settings, meta=(Min=1))
+	FIntVector GroupSize = FIntVector(64, 1, 1);
+
+	/** Parameter bindings. Parameters are uniform values. */
+	UPROPERTY(EditAnywhere, Category=Bindings)
+	TArray<FOptimus_ShaderBinding> Parameters;
+	
+	/** Input bindings. Each one is a function that should be connected to an implementation in a data interface. */
+	UPROPERTY(meta=(DeprecatedProperty))
+	TArray<FOptimusParameterBinding> InputBindings_DEPRECATED;
+
+	/** Output bindings. Each one is a function that should be connected to an implementation in a data interface. */
+	UPROPERTY(meta=(DeprecatedProperty))
+	TArray<FOptimusParameterBinding> OutputBindings_DEPRECATED;	
+
+	/** Input bindings. Each one is a function that should be connected to an implementation in a data interface. */
+	UPROPERTY(EditAnywhere, Category = Bindings, DisplayName = "Input Bindings")
+	FOptimusParameterBindingArray InputBindingArray;
+
+	/** Output bindings. Each one is a function that should be connected to an implementation in a data interface. */
+	UPROPERTY(EditAnywhere, Category = Bindings, DisplayName = "Output Bindings")
+	FOptimusParameterBindingArray OutputBindingArray;
+	
+	/** 
+	 * The kernel source code. 
+	 * If the code contains more than just the kernel entry function, then place the kernel entry function inside a KERNEL {} block.
+	 */
+	UPROPERTY(EditAnywhere, Category = ShaderSource)
+	FOptimusShaderText ShaderSource;
+
+#if WITH_EDITOR
+	// IOptimusShaderTextProvider overrides
+	FOnDiagnosticsUpdated OnDiagnosticsUpdatedEvent;
+	virtual FOnDiagnosticsUpdated& OnDiagnosticsUpdated() override {return OnDiagnosticsUpdatedEvent; };
+	
+	void PostEditChangeProperty(struct FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
+
+	void PostLoad() override;
+	
+protected:
+	void ConstructNode() override;
+
+private:
+
+
+	static bool IsParameterBinding(FName InBindingPropertyName);
+	
+	void RefreshBindingPins(FName InBindingPropertyName);
+	void ClearBindingPins(FName InBindingPropertyName);
+	
+	void UpdatePinTypes(
+		EOptimusNodePinDirection InPinDirection
+		);
+
+	void UpdatePinNames(
+	    EOptimusNodePinDirection InPinDirection);
+
+	void UpdatePinDataDomains(
+		EOptimusNodePinDirection InPinDirection
+		);
+	
+	void UpdatePreamble();
+
+	TMap<FName, UOptimusNodePin*> GetFilteredPins(
+		EOptimusNodePinDirection InDirection,
+		EOptimusNodePinStorageType InStorageType) const;
+
+	static FString GetDeclarationForBinding(const FOptimus_ShaderBinding& Binding);
+	static FString GetDeclarationForBinding(const FOptimusParameterBinding& Binding, bool bIsInput);
+
+	TArray<UOptimusNodePin *> GetKernelPins(
+		EOptimusNodePinDirection InPinDirection
+		) const;
+};

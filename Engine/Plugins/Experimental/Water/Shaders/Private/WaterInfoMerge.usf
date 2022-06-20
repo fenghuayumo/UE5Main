@@ -1,0 +1,86 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+
+Texture2D<float4> DepthTexture;
+Texture2D<float4> ColorTexture;
+
+
+float2 WaterHeightExtents;
+float GroundZMin;
+float CaptureZ;
+
+struct FWaterColorPassResult
+{
+	float2 Velocity;
+	int WaterBodyIndex;
+	float SceneDepth;
+};
+
+FWaterColorPassResult MakeWaterColorPassResult(float4 InSampleData)
+{
+	FWaterColorPassResult Result;
+	Result.Velocity = InSampleData.rg;
+	Result.WaterBodyIndex = InSampleData.b;
+	Result.SceneDepth = InSampleData.a;
+	return Result;
+}
+
+float DecodeFloatRGB(float3 Enc)
+{
+	float3 Encoding = float3(1.0, 1.0 / 255.0, 1.0 / 65025.0);
+	return 1 - dot(Enc, Encoding);
+}
+
+float NormalizeHeight(float Height, float Min, float Max)
+{
+	float NormalizedHeight = 1.f;
+	// It's possible that the min and max are the same value in which case we might end up generating a div by zero error
+	// In this case it's okay to use the Normalized value of 1.0 which will just map to the Min value.
+	if (Min != Max)
+	{
+		NormalizedHeight = saturate((Height - Min) / (Max - Min));
+	}
+	return NormalizedHeight;
+}
+
+void Main(
+	in FScreenVertexOutput Input,
+	out float4 OutColor : SV_Target0
+	)
+{
+	const float4 SVPos = Input.Position;
+	uint2 TextureCoordinates = floor(SVPos.xy);
+	
+	const float GroundDeviceDepth = DecodeFloatRGB(DepthTexture.Load(int3(TextureCoordinates, 0)).rgb);
+	const float GroundSceneDepth = ConvertFromDeviceZ(GroundDeviceDepth);
+	const FWaterColorPassResult WaterInfo = MakeWaterColorPassResult(ColorTexture.Load(int3(TextureCoordinates, 0)));
+	const float WaterSceneDepth = WaterInfo.SceneDepth;
+	float WaterZ = CaptureZ - WaterSceneDepth;
+
+	float GroundZ = CaptureZ - GroundSceneDepth;
+
+	const float WaterZMin = WaterHeightExtents.x;
+	const float WaterZMax = WaterHeightExtents.y;
+	
+	// If this is a dilated region (indicated by WaterBodyIndex == -1) and it is above the ground we must push it down to prevent artifacts
+	// A negative NormalizedWaterZ is a special value for the material and will map to a value slightly below the terrain.
+	if (WaterInfo.WaterBodyIndex == -1 && WaterZ > GroundZ)
+	{
+		WaterZ = GroundZ - 32.f;
+	}
+
+	const float NormalizedWaterZ = NormalizeHeight(WaterZ, WaterZMin, WaterZMax);
+	
+	// If the GroundDepth is further than the far plane of the projection, set the GroundZ to some really far away value
+	if (GroundDeviceDepth == 1.0)
+	{
+		GroundZ = GroundZMin;
+	}
+	
+	const float NormalizedGroundZ = NormalizeHeight(GroundZ, GroundZMin, WaterZMax);
+
+
+	OutColor = float4(WaterInfo.Velocity, NormalizedWaterZ, NormalizedGroundZ);
+}
