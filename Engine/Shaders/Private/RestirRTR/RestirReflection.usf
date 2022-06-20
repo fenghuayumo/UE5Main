@@ -128,7 +128,10 @@ FSortedReflectionRay GenerateRestirReflectionRay(uint2 PixelPos, float2 UpscaleF
 	GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
 
 	float2 E = Rand1SPPDenoiserInput(PixelPos);
-	
+	// RandomSequence RandSequence;
+	// RandomSequence_Initialize(RandSequence, PixelPos, 0, View.StateFrameIndex, 1);
+	// float2 E = RandomSequence_GenerateSample1D(RandSequence);
+
 	const bool bOutputForDenoiser = true; // #todo: pass this in via constants when denoiser is on
 	if (bOutputForDenoiser)
 	{
@@ -482,15 +485,15 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingDeferredReflectionsRGS)
 	
             float risRnd =  RandomSequence_GenerateSample1D(RandSequence);
 
-            LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
-			// LocalReservoir.M = 1;
-			// LocalReservoir.weightSum = targetPdf * invSourcePdf;
-			// LocalReservoir.targetPdf = targetPdf;
-			// LocalReservoir.sampleRef = sampleRef;
+            // LocalReservoir.StreamSample(sampleRef, risRnd, targetPdf, invSourcePdf);
+			LocalReservoir.M = 1;
+			LocalReservoir.weightSum = invSourcePdf;
+			LocalReservoir.targetPdf = targetPdf;
+			LocalReservoir.sampleRef = sampleRef;
 			// LocalReservoir.sourcePdf = RayPdf;
 			// LocalReservoir.W = invSourcePdf;
-			LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
-			LocalReservoir.M = 1;
+			// LocalReservoir.FinalizeResampling(1.0, LocalReservoir.M);
+			// LocalReservoir.M = 1;
 		}
 
 		state = LocalReservoir;

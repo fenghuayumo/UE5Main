@@ -209,7 +209,7 @@ static TAutoConsoleVariable<int32> CVarRayTracingReflectionsExperimentalDeferred
 	TEXT("Whether to use the experimental deferred ray traced reflection rendering algorithm, which only supports a subset of features but runs faster. (default = 0)."),
 	ECVF_RenderThreadSafe);
 
-static TAutoConsoleVariable<float> CVarRayTracingReflectionsNormalBias(
+TAutoConsoleVariable<float> CVarRayTracingReflectionsNormalBias(
 	TEXT("r.RayTracing.Reflections.NormalBias"),
 	0.1,
 	TEXT("Magnitude of normal bias for reflection rays. (default = 0.1)"),
@@ -398,7 +398,7 @@ static int32 GetRayTracingReflectionsSamplesPerPixel(const FViewInfo& View)
 	return GRayTracingReflectionsSamplesPerPixel >= 0 ? GRayTracingReflectionsSamplesPerPixel : View.FinalPostProcessSettings.RayTracingReflectionsSamplesPerPixel;
 }
 
-static float GetRayTracingReflectionsMaxRoughness(const FViewInfo& View)
+float GetRayTracingReflectionsMaxRoughness(const FViewInfo& View)
 {
 	return FMath::Clamp(GRayTracingReflectionsMaxRoughness >= 0 ? GRayTracingReflectionsMaxRoughness : View.FinalPostProcessSettings.RayTracingReflectionsMaxRoughness, 0.01f, 1.0f);
 }

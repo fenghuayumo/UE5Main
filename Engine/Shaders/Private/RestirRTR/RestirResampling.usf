@@ -17,9 +17,15 @@
 #include "ReservoirManagement.ush"
 
 
+#define INITIAL_SAMPLE_PASS_NUM		0
+#define TEMPORAL_SAMPLE_PASS_NUM	1
+#define SPATIAL_SAMPLE_PASS_NUM		2
+#define EVALUATION_PASS_NUM			3
+
+
 int MaxTemporalHistory;
 float2 UpscaleFactor;
-
+int2  RayTracingBufferSize;
 Texture2D<float> DepthHistory;
 Texture2D<float4> NormalHistory;
 float ReflectionMaxRoughness;
@@ -89,46 +95,45 @@ bool CheckVisibility(int2 PixelCoord, FGBufferData GBuffer, float3 WorldPosition
     return !MinimalPayload.IsHit();
 }
 
-
-
-// [numthreads(8, 8, 1)]
 RAY_TRACING_ENTRY_RAYGEN(TemporalResamplingRGS)
 {
-    uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
-    //uint2 DispatchThreadId = DispatchThreadID.xy + View.ViewRectMin.xy;
-	// uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
-    uint2 PixelCoord = floor(float2(DispatchThreadId) * UpscaleFactor);
-	if (any(PixelCoord > View.ViewSizeAndInvSize.xy))
-	{
-		return;
-	}
+	uint2 DispatchThreadId = DispatchRaysIndex().xy;
+	const uint2 ViewSize = uint2(View.ViewSizeAndInvSize.xy);
+	const bool bValidThread = all(DispatchThreadId < ViewSize);
 
-   RandomSequence RandSequence = (RandomSequence) 0; // Not actually used, since hard shadows are forced
-   RandomSequence_Initialize(RandSequence, PixelCoord, 0, View.StateFrameIndex, 1);
+	DispatchThreadId = select(DispatchThreadId < ViewSize, DispatchThreadId, DispatchThreadId - ViewSize); // faster than mod
 
-	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+	const float2 BufferUV = (float2(DispatchThreadId + View.ViewRectMin.xy) + 0.5) * View.BufferSizeAndInvSize.zw;
+	const float2 ViewportUV = BufferUVToViewportUV(BufferUV);
+
+	const float2 ScreenPos = ViewportUVToScreenPos(ViewportUV);
+	const uint2 PixelRandomSeed = Rand3DPCG16(int3(DispatchThreadId, View.StateFrameIndexMod8)).xy;
+
+	const int2 PixelCoord = int2(BufferUV * RayTracingBufferSize);
+
 	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
-	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
-
-    const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999;
-    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
-	// float3 WorldPosition = ReconstructWorldPositionFromDepth(BufferUV, SceneDepth);
-    float3 TranslatedWorldPosition, CameraDirection;
-    ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
-	float3 WorldNormal = GBuffer.WorldNormal;
-    GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
+	GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
 	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
 
-    float3 V = -CameraDirection;
-    const float NoV = max(0, dot(WorldNormal, V));
+	const float SceneDepth = GBuffer.Depth;
+	const float DeviceZ = ConvertToDeviceZ(SceneDepth);
+	const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+	const bool bValidPixel = RoughnessFade > 0;
+	 uint LinearIndex = CalcLinearIndex(PixelCoord);
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + TEMPORAL_SAMPLE_PASS_NUM * 63 );
+
 	Reservoir state = Reservoir::Empty();
-	if ( bIsValidPixel) 
+	if (bValidPixel && bValidThread)
     {
+		const float3 TranslatedWorldPosition = mul(float4(ScreenPos * SceneDepth, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+		const float3 V = normalize(View.TranslatedWorldCameraOrigin - TranslatedWorldPosition);
+		const float3 N = GBuffer.WorldNormal;
+		const float NoV = max(0, dot(N, V));
         Reservoir curSample = Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
 
         int historyLimit = min(Reservoir::MaxM,MaxTemporalHistory * curSample.M);
         state.CombineReservoirs(curSample, /* random = */ 0.5, curSample.targetPdf);
-        state = curSample;
+        // state = curSample;
         // Backproject this pixel to last frame
 
         // start by just using our sample position
@@ -161,33 +166,39 @@ RAY_TRACING_ENTRY_RAYGEN(TemporalResamplingRGS)
             ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
         }
 
-        const float AngleOffset = ((View.StateFrameIndex + 7) * 11) % 32 * 2 * PI;
+        bool foundNeighbor = false;//DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), PrevUV);
+		const float radius = 3;
 
-        for (uint SampleIndex = 0; SampleIndex < 1  && state.M < MaxTemporalHistory; ++SampleIndex)
-        {
-            const float Angle = (SampleIndex + AngleOffset) * GOLDEN_ANGLE;
-            const float OffsetRadius = sqrt(float(((SampleIndex - 1) + View.StateFrameIndex) & 3) + 1) * clamp(MaxTemporalHistory - state.M, 1, MaxTemporalHistory); // TODO: keep high in noisy situation
-            const float2 PixelOffsetBase = float2(cos(Angle), sin(Angle)) * OffsetRadius;
-            const int2 PixelOffset = SampleIndex == 0 ? int2(0, 0) : int2(PixelOffsetBase);
-            // const float4 reproj = ReprojectionMap[PixelCoord + Offset * 2];
-	        int2 idx = prevPos + PixelOffset;
+		// Try to find a matching surface in the neighborhood of the reprojected pixel
+		for (int i = 0; i < 9; i++)
+		{
+			int2 offset = 0;
+			if (i > 0)
+			{
+				offset = int2((RandContext.GenerateSample2D() - 0.5f) * radius);
+			}
+			int2 idx = prevPos + offset;
 
-            float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
-            float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
+			float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
+			float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
 
-            // TODO: refine sample rejection tests
-            if (dot(GBuffer.WorldNormal, PrevWorldNormal) < 0.5)
-            {
-                continue;
-            }
+			// TODO: refine sample rejection tests
+			if (dot(GBuffer.WorldNormal, PrevWorldNormal) < 0.5)
+			{
+				continue;
+			}
 
-            if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > 0.1)
-            {
-                continue;
-            }
+			if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > 0.1)
+			{
+				continue;
+			}
+			prevPos = idx;
+			foundNeighbor = true;
+			break;
+		}
 
-            prevPos = idx;
-
+		if (foundNeighbor)
+		{
             const uint2 prePosId = clamp(floor(prevPos / UpscaleFactor  ), uint2(0,0), ReservoirBufferDim.xy - 1);
             Reservoir prevSample = Reservoir::Load(ReadReservoirHistoryData(prePosId, 0));
             prevSample.M = min(prevSample.M, MaxTemporalHistory);
@@ -200,86 +211,168 @@ RAY_TRACING_ENTRY_RAYGEN(TemporalResamplingRGS)
             float3 SampleL = normalize(OffsetA);
             const float a2 = max(1e-5, Pow4(GBuffer.Roughness));
             const float3 SampleH = normalize(V + SampleL);
-            const float SampleNoH = max(0, dot(WorldNormal, SampleH));
+            const float SampleNoH = max(0, dot(N, SampleH));
 
             float PrevNdf = D_GGX(a2, SampleNoH);
-            // prevSample.M = min(prevSample.M, MaxTemporalHistory * smoothstep(0.005, 0.01, PrevNdf));
-			const float SampleNoL = max(0, dot(WorldNormal, SampleL));
-
+            prevSample.M = min(prevSample.M, MaxTemporalHistory * smoothstep(0.005, 0.01, PrevNdf));
+			const float SampleNoL = max(0, dot(N, SampleL));
             const float LocalBRDF = D_GGX(a2, SampleNoH) * Vis_Smith(a2, NoV, SampleNoL) * SampleNoL;
-            // Discard back-face
-            // if (dot(WorldNormal, OffsetA) < 0 || any(isnan(OffsetA)) || any(isnan(OffsetB)))
-            // {
-            //     continue;
-            // }
 
-            // float RB2 = dot(OffsetB, OffsetB);
-            // float RA2 = dot(OffsetA, OffsetA);
-            // OffsetB = normalize(OffsetB);
-            // OffsetA = normalize(OffsetA);
-
-            // float cosA = dot(WorldNormal, OffsetB);
-            // float cosB = dot(prevSample.sampleRef.CreationNormal, OffsetB);
-            // float cosPhiA = -dot(OffsetA, prevSample.sampleRef.Normal);
-            // float cosPhiB = -dot(OffsetB, prevSample.sampleRef.Normal);
-            // // Discard extreme samples to prevent fireflies
-            // if ( cosPhiB <= 0 || RA2 <= 0 || RB2 <= 0)
-            // {
-            //     continue;
-            // }
-            // float Jocbian = RB2 * max(0.0,cosPhiA) / max(1e-5, (RA2 * cosPhiB));
-            float Jocbian = 1.0;
-
-			// TODO: finish the derivations, don't perspective-project for every sample.
-            // const float3 SurfaceOffset = prevSample.sampleRef.CreationPoint - TranslatedWorldPosition;
-
-			// const float3 RayMarchDir = prevSample.sampleRef.Position - TranslatedWorldPosition;
-			// const float3 RayMarchEnd = TranslatedWorldPosition + RayMarchDir * min(1.0, length(SurfaceOffset) / length(RayMarchDir));
-
-			// float4 RayHitClipPos = mul(float4(RayMarchEnd, 1), View.WorldToClip);
-			// float3 RayHitScreenPos = RayHitClipPos.xyz / RayHitClipPos.w;
-			// float2 RayMarchHitUv = RayHitScreenPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
-			// uint2 HitPixelCoord = RayMarchHitUv * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
-			// const float2 RaymarchLenPx = HitPixelCoord - PixelCoord;
-
-			// const uint MIN_PX_PER_STEP = 2;
-			// const uint MAX_TAPS = 2;
-
-			// const int StepCount = min(MAX_TAPS, int(floor(length(RaymarchLenPx) / MIN_PX_PER_STEP)));
-
-			// // Depth values only have the front; assume a certain thickness.
-			// const float Z_LAYER_THICKNESS = 0.05;
-
-			// for (int k = 0; k < StepCount; ++k) 
-			// {
-			//     const float t = (k + 0.5) / StepCount;
-			//     const float3 InterpPos = lerp(WorldPosition, RayMarchEnd, t);
-			//     float4 InterpClipPos = mul(float4(InterpPos, 1), View.WorldToClip);
-			//     InterpClipPos.xyz /= InterpClipPos.w;
-			// 	float2 RayMarchUV = InterpClipPos.xy * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
-			//     const float DepthAtInterp = DepthHistory.SampleLevel(GlobalPointClampedSampler, RayMarchUV, 0);
-			//     if (DepthAtInterp > InterpClipPos.z * 1.001) 
-			//         Visible *= smoothstep(0, Z_LAYER_THICKNESS, abs( max(1e-20,InterpClipPos.z) /max(1e-20,DepthAtInterp) ) -1.0 );
-			// }
             if( ApproxVisibility)
                 if( !CheckVisibility(PixelCoord, GBuffer, TranslatedWorldPosition, prevSample))
                     Visible = 0;
-
+            float Jocbian = 1.0;
             if (prevSample.sampleRef.IsValid())
             {
-                float pNewTN = Luminance(prevSample.sampleRef.Irradiance * LocalBRDF);
+                float pNewTN =  max(1e-3, Luminance(prevSample.sampleRef.Irradiance * LocalBRDF));
             
-                state.CombineReservoirs(prevSample, RandomSequence_GenerateSample1D(RandSequence), Visible * pNewTN * Jocbian);
+                state.CombineReservoirs(prevSample, RandContext.GenerateSample1D(), Visible * pNewTN * Jocbian);
             }
 		}
         state.FinalizeResampling(1, state.M);
-        // state.W = (1.0 / max(1e-5, state.targetPdf)) * (state.weightSum / max(1e-5, state.M));
-        // state.W = min(state.W, 1e20);
-
     }
 
     WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
 }
+
+// [numthreads(8, 8, 1)]
+// RAY_TRACING_ENTRY_RAYGEN(TemporalResamplingRGS)
+// {
+//     uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
+//     //uint2 DispatchThreadId = DispatchThreadID.xy + View.ViewRectMin.xy;
+// 	// uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor);
+//     uint2 PixelCoord = floor(float2(DispatchThreadId) * UpscaleFactor);
+// 	if (any(PixelCoord > View.ViewSizeAndInvSize.xy))
+// 	{
+// 		return;
+// 	}
+//     uint LinearIndex = CalcLinearIndex(PixelCoord);
+// 	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex + TEMPORAL_SAMPLE_PASS_NUM * 63 );
+
+// 	const float2 BufferUV = (PixelCoord + 0.5) * View.BufferSizeAndInvSize.zw;
+// 	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+// 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
+
+//     float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+// 	// float3 WorldPosition = ReconstructWorldPositionFromDepth(BufferUV, SceneDepth);
+//     float3 TranslatedWorldPosition, CameraDirection;
+//     ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
+// 	float3 WorldNormal = GBuffer.WorldNormal;
+//     GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
+// 	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
+//     const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+//     const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999 && RoughnessFade > 0;
+
+//     float3 V = -CameraDirection;
+//     const float NoV = max(0, dot(WorldNormal, V));
+// 	Reservoir state = Reservoir::Empty();
+// 	if ( bIsValidPixel) 
+//     {
+//         Reservoir curSample = Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
+
+//         int historyLimit = min(Reservoir::MaxM,MaxTemporalHistory * curSample.M);
+//         state.CombineReservoirs(curSample, /* random = */ 0.5, curSample.targetPdf);
+//         // state = curSample;
+//         // Backproject this pixel to last frame
+
+//         // start by just using our sample position
+//         int2 prevPos = PixelCoord;
+//         float ExpectedPrevLinearDepth = GBuffer.Depth;
+
+//         float2 ViewUV = (float2(PixelCoord) + 0.5) * View.ViewSizeAndInvSize.zw;
+//         float4 NDC = float4(ViewUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+
+//     #if GBUFFER_HAS_VELOCITY && 0
+//         // Some objects can get marked as not having velocities, which leads to DecodeGBuffer zeroing them
+//         // This appears to be errant under some conditions, so overriding the rejection produces better results
+//         GBuffer.Velocity = GBufferVelocityTexture.Load(int3(PixelCoord, 0));
+//     #endif
+//         if (GBuffer.Velocity.x > 0.0)
+//         {
+//             float2 Velocity = DecodeVelocityFromTexture(GBuffer.Velocity).xy;
+//             float2 PrevNDC = NDC.xy - Velocity;
+//             float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+//             prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+//             ExpectedPrevLinearDepth = ConvertFromDeviceZ(DeviceZ - DecodeVelocityFromTexture(GBuffer.Velocity).z);
+//         }
+//         else
+//         {
+//             float4 PrevNDC = mul(NDC, View.ClipToPrevClip);
+//             PrevNDC.xyz /= PrevNDC.w;
+//             float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+//             prevPos = PrevUV * View.ViewSizeAndInvSize.xy + View.ViewRectMin.xy;
+
+//             ExpectedPrevLinearDepth = ConvertFromDeviceZ(PrevNDC.z);
+//         }
+
+//         bool foundNeighbor = false;//DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), PrevUV);
+// 		const float radius = 3;
+
+// 		// Try to find a matching surface in the neighborhood of the reprojected pixel
+// 		for (int i = 0; i < 9; i++)
+// 		{
+// 			int2 offset = 0;
+// 			if (i > 0)
+// 			{
+// 				offset = int2((RandContext.GenerateSample2D() - 0.5f) * radius);
+// 			}
+// 			int2 idx = prevPos + offset;
+
+// 			float PrevDepth = ConvertFromDeviceZ(DepthHistory.Load(int3(idx, 0)).r);
+// 			float3 PrevWorldNormal = normalize(DecodeNormal(NormalHistory.Load(int3(idx, 0)).xyz));
+
+// 			// TODO: refine sample rejection tests
+// 			if (dot(GBuffer.WorldNormal, PrevWorldNormal) < 0.5)
+// 			{
+// 				continue;
+// 			}
+
+// 			if (abs(ExpectedPrevLinearDepth - PrevDepth) / ExpectedPrevLinearDepth > 0.1)
+// 			{
+// 				continue;
+// 			}
+// 			prevPos = idx;
+// 			foundNeighbor = true;
+// 			break;
+// 		}
+
+// 		if (foundNeighbor)
+// 		{
+//             const uint2 prePosId = clamp(floor(prevPos / UpscaleFactor  ), uint2(0,0), ReservoirBufferDim.xy - 1);
+//             Reservoir prevSample = Reservoir::Load(ReadReservoirHistoryData(prePosId, 0));
+//             prevSample.M = min(prevSample.M, MaxTemporalHistory);
+
+// 			float Visible = 1.0;
+            
+//             float3 OffsetB = prevSample.sampleRef.Position - prevSample.sampleRef.CreationPoint;
+//             float3 OffsetA = prevSample.sampleRef.Position + LWCHackToFloat(PrimaryView.PreViewTranslation) - TranslatedWorldPosition;
+
+//             float3 SampleL = normalize(OffsetA);
+//             const float a2 = max(1e-5, Pow4(GBuffer.Roughness));
+//             const float3 SampleH = normalize(V + SampleL);
+//             const float SampleNoH = max(0, dot(WorldNormal, SampleH));
+
+//             float PrevNdf = D_GGX(a2, SampleNoH);
+//             prevSample.M = min(prevSample.M, MaxTemporalHistory * smoothstep(0.005, 0.01, PrevNdf));
+// 			const float SampleNoL = max(0, dot(WorldNormal, SampleL));
+//             const float LocalBRDF = D_GGX(a2, SampleNoH) * Vis_Smith(a2, NoV, SampleNoL) * SampleNoL;
+
+//             if( ApproxVisibility)
+//                 if( !CheckVisibility(PixelCoord, GBuffer, TranslatedWorldPosition, prevSample))
+//                     Visible = 0;
+//             float Jocbian = 1.0;
+//             if (prevSample.sampleRef.IsValid())
+//             {
+//                 float pNewTN =  max(1e-3, Luminance(prevSample.sampleRef.Irradiance * LocalBRDF));
+            
+//                 state.CombineReservoirs(prevSample, RandContext.GenerateSample1D(), Visible * pNewTN * Jocbian);
+//             }
+// 		}
+//         state.FinalizeResampling(1, state.M);
+//     }
+
+//     WriteReservoirData(DispatchThreadId, OutputSlice, state.Store());
+// }
 
 void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuffer, float DeviceZ, float3 TranslatedWorldPosition, float3 CameraDirection, inout FRandomContext RandContext, inout Reservoir state)
 {
@@ -309,9 +402,10 @@ void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuf
 	const int TARGET_M = 512;
 	for (int i = 0; i < NumSamples && state.M < TARGET_M; ++i)
 	{
-		float ang = (i + AngleOffset) * GOLDEN_ANGLE;
-        float radius = float(i + RandContext.GenerateSample1D()) * (KernelRadius / NumSamples);
-        int2 PixelOffset = float2(cos(ang), sin(ang)) * radius;
+		// float ang = (i + AngleOffset) * GOLDEN_ANGLE;
+        // float radius = float(i + RandContext.GenerateSample1D()) * (KernelRadius / NumSamples);
+         int2 PixelOffset = RandContext.GenerateSample1D() * KernelRadius;
+        // int2 PixelOffset = float2(cos(ang), sin(ang)) * radius;
 		const int2 SampleCoord = PixelCoord + PixelOffset;
 
 		if (any(SampleCoord < 0) || any(SampleCoord >= View.BufferSizeAndInvSize.xy) || all(SampleCoord == PixelCoord))
@@ -344,7 +438,7 @@ void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuf
 		}
 		uint2 samplePosID = clamp(floor(SampleCoord / UpscaleFactor ), uint2(0,0), ReservoirBufferDim.xy - 1);
 		Reservoir neighborSample = Reservoir::Load(ReadReservoirData(samplePosID, InputSlice));
-
+        // neighborSample.M = min(neighborSample.M, 500);
 		// Load that neighbor's RIS state, do resampling
 		if (neighborSample.sampleRef.IsValid())
 		{			
@@ -373,7 +467,7 @@ void ApplySpatialResampling(uint2 PixelCoord,uint2 DispatchID, FGBufferData GBuf
 
             const float LocalBRDF = D_GGX(a2, SampleNoH) * Vis_Smith(a2, NoV, SampleNoL) * SampleNoL;
 
-			float pNewTN = Luminance(neighborSample.sampleRef.Irradiance * LocalBRDF);
+			float pNewTN =  max(1e-3, Luminance(neighborSample.sampleRef.Irradiance * LocalBRDF));
 
 			// float RB2 = dot(OffsetB, OffsetB);
 			// float RA2 = dot(OffsetA, OffsetA);
@@ -416,18 +510,23 @@ RAY_TRACING_ENTRY_RAYGEN(SpatialResamplingRGS)
 		return;
 	}
 	uint LinearIndex = CalcLinearIndex(PixelCoord);
-	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex );
+	FRandomContext RandContext = FRandomContext::Create(LinearIndex, View.StateFrameIndex  + SPATIAL_SAMPLE_PASS_NUM * 63);
 
 	FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+    GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
+	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
+
 	float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
 	float3 TranslatedWorldPosition;
 	float3 CameraDirection;
 	ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
 
-
+    
 	Reservoir state = Reservoir::Empty();
 	const bool bIsDepthValid = DeviceZ > 0.0 && DeviceZ < 0.999;
-	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+    const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && RoughnessFade > 0;
 
 	if (bIsValidPixel)
 	{

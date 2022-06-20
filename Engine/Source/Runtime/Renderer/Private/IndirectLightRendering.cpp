@@ -24,7 +24,7 @@
 #include "RendererUtils.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Lumen/LumenTracingUtils.h"
-
+#include "Fusion/FusionDenoiser.h"
 // Must match EDynamicGlobalIlluminationMethod
 // Note: Default for new projects set by GameProjectUtils
 static TAutoConsoleVariable<int32> CVarDynamicGlobalIlluminationMethod(
@@ -1652,8 +1652,7 @@ void FDeferredShadingSceneRenderer::RenderDeferredReflectionsAndSkyLighting(
 			if (bDenoise)
 			{
 				const IScreenSpaceDenoiser* DefaultDenoiser = IScreenSpaceDenoiser::GetDefaultDenoiser();
-				const IScreenSpaceDenoiser* DenoiserToUse = DenoiserMode == 1 ? DefaultDenoiser : GScreenSpaceDenoiser;
-
+				const IScreenSpaceDenoiser* DenoiserToUse = DenoiserMode == 2 ?  FFusionDenoiser::GetDenoiser(): DenoiserMode == 1 ? DefaultDenoiser : GScreenSpaceDenoiser;
 				// Standard event scope for denoiser to have all profiling information not matter what, and with explicit detection of third party.
 				RDG_EVENT_SCOPE(GraphBuilder, "%s%s(Reflections) %dx%d",
 					DenoiserToUse != DefaultDenoiser ? TEXT("ThirdParty ") : TEXT(""),

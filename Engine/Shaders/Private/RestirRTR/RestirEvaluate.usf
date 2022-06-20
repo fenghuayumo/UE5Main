@@ -1,40 +1,65 @@
 #include "../Common.ush"
-
+#define USE_PREEXPOSURE 0
+#define USE_TONEMAP 1
 #define SUPPORT_CONTACT_SHADOWS		0
 
+#include "../Common.ush"
 #include "../DeferredShadingCommon.ush"
-#include "../DeferredLightingCommon.ush"
-#include "../ReflectionEnvironmentShared.ush"
-#include "../Montecarlo.ush"
-#include "../PathTracing/Utilities/PathTracingRandomSequence.ush" 
 #include "../SceneTextureParameters.ush"
+#include "../ScreenSpaceDenoise/SSDPublic.ush"
+#include "../MortonCode.ush"
+#include "../BRDF.ush"
 
 #include "../RayTracing/RayTracingCommon.ush"
 #include "../RayTracing/RayTracingDeferredShadingCommon.ush"
 #include "../RayTracing/RayTracingReflectionsCommon.ush"
-
+#include "../RayTracing/RayTracingDeferredReflections.ush"
 
 #include "ReservoirManagement.ush"
 
 RWTexture2D<float4>                             ColorOutput;
+RWTexture2D<float4>                             DebugTex;
 
 int    InputSlice;
 
 RaytracingAccelerationStructure                 TLAS;
 float ReflectionMaxNormalBias;
 float ReflectionMaxRoughness;
+float ReflectionSmoothBias;
 float2 UpscaleFactor;
 int    ApproxVisibility;
 int  FeedbackVisibility;
+
+Texture2D RawReflectionColor;
+
+float3 FastTonemap(float3 c)
+{
+	return c * rcp(max3(c.r, c.g, c.b) + 1.0);
+}
+
+float3 InvFastTonemap(float3 c)
+{
+	return c * rcp(1.0 - max3(c.r, c.g, c.b));
+}
+
+#if USE_TONEMAP
+#	define TONEMAP(x) FastTonemap(x)
+#	define INV_TONEMAP(x) InvFastTonemap(x)
+#else // USE_TONEMAP
+#	define TONEMAP(x) (x)
+#	define INV_TONEMAP(x) (x)
+#endif // USE_TONEMAP
 
 RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
 {
 
     uint2 DispatchThreadId = DispatchRaysIndex().xy + View.ViewRectMin.xy;
     uint2 PixelCoord = GetPixelCoord(DispatchThreadId, UpscaleFactor.x);
-
+	DebugTex[DispatchThreadId] = 0;
     // Get G-Buffer surface data
     FGBufferData GBuffer = GetGBufferDataFromSceneTexturesLoad(PixelCoord);
+	GBuffer.Roughness = GetRayTracingClearCoatApproximateRoughness(GBuffer);
+	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
 
     float Depth = GBuffer.Depth;
     float DeviceZ = SceneDepthTexture.Load(int3(PixelCoord, 0)).r;
@@ -44,7 +69,9 @@ RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
     ReconstructTranslatedWorldPositionAndCameraDirectionFromDeviceZ(PixelCoord, DeviceZ, TranslatedWorldPosition, CameraDirection);
     float3 V = -CameraDirection;
     const bool bIsDepthValid = DeviceZ > 0.0;
-	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid;
+	const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+
+	const bool bIsValidPixel = GBuffer.ShadingModelID != SHADINGMODELID_UNLIT && bIsDepthValid && RoughnessFade > 0;
 
     Reservoir risSample = Reservoir::Empty();
 	float3 ExitantRadiance = 0.0;
@@ -55,13 +82,11 @@ RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
 	{
 		{
 			risSample = Reservoir::Load(ReadReservoirData(DispatchThreadId, InputSlice));
-
-			if (risSample.sampleRef.IsValid())
+			//if (risSample.sampleRef.IsValid())
 			{
                 const float NoV = max(0, dot(GBuffer.WorldNormal, V));
 
 		        const float a2 = max(1e-5, Pow4(GBuffer.Roughness));
-
 
                 float3 LightPosition = risSample.sampleRef.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
 				float3 Direction = (LightPosition - TranslatedWorldPosition);
@@ -70,8 +95,7 @@ RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
 				Ray.Origin = TranslatedWorldPosition;
 				Ray.Direction = normalize(Direction);
 				Ray.TMin = 0;
-				Ray.TMax = length(Direction) - 1e-1;
-				Ray.TMax = min(Ray.TMax, 1e27);
+				Ray.TMax = length(Direction) - 1e-3;
 
 				float3 BiasNormal = GBuffer.WorldNormal;
 				if ( dot(BiasNormal, Ray.Direction) < 0.0)
@@ -117,6 +141,8 @@ RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
 
 					RayDistance += Ray.TMax;
 					HitCount += 1.0f;
+					float3 color = risSample.weightSum  ;
+					DebugTex[DispatchThreadId] = float4(color ,1.0);
 				}
 				else
 				{
@@ -130,26 +156,31 @@ RAY_TRACING_ENTRY_RAYGEN(RestirEvaluateRGS)
 					}
 				}
             }
-            else
-			{
-				// sample occluded, kill it for the history
-				risSample = Reservoir::Empty();
-			}
-            WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+            // else
+			// {
+			// 	// sample occluded, kill it for the history
+			// 	risSample = Reservoir::Empty();
+			// }
+            // WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0));
         }
-        ExitantRadiance /= float(1);
 
 		RayDistance /= max(HitCount, 1.0);
 
 		// Apply the pre-exposure scale to the resulting shaded value
-#if USE_PREEXPOSURE
-		ExitantRadiance *= View.PreExposure;
-#endif
+// #if USE_PREEXPOSURE
+		// ExitantRadiance *= View.PreExposure;
+// #endif
+		//ExitantRadiance = INV_TONEMAP(ExitantRadiance);
     }
-    else
+    //else
 	{
 		// Invalid pixel, write empty reservoir
-		WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
+		WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0));
 	}
-    ColorOutput[DispatchThreadId] = float4(ExitantRadiance,1.0);
+
+
+	float alpha = RawReflectionColor.Load(uint3(DispatchThreadId, 0)).a;
+    ColorOutput[DispatchThreadId] = float4(ExitantRadiance,alpha);
+	// float3 color = risSample.weightSum;
+	// DebugTex[DispatchThreadId] = float4(color ,1.0);
 }

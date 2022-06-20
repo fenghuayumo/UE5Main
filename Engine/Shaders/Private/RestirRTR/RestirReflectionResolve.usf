@@ -43,10 +43,11 @@ Texture2D ReflectionHistory;
 Texture2D RawReflectionColor;
 Texture2D ReflectionDenoiserData; // xyz: camera-relative reflection hit position, w: 1/pdf
 
+int InputSlice;
 // Outputs
 
 RWTexture2D<float4> ColorOutput;
-
+RWTexture2D<float4> DebugTex;
 float3 FastTonemap(float3 c)
 {
 	return c * rcp(max3(c.r, c.g, c.b) + 1.0);
@@ -172,7 +173,7 @@ void ReflectionResolveCS(
 	float ReflectionHitDistance = 0;
 
 	Reservoir risSample = Reservoir::Empty();
-
+	DebugTex[View.ViewRectMin.xy + DispatchThreadId] = 0;
 	if (bValidPixel && bValidThread)
 	{
 		const float3 PositionTranslatedWorld = mul(float4(ScreenPos * SceneDepth, SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
@@ -199,14 +200,13 @@ void ReflectionResolveCS(
 		for (int i = 0; i < NUM_SAMPLES; ++i)
 		{
 			float2 HammersleySample = Hammersley16(i, NUM_SAMPLES, PixelRandomSeed);
-			//float2 DiskSample = HammersleySample * 2.0 - 1.0; // cheapest, but may produce noticeable rectangular block artifacts
+			// float2 DiskSample = HammersleySample * 2.0 - 1.0; // cheapest, but may produce noticeable rectangular block artifacts
 			float2 DiskSample = UniformSampleDisk(HammersleySample); // slightly more expensive, but maybe slightly better? the jury is out...
-			//float2 DiskSample = UniformSampleDisk(RandomFloat2(PixelRandomSeed));
+			// float2 DiskSample = UniformSampleDisk(RandomFloat2(PixelRandomSeed));
 			float2 SampleOffset = DiskSample * FilterSize;
-
 			const int2 SamplePixelId = clamp(int2(ReflectionPixelPos + SampleOffset), ViewRectBounds.xy, ViewRectBounds.zw);
 
-			risSample = Reservoir::Load(ReadReservoirData(SamplePixelId, 0));
+			risSample = Reservoir::Load(ReadReservoirData(SamplePixelId, InputSlice));
 
 			// const float4 DenoiserData = ReflectionDenoiserData.Load(uint3(SamplePixelId, 0));
 			// float InvRayPdf = DenoiserData.w;
@@ -215,7 +215,7 @@ void ReflectionResolveCS(
 			// const float RayLength = length(RayOriginRelativeHitPosition);
 
 			// ReflectionHitDistance += RayLength;
-
+			
 			float4 SampleColor = RawReflectionColor.Load(uint3(SamplePixelId, 0));
 			SampleColor.xyz = risSample.sampleRef.Irradiance;
 
@@ -233,19 +233,17 @@ void ReflectionResolveCS(
             // NeiborSamplingPdf /= clamp(CenterToHitVis / SampleToHitVis, 1e-1, 1e1);
 			// ReflectionHitDistance += CenterToHitDist;
 			// const float3 SampleL =  CenterToHit * rcp(CenterToHitDist);
-			const float3 SampleL = normalize(risSample.sampleRef.Position - risSample.sampleRef.CreationPoint);
+			const float3 SampleL = normalize(risSample.sampleRef.Position + LWCHackToFloat(PrimaryView.PreViewTranslation) - PositionTranslatedWorld);
 			const float3 SampleH = normalize(V + SampleL);
 			const float SampleNoH = max(0, dot(N, SampleH));
 			const float SampleNoL = max(0, dot(N, SampleL));
 			const float VoH = saturate(dot(V, SampleH));
 
 			const float D = D_GGX(a2, SampleNoH);
-			// float3 F = F_Schlick( GBuffer.SpecularColor, VoH );
-			// float G_SmithL = 2 * SampleNoL / (SampleNoL + sqrt(SampleNoL * (SampleNoL - SampleNoL * a2) + a2));
 			float Vis = Vis_Smith(a2, NoV, SampleNoL);
 			const float LocalBRDF = D * Vis * SampleNoL;
 			// const float SpecPdf = D * SampleNoH; //Pdf GGX
-			const float SpecPdf = 2 * VoH * D / (NoV + sqrt(NoV * (NoV - NoV * a2) + a2)); //PdfVGGX
+			//const float SpecPdf = 2 * VoH * D / (NoV + sqrt(NoV * (NoV - NoV * a2) + a2)); //PdfVGGX
 
 			// float InvRayPdf =  1.0 / risSample.sourcePdf;
 
@@ -268,89 +266,89 @@ void ReflectionResolveCS(
 		ReflectionColor.a = ReflectionColor.a / WeightSum;
 	}
 
-	// if (ReflectionHistoryWeight > 0)
-	// {
-	// 	WriteSharedColorSample(GroupThreadId, ReflectionColor);
-	// 	GroupMemoryBarrierWithGroupSync();
-	// }
+	if (ReflectionHistoryWeight > 0)
+	{
+		WriteSharedColorSample(GroupThreadId, ReflectionColor);
+		GroupMemoryBarrierWithGroupSync();
+	}
 
-	// if (ReflectionHistoryWeight > 0 && bValidPixel && bValidThread)
-	// {
-	// 	// Compute neighborhood color bounds (as mean and variance)
+	if (ReflectionHistoryWeight > 0 && bValidPixel && bValidThread)
+	{
+		// Compute neighborhood color bounds (as mean and variance)
 
-	// 	// NOTE: Reflection image uses premultiplied alpha, so we must handle all 4 components during temporal filtering
-	// 	float4 ColorM1 = (float4)0.0;
-	// 	float4 ColorM2 = (float4)0.0;
+		// NOTE: Reflection image uses premultiplied alpha, so we must handle all 4 components during temporal filtering
+		float4 ColorM1 = (float4)0.0;
+		float4 ColorM2 = (float4)0.0;
 
-	// 	// Technically this is incorrect and may introduce artifacts (discontinuities) on borders between thread groups.
-	// 	// Can be seen quite clearly when screen percentage is very low, but not obvious or objectionable at typical resolutions.
-	// 	// Per-frame thread offsetting is effective at masking the issue over time (enabled using SpatialResolve.TemporalQuality=2)
-	// 	const int4 ValidTapBounds = int4(0, 0, THREADGROUP_SIZE_X-1, THREADGROUP_SIZE_Y-1);
+		// Technically this is incorrect and may introduce artifacts (discontinuities) on borders between thread groups.
+		// Can be seen quite clearly when screen percentage is very low, but not obvious or objectionable at typical resolutions.
+		// Per-frame thread offsetting is effective at masking the issue over time (enabled using SpatialResolve.TemporalQuality=2)
+		const int4 ValidTapBounds = int4(0, 0, THREADGROUP_SIZE_X-1, THREADGROUP_SIZE_Y-1);
 
-	// 	int Count = 0;
-	// 	for (int y = -1; y <= 1; ++y)
-	// 	{
-	// 		for (int x = -1; x <= 1; ++x)
-	// 		{
-	// 			int2 TapOffset = int2(x, y);
-	// 			int2 TapPos = clamp(int2(GroupThreadId) + TapOffset, ValidTapBounds.xy, ValidTapBounds.zw);
-	// 			float4 SampleColor = ReadSharedColorSample(TapPos);
+		int Count = 0;
+		for (int y = -1; y <= 1; ++y)
+		{
+			for (int x = -1; x <= 1; ++x)
+			{
+				int2 TapOffset = int2(x, y);
+				int2 TapPos = clamp(int2(GroupThreadId) + TapOffset, ValidTapBounds.xy, ValidTapBounds.zw);
+				float4 SampleColor = ReadSharedColorSample(TapPos);
 
-	// 			// Welford's online algorithm for variance.
-	// 			// More numerically stable than accumulating squares.
-	// 			// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
-	// 			Count += 1;
-	// 			float4 Delta1 = SampleColor - ColorM1;
-	// 			ColorM1 += Delta1 / Count;
-	// 			float4 Delta2 = SampleColor - ColorM1;
-	// 			ColorM2 += Delta1 * Delta2;
-	// 		}
-	// 	}
-	// 	ColorM2 /= (Count - 1); // normalization step to get final variance
+				// Welford's online algorithm for variance.
+				// More numerically stable than accumulating squares.
+				// https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance
+				Count += 1;
+				float4 Delta1 = SampleColor - ColorM1;
+				ColorM1 += Delta1 / Count;
+				float4 Delta2 = SampleColor - ColorM1;
+				ColorM2 += Delta1 * Delta2;
+			}
+		}
+		ColorM2 /= (Count - 1); // normalization step to get final variance
 
-	// 	float4 ColorStdDev = sqrt(ColorM2);
+		float4 ColorStdDev = sqrt(ColorM2);
 
-	// 	// Dual source reprojection as per DD2018: Tomasz Stachowiak - Stochastic all the things
+		// Dual source reprojection as per DD2018: Tomasz Stachowiak - Stochastic all the things
 
-	// 	float4 EncodedVelocity = Texture2DSampleLevel(GBufferVelocityTexture, GlobalPointClampedSampler, BufferUV, 0);
+		float4 EncodedVelocity = Texture2DSampleLevel(GBufferVelocityTexture, GlobalPointClampedSampler, BufferUV, 0);
 
-	// 	float2 BufferUV1 = GetReprojectedBufferUV(ScreenPos, SceneDepth, EncodedVelocity);
-	// 	float2 BufferUV2 = GetReprojectedBufferUV(ScreenPos, SceneDepth + ReflectionHitDistance, EncodedVelocity);
+		float2 BufferUV1 = GetReprojectedBufferUV(ScreenPos, SceneDepth, EncodedVelocity);
+		float2 BufferUV2 = GetReprojectedBufferUV(ScreenPos, SceneDepth + ReflectionHitDistance, EncodedVelocity);
 
-	// 	float HistoryWeight = ReflectionHistoryWeight;
+		float HistoryWeight = ReflectionHistoryWeight;
 
-	// 	// NOTE: Bilinear sampling is intentionally used to sample the history buffer.
-	// 	// If point filter is used, the rounding of texture coordinates can introduce a noticeable distortion artifact.
-	// 	// Bilinaer filter will introduce blur, but it's less noticeable than the distortion.
-	// 	// #yuriy_todo: can try to stochastically jitter the UV by 0.5 texel and still use point filter.
-	// 	float4 HistoryColor1 = ReflectionHistory.SampleLevel(GlobalBilinearClampedSampler, BufferUV1, 0);
-	// 	float4 HistoryColor2 = ReflectionHistory.SampleLevel(GlobalBilinearClampedSampler, BufferUV2, 0);
+		// NOTE: Bilinear sampling is intentionally used to sample the history buffer.
+		// If point filter is used, the rounding of texture coordinates can introduce a noticeable distortion artifact.
+		// Bilinaer filter will introduce blur, but it's less noticeable than the distortion.
+		// #yuriy_todo: can try to stochastically jitter the UV by 0.5 texel and still use point filter.
+		float4 HistoryColor1 = ReflectionHistory.SampleLevel(GlobalBilinearClampedSampler, BufferUV1, 0);
+		float4 HistoryColor2 = ReflectionHistory.SampleLevel(GlobalBilinearClampedSampler, BufferUV2, 0);
 
-	// 	float ColorDistance1 = abs(RgbLuma(ColorM1.rgb) - RgbLuma(HistoryColor1.rgb));
-	// 	float ColorDistance2 = abs(RgbLuma(ColorM1.rgb) - RgbLuma(HistoryColor2.rgb));
+		float ColorDistance1 = abs(RgbLuma(ColorM1.rgb) - RgbLuma(HistoryColor1.rgb));
+		float ColorDistance2 = abs(RgbLuma(ColorM1.rgb) - RgbLuma(HistoryColor2.rgb));
 
-	// 	float4 HistoryColor = ColorDistance1 < ColorDistance2 ? HistoryColor1 : HistoryColor2;
-	// 	float2 HistoryUV = ColorDistance1 < ColorDistance2 ? BufferUV1 : BufferUV2;
+		float4 HistoryColor = ColorDistance1 < ColorDistance2 ? HistoryColor1 : HistoryColor2;
+		float2 HistoryUV = ColorDistance1 < ColorDistance2 ? BufferUV1 : BufferUV2;
 
-	// 	// Detect disocclusion and clamp history color closer to current neighborhood mean
-	// 	if (DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), HistoryUV))
-	// 	{
-	// 		ColorStdDev *= 0.25;
+		// Detect disocclusion and clamp history color closer to current neighborhood mean
+		if (DisocclusionHeuristic(ScreenPos, ConvertToDeviceZ(SceneDepth), HistoryUV))
+		{
+			ColorStdDev *= 0.25;
 
-	// 	#if 0 // Disocclusion debug visualiztion:
-	// 		ReflectionColor.r = 1;
-	// 		HistoryWeight = 0;
-	// 	#endif
-	// 	}
+		#if 0 // Disocclusion debug visualiztion:
+			ReflectionColor.r = 1;
+			HistoryWeight = 0;
+		#endif
+		}
 
-	// 	// Basic color box clamp -- #yuriy_todo: try box clipping instead
-	// 	float4 ColorMin = ColorM1 - ColorStdDev;
-	// 	float4 ColorMax = ColorM1 + ColorStdDev;
-	// 	HistoryColor = clamp(HistoryColor, ColorMin, ColorMax);
+		// Basic color box clamp -- #yuriy_todo: try box clipping instead
+		float4 ColorMin = ColorM1 - ColorStdDev;
+		float4 ColorMax = ColorM1 + ColorStdDev;
+		HistoryColor = clamp(HistoryColor, ColorMin, ColorMax);
 
-	// 	float4 SpatialReflectionColor = ReflectionColor;
-	// 	ReflectionColor = lerp(ReflectionColor, HistoryColor, HistoryWeight);
-	// }
+		float4 SpatialReflectionColor = ReflectionColor;
+		ReflectionColor = lerp(ReflectionColor, HistoryColor, HistoryWeight);
+	}
 	const int2 ClampedReflectionPixelPos = clamp(int2(ReflectionPixelPos), 0, ReservoirBufferDim.xy);
     WriteReservoirHistoryData(ClampedReflectionPixelPos, 0,  Reservoir::Load(ReadReservoirData(ClampedReflectionPixelPos, 0)).Store());
 	

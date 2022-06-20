@@ -9,7 +9,7 @@ struct PackedReservoir
 	uint4 HitGeometry;
 	uint4 LightInfo;
 
-	// float4 PdfInfo;
+	float4 PdfInfo;
 };
 
 RWStructuredBuffer<PackedReservoir> RWRTReservoirUAV;
@@ -175,11 +175,16 @@ struct Reservoir
 		res.sampleRef.Normal = UnpackNormal(HitGeometry.w);
 
 		uint4 LightInfo = data.LightInfo;
-		UnpackIrradiance(LightInfo.xy, res.sampleRef.Irradiance, res.M);
+		// UnpackIrradiance(LightInfo.xy, res.sampleRef.Irradiance, res.M);
+		res.sampleRef.Irradiance = asfloat(LightInfo.xyz);
+		res.M = LightInfo.w;
 		res.sampleRef.Valid = res.M ;
 
-		res.weightSum = asfloat(LightInfo.z);
-		res.targetPdf = asfloat(LightInfo.w);
+		res.weightSum = (data.PdfInfo.x);
+		res.targetPdf = (data.PdfInfo.y);
+
+		// res.weightSum = asfloat(LightInfo.z);
+		// res.targetPdf = asfloat(LightInfo.w);
 		// Discard reservoirs that have Inf/NaN
 		if (isinf(res.weightSum) || isnan(res.weightSum)) {
 			res = Empty();
@@ -202,11 +207,17 @@ struct Reservoir
 		data.HitGeometry = HitGeometry;
 
 		uint4 LightInfo;
-		LightInfo.xy = PackIrradiance(sampleRef.Irradiance, M);
-		LightInfo.z = asuint(weightSum);
-		LightInfo.w = asuint(targetPdf);
+		// LightInfo.xy = PackIrradiance(sampleRef.Irradiance, M);
+		// LightInfo.z = asuint(weightSum);
+		// LightInfo.w = asuint(targetPdf);
+		LightInfo.xyz = asuint(sampleRef.Irradiance);
+		LightInfo.w = M;
 		data.LightInfo = LightInfo;
 
+		float4 PdfInfo = 0;
+		PdfInfo.x = (weightSum);
+		PdfInfo.y = (targetPdf);
+		data.PdfInfo = PdfInfo;
 		return data;
 	}
 

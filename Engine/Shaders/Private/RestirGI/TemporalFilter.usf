@@ -182,7 +182,7 @@ void TemporalFilter(uint2 DispatchThreadId: SV_DispatchThreadID)
     float HistorySpp = min(History.a, TARGET_COUNT);
     float2 MovePixel = Reproject.xy * BufferTexSize.xy ;
     // float  MoveFactor = 1.0 / max(length(MovePixel), 1.0);
-    float MoveFactor = lerp(1, 0.25, length(MovePixel));
+    float MoveFactor = lerp(1, 0.25, saturate(length(MovePixel) / 10.0));
     float ClampBoxSize = lerp(0.25, 1.0, pow(saturate(HistorySpp / TARGET_COUNT), 2)) * HistroryClipFactor * MoveFactor;
     ClampBoxSize = max(ClampBoxSize, 0.5);
 

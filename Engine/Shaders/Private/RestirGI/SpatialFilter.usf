@@ -110,7 +110,7 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
         // float2 SampleOffset = DiskSample * FilterSize;
 
         const float Angle = (SampleIndex + RandAngleOffset) * GOLDEN_ANGLE + (RaySubPixelId / float(SubPixelCount) ) * 2 * PI;
-        const float Radius = pow(float(SampleIndex), 0.666) * 1.0 + UpscaleFactor;
+        const float Radius = pow(float(SampleIndex), 0.666) * 2;
         const float2 SampleOffset = float2(cos(Angle), sin(Angle)) * Radius;
 
         const int2   Px = int2(floor(float2(DispatchID.xy) * ResolutionFraction + SampleOffset));
@@ -156,15 +156,15 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
     const float3 CenterNormal = normalize(DecodeNormal(NormalTexture.SampleLevel(PointClampSampler, ViewUV,0).xyz));
     const float CenterSSAO = SSAOTex.SampleLevel(PointClampSampler, ViewUV,0).r;
 
-    if (NormalizedSpp >= 0.99 ) 
-    {
-        RWFilteredTex[PixelCoord] = float4(CenterValue, 1.0);
-        return;
-    }
+    // if (NormalizedSpp >= 0.99999 ) 
+    // {
+    //     RWFilteredTex[PixelCoord] = float4(CenterValue, 1.0);
+    //     return;
+    // }
 
     const float AngleOff = (View.StateFrameIndex * 13) % 32 * 2 * PI + PI * InterleavedGradientNoise(PixelCoord);
 
-    const uint MAX_SAMPLE_COUNT = 16; //8
+    const uint MAX_SAMPLE_COUNT = 32; //8
     const float MAX_RADIUS_PX = 32.0; // 16
 
     // Feeds into the `pow` to remap sample index to radius.
