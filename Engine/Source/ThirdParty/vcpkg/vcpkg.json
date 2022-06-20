@@ -1,0 +1,15 @@
+{
+  "name": "vcpkg",
+  "version-string": "0.0.0",
+  "description": "Unreal Engine 5 dependencies installed with vcpkg",
+  "dependencies": [
+    "cli11",
+    "fmt",
+    "http-parser",
+    "libressl",
+    "protobuf",
+    "re2",
+    "rpclib",
+    "zstd"
+  ]
+}

@@ -1,0 +1,95 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using EpicGames.Core;
+using System.IO;
+
+namespace UnrealBuildTool
+{
+	/// <summary>
+	/// ModuleRules extension for low level tests.
+	/// </summary>
+	public class TestModuleRules : ModuleRules
+	{
+		/// <summary>
+		/// Associated tested module of this test module.
+		/// </summary>
+		public ModuleRules TestedModule { get; private set; }
+
+		/// <summary>
+		/// Constructs a TestModuleRules object with an associated tested module.
+		/// </summary>
+		public TestModuleRules(ModuleRules TestedModule) : base(TestedModule.Target)
+		{
+			this.TestedModule = TestedModule;
+
+			bIsTestModuleOverride = true;
+
+			Name = TestedModule.Name + "Tests";
+			if (!string.IsNullOrEmpty(TestedModule.ShortName))
+			{
+				ShortName = TestedModule.ShortName + "Tests";
+			}
+
+			File = TestedModule.File;
+			Directory = DirectoryReference.Combine(TestedModule.Directory, "Tests");
+
+			Context = TestedModule.Context;
+
+			PCHUsage = PCHUsageMode.NoPCHs;
+			PrecompileForTargets = PrecompileTargetsType.None;
+
+			if (Target.Configuration == UnrealTargetConfiguration.Debug && Target.Platform == UnrealTargetPlatform.Linux)
+			{
+				OptimizeCode = CodeOptimization.Never;
+			}
+
+			bAllowConfidentialPlatformDefines = true;
+			bLegalToDistributeObjectCode = true;
+
+			// Required false for catch.hpp
+			bUseUnity = false;
+
+			// Disable exception handling so that tests can assert for exceptions
+			bEnableObjCExceptions = false;
+			bEnableExceptions = false;
+
+			string SetupFile = Path.Combine("Private", "setup.cpp");
+			string TeardownFile = Path.Combine("Private", "teardown.cpp");
+			if (System.IO.File.Exists(Path.Combine(Directory.ToString(), SetupFile)))
+			{
+				BuildOrderSettings.AddBuildOrderOverride(SetupFile, SourceFileBuildOrder.First);
+			}
+			if (System.IO.File.Exists(Path.Combine(Directory.ToString(), TeardownFile)))
+			{
+				BuildOrderSettings.AddBuildOrderOverride(TeardownFile, SourceFileBuildOrder.Last);
+			}
+
+			PrivateDependencyModuleNames.AddRange(TestedModule.PrivateDependencyModuleNames);
+
+			if (!PrivateDependencyModuleNames.Contains("LowLevelTestsRunner"))
+			{
+				PrivateDependencyModuleNames.Add("LowLevelTestsRunner");
+			}
+
+			// Tests can refer to tested module's Public and Private paths
+			string ModulePublicDir = Path.Combine(TestedModule.ModuleDirectory, "Public");
+			if (System.IO.Directory.Exists(ModulePublicDir))
+			{
+				PublicIncludePaths.Add(ModulePublicDir);
+			}
+
+			string ModulePrivateDir = Path.Combine(TestedModule.ModuleDirectory, "Private");
+			if (System.IO.Directory.Exists(ModulePrivateDir))
+			{
+				PrivateIncludePaths.Add(ModulePrivateDir);
+			}
+			
+
+			// Platforms specific setup
+			if (Target.Platform == UnrealTargetPlatform.Android)
+			{
+				PublicDefinitions.Add("CATCH_CONFIG_NOSTDOUT");
+			}
+		}
+	}
+}
