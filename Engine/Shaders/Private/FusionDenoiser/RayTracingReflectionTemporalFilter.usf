@@ -1,0 +1,591 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "RayTracingDenoiseCommon.ush"
+#include "RayTracingUpscaleCommon.ush"
+#include "../ColorSpace.ush"
+#include "../Bilinear.ush"
+int2  GBufferDim;
+int   HistoryLength;
+
+float BlendWeight;
+float MomentBlendWeight;
+float NormalKernel;
+float DepthKernel;
+
+Texture2D DepthTextureThis;
+Texture2D DepthTextureLast;
+
+Texture2D NormalTextureThis;
+Texture2D NormalTextureLast;
+
+Texture2D   ColorLast;
+Texture2D   ColorInput;
+
+Texture2D   DistanceInput;
+Texture2D   MomentLast;
+
+RWTexture2D<float4>  ColorThis;
+RWTexture2D<float4> MomentThis;
+
+Texture2D 	ReprojectionTex;
+SamplerState LinearSampler;
+SamplerState PointClampSampler;
+int         ApproximateWithGI;
+
+float4      TexBufferSize;
+uint        UpscaleFactor;
+float       ReflectionMaxRoughness;
+float       ReflectionSmoothBias;
+
+groupshared uint gShouldDenoise;
+
+float3 ClipAABB(float3 MinAB, float3 MaxAB, float3 HistorySample)
+{
+    // Note: only clips towards aabb center
+    float3 CenterAB = 0.5f * (MaxAB + MinAB);
+    float3 ExtentClip = 0.5f * (MaxAB - MinAB) + 0.001f;
+
+    // Find color vector``
+    float3 ColorVector = HistorySample - CenterAB;
+    // Transform into clip space
+    float3 ColorVectorClip = ColorVector / ExtentClip;
+    // Find max absolute component
+    ColorVectorClip  = abs(ColorVectorClip);
+    float MaxAbsUnit = max(max(ColorVectorClip.x, ColorVectorClip.y), ColorVectorClip.z);
+
+    if (MaxAbsUnit > 1.0)
+        return CenterAB + ColorVector / MaxAbsUnit; // clip towards color vector
+    else
+        return HistorySample; // point is inside aabb
+}
+
+void NeighborhoodStandardDeviation(int2 coord, out float3 mean, out float3 stdDev)
+{
+    float3 m1 = 0.0f;
+    float3 m2 = 0.0f;
+
+    int   radius = 8;
+    float weight = (float(radius) * 2.0f + 1.0f) * (float(radius) * 2.0f + 1.0f);
+
+    for (int dx = -radius; dx <= radius; dx++)
+    {
+        for (int dy = -radius; dy <= radius; dy++)
+        {
+            int2 SampleCoord = coord + int2(dx, dy);
+            float3  SampleColor = ColorInput[SampleCoord].rgb;
+
+            m1 += SampleColor;
+            m2 += SampleColor * SampleColor;
+        }
+    }
+
+    mean          = m1 / weight;
+    float3 variance = (m2 / weight) - (mean * mean);
+
+    stdDev = sqrt(max(variance, 0.0f));
+}
+
+float ComputeMaxAccumulatedFrame(float historyLength)
+{
+    // if (length(CameraDelta) > 0.0f)
+    //     return 8.0f;
+    // else
+    return historyLength;
+}
+
+bool IsReprjValid(int2 coord, int2 imageDim, float Z, float Zprev, float fwidthZ, float3 normal, float3 normalPrev, float fwidthNormal)
+{
+	// check whether reprojected pixel is inside of the screen
+	if (any(coord < int2(0, 0)) || any(coord > imageDim - int2(1, 1))) return false;
+	// check if deviation of depths is acceptable
+	if (abs(Zprev - Z) / (fwidthZ + 1e-4) > 2.0) return false;
+	// check normals for compatibility
+	if (distance(normal, normalPrev) / (fwidthNormal + 1e-10) > 16.0) return false;
+
+	return true;
+}
+
+uint2 GetPixelCoord(uint2 DispatchThreadId, uint UpscaleFactor)
+{
+	uint UpscaleFactorPow2 = UpscaleFactor * UpscaleFactor;
+
+	// TODO(Denoiser): find a way to not interfer with TAA's jittering.
+	uint SubPixelId = View.StateFrameIndex & (UpscaleFactorPow2 - 1);
+
+	return DispatchThreadId * UpscaleFactor + uint2(SubPixelId & (UpscaleFactor - 1), SubPixelId / UpscaleFactor);
+}
+
+bool LoadPrevData(int2 fragCoord, out float4 prevReflection, out float4 prevMoments, out float historyLength)
+{
+	const int2 ipos = GetPixelCoord(fragCoord, UpscaleFactor);// fragCoord / DenoiseDim.xy * GBufferDim.xy;
+	float4 motion = 0;
+
+	float depth = DepthTextureThis[ipos].r;
+	float deltaD = DepthKernel * 1e-3;
+
+	float4 Velocity = GBufferVelocityTexture[ipos];
+	float2 uv = (float2(ipos) + 0.5) / GBufferDim.xy;
+	float4 ndc = float4(uv * float2(2, -2) + float2(-1, 1), depth, 1);
+	float depthLast;
+	float2 uvLast;
+	uint2 gBufferPixelPosLast;
+	if (Velocity.x > 0.0)
+	{
+		Velocity.xyz = DecodeVelocityFromTexture(Velocity);
+		float2 ndcLast = ndc.xy - Velocity.xy;
+		uvLast = (ndcLast.xy * float2(1, -1) + 1) * 0.5;
+		gBufferPixelPosLast = uvLast * GBufferDim;
+		depthLast = DepthTextureLast[gBufferPixelPosLast].r;
+	}
+	else
+	{
+		float4 ndcLast = mul(ndc, View.ClipToPrevClip);
+		ndcLast.xyz /= ndcLast.w;
+		depthLast = ndcLast.z;
+		uvLast = (ndcLast.xy * float2(1, -1) + 1) * 0.5;
+		gBufferPixelPosLast = uvLast * GBufferDim;
+	}
+
+	// stores: Z, fwidth(z), z_prev
+	float3 normal = DecodeNormal(NormalTextureThis[ipos].xyz);
+	float deltaN = NormalKernel * 0.1;
+
+	prevReflection = 0;
+	prevMoments = 0;
+
+	bool v[4];
+	const float2 posPrev = uvLast * GBufferDim - 0.5;
+	int2 iposPrev = posPrev;
+	float2 GBufferPosLast = clamp(uvLast * GBufferDim - 0.5, 0, GBufferDim - 1);
+	int2 offset[4] = { int2(0, 0), int2(1, 0), int2(0, 1), int2(1, 1) };
+
+
+	// check for all 4 taps of the bilinear filter for validity
+	bool valid = false;
+	for (int sampleIdx = 0; sampleIdx < 4; sampleIdx++)
+	{
+		int2 loc = iposPrev + offset[sampleIdx];
+		float depthPrev = DepthTextureLast[loc].r;
+		float3 normalPrev = DecodeNormal(NormalTextureLast[loc].xyz);
+
+		v[sampleIdx] = IsReprjValid(loc, GBufferDim, depthLast, depthPrev, deltaD, normal, normalPrev, deltaN);
+		valid = valid || v[sampleIdx];
+	}
+
+	if (valid)
+	{
+		float sumw = 0;
+		float x = saturate((GBufferPosLast.x - iposPrev.x));
+		float y = saturate((GBufferPosLast.y - iposPrev.y));
+
+		// bilinear weights
+		float w[4] = { (1 - x) * (1 - y),
+							x * (1 - y),
+					   (1 - x) * y,
+							x * y };
+
+		prevReflection = 0;
+		prevMoments = 0;
+
+		// perform the actual bilinear interpolation
+		for (int sampleIdx = 0; sampleIdx < 4; sampleIdx++)
+		{
+			int2 loc = clamp(iposPrev + offset[sampleIdx], 0, int2(TexBufferSize.xy) - 1);
+			if (v[sampleIdx])
+			{
+				float Weight = w[sampleIdx];
+				prevReflection += Weight * ColorLast[loc];
+				prevMoments += Weight * MomentLast[loc];
+				sumw += Weight;
+			}
+		}
+
+		// redistribute weights in case not all taps were used
+		valid = (sumw >= 0.01);
+		prevReflection = valid ? prevReflection / sumw : 0;
+		prevMoments = valid ? prevMoments / sumw : 0;
+		historyLength = prevMoments.b;
+	}
+	if (!valid) // perform cross-bilateral filter in the hope to find some suitable samples somewhere
+	{
+		float cnt = 0.0;
+
+		// this code performs a binary descision for each tap of the cross-bilateral filter
+		const int radius = 1;
+		for (int yy = -radius; yy <= radius; yy++)
+		{
+			for (int xx = -radius; xx <= radius; xx++)
+			{
+				int2 p0 = iposPrev / UpscaleFactor + int2(xx, yy);
+				int2 p = GetPixelCoord(p0, UpscaleFactor); 
+				float depthFilter = DepthTextureLast[p].r;
+				float3 normalFilter = DecodeNormal(NormalTextureLast[p].xyz);
+
+				if (IsReprjValid(p0, int2(TexBufferSize.xy), depth, depthFilter, deltaD, normal, normalFilter, deltaN))
+				{
+					prevReflection += ColorLast[int2(p0)];
+					prevMoments += MomentLast[int2(p0)];
+					cnt += 1.0;
+				}
+			}
+		}
+		if (cnt > 0)
+		{
+			valid = true;
+			prevReflection /= cnt;
+			prevMoments /= cnt;
+			historyLength = prevMoments.b;
+		}
+
+	}
+
+	if (!valid)
+	{
+		prevReflection = 0;
+		prevMoments = float4(0, 0, 0, 0);
+		historyLength = 0;
+	}
+
+	if (any(uvLast <= 0) || any(uvLast >= 1))
+	{
+		valid = false;
+	}
+
+	return valid;
+}
+
+float GetClearCoatApproximateRoughness(FGBufferData GBuffer)
+{
+	// Use the similar clearcoat approximation as SSR: simply blend base and clear coat roughness
+	// #todo: stochastic clearcoat
+	if (GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT)
+	{
+		const float ClearCoat = GBuffer.CustomData.x;
+		const float ClearCoatRoughness = GBuffer.CustomData.y;
+
+		// Combined reflection roughness is biased towards clear coat. 
+		// The approximation is quite arbitrary, based on empirical results.
+		return lerp(ClearCoatRoughness, GBuffer.Roughness, pow(1.0 - ClearCoat, 4.0));
+	}
+	else
+	{
+		return GBuffer.Roughness;
+	}
+}
+
+float ApplySmoothBias(float Roughness, float SmoothBias)
+{
+	if (SmoothBias >= 0)
+	{
+		// SmoothStep-like function up to SmoothBias, original value above
+		float X = saturate(Roughness / SmoothBias);
+		return Roughness * X * X * (3.0 - 2.0 * X);
+	}
+	else
+	{
+		// Negative value forces mirror-like reflections
+		return 0;
+	}
+}
+
+float GetRoughnessFade(float Roughness, float MaxRoughness)
+{
+	float RoughnessMaskScale = -2.0 / MaxRoughness;
+	return saturate(Roughness * RoughnessMaskScale + 2.0);
+}
+
+float3 soft_color_clamp(float3 center, float3 history, float3 ex, float3 dev) 
+{
+    // Sort of like the color bbox clamp, but with a twist. In noisy surrounds, the bbox becomes
+    // very large, and then the clamp does nothing, especially with a high multiplier on std. deviation.
+    //
+    // Instead of a hard clamp, this will smoothly bring the value closer to the center,
+    // thus over time reducing disocclusion artifacts.
+    //float3 history_dist = abs(history - ex) / max(0.1, dev);
+    //float3 history_dist = abs(history - ex) / max(0.002, dev);
+    //float3 history_dist = abs(history - ex) / dev;
+    float3 history_dist = abs(history - ex) / max(abs(history * 0.1), dev);
+
+    float3 closest_pt = clamp(history, center - dev, center + dev);
+    return lerp(history, closest_pt, smoothstep(1.0, 3.0, history_dist));
+}
+
+[numthreads(16, 16, 1)]
+void TemporalFilter_CS(
+    uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 GroupId : SV_GroupID)
+{
+
+    const uint2 ViewSize = uint2(TexBufferSize.xy);
+	const bool bValidThread = all(DispatchThreadId < ViewSize);
+
+	const float2 BufferUV = (float2(DispatchThreadId ) + 0.5) * TexBufferSize.zw;
+
+	const int2 CurrentCoord = int2(BufferUV * TexBufferSize.xy);
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	GBuffer.Roughness = GetClearCoatApproximateRoughness(GBuffer);
+	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
+
+	const float SceneDepth = GBuffer.Depth;
+    const float DeviceZ = ConvertToDeviceZ(SceneDepth);
+
+	const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+	const bool bValidPixel = RoughnessFade > 0;
+
+	// NOTE: Reflection image uses premultiplied alpha, so we must handle all 4 components during spatial filtering
+	float4 ReflectionColor = (float4)0;
+
+    float4 output_radiance = 0.0f;
+    float4 output_moments  = 0.0f;
+
+	float4 NDC = float4(BufferUV * float2(2, -2) + float2(-1, 1), DeviceZ, 1);
+
+    if (bValidPixel && bValidThread)
+    {
+        float4          Center = ColorInput[CurrentCoord];
+        const float     RayLength      = DistanceInput[CurrentCoord];
+
+		float4 HitRefNDC = float4(BufferUV * float2(2, -2) + float2(-1, 1), ConvertToDeviceZ(SceneDepth + RayLength), 1);
+		float4 HitPrevNDC = mul(HitRefNDC, View.ClipToPrevClip);
+		HitPrevNDC.xyz /= HitPrevNDC.w;
+		float2 HitPrevUV = (HitPrevNDC.xy * float2(1, -1) + 1) * 0.5;
+
+        float4 PrevNDC = mul(NDC, View.ClipToPrevClip);
+        PrevNDC.xyz /= PrevNDC.w;
+    	float2 PrevUV = (PrevNDC.xy * float2(1, -1) + 1) * 0.5;
+
+		float4 Reproj = ReprojectionTex[CurrentCoord];
+		const float2 ReflectorMoveRate = min(1.0, length(Reproj.xy) / length(PrevUV - BufferUV));
+    	HitPrevUV = lerp(BufferUV, HitPrevUV, ReflectorMoveRate);
+		
+		const uint quad_reproj_valid_packed = uint(Reproj.z * 15.0 + 0.5);
+    	const float4 quad_reproj_valid = (quad_reproj_valid_packed & uint4(1, 2, 4, 8)) != 0;
+
+
+		float4 history0 = 0.0;
+		float history0_valid = 1;
+
+		if (0 == quad_reproj_valid_packed) 
+		{
+            // Everything invalid
+            history0_valid = 0;
+        } 
+		else if (15 == quad_reproj_valid_packed) 
+		{
+            history0 = ColorLast.SampleLevel(LinearSampler, BufferUV + Reproj.xy, 0) ;
+        } 
+		else 
+		{
+            float4 quad_reproj_valid = (quad_reproj_valid_packed & uint4(1, 2, 4, 8)) != 0;
+
+            const Bilinear bilinear = GetBilinearFilter(BufferUV + Reproj.xy, TexBufferSize.xy);
+            float4 s00 = ColorLast[int2(bilinear.Origin) + int2(0, 0)] ;
+            float4 s10 = ColorLast[int2(bilinear.Origin) + int2(1, 0)] ;
+            float4 s01 = ColorLast[int2(bilinear.Origin) + int2(0, 1)] ;
+            float4 s11 = ColorLast[int2(bilinear.Origin) + int2(1, 1)] ;
+            float4 weights = GetBilinearCustomWeights(bilinear, quad_reproj_valid);
+
+            if (dot(weights, 1.0) > 1e-5) {
+                history0 = ApplyBilinearCustomWeights(s00, s10, s01, s11, weights);
+            } else {
+                // Invalid, but we have to return something.
+                history0 = (s00 + s10 + s01 + s11) / 4;
+            }
+        }
+
+		float4 history1 = ColorLast.SampleLevel(LinearSampler, HitPrevUV, 0);
+		float4 moment1 = MomentLast.SampleLevel(LinearSampler, BufferUV + Reproj.xy, 0);
+		float  history1_valid = quad_reproj_valid_packed == 15;
+
+		float4 vsum = 0.0.xxxx;
+		float4 vsum2 = 0.0.xxxx;
+		float wsum = 0.0;
+
+		const int k = 1;
+		for (int y = -k; y <= k; ++y) {
+			for (int x = -k; x <= k; ++x) {
+				const int2 sample_px = CurrentCoord + int2(x, y) * 1;
+				const float sample_depth = SceneDepthTexture[sample_px];
+
+				float4 neigh = ColorInput[sample_px];
+				float w = 1;//exp(-3.0 * float(x * x + y * y) / float((k+1.) * (k+1.)));
+
+				w *= exp2(-200.0 * abs(/*center_normal_vs.z **/ (SceneDepth / sample_depth - 1.0)));
+
+				vsum += neigh * w;
+				vsum2 += neigh * neigh * w;
+				wsum += w;
+			}
+		}
+
+		float4 ex = vsum / wsum;
+		float4 ex2 = vsum2 / wsum;
+		float4 dev = sqrt(max(0.0.xxxx, ex2 - ex * ex));
+		//dev = max(dev, 0.1);
+
+		float reproj_validity_dilated = Reproj.z;
+		float box_size = 1;
+
+		float4 nmin = Center - dev * box_size ;
+		float4 nmax = Center + dev * box_size ;
+
+		
+		float h0diff = length(history0.xyz - ex.xyz);
+		float h1diff = length(history1.xyz - ex.xyz);
+		float hdiff_scl = max(1e-10, max(h0diff, h1diff));
+		float h0_score = exp2(-100 * min(1, h0diff / hdiff_scl)) * history0_valid;
+		float h1_score = exp2(-100 * min(1, h1diff / hdiff_scl)) * history1_valid;
+
+		const float score_sum = h0_score + h1_score;
+		if (score_sum > 1e-50) {
+			h0_score /= score_sum;
+			h1_score /= score_sum;
+		} else {
+			h0_score = 1;
+			h1_score = 0;
+		}
+
+		float4 clamped_history0 = history0;
+		float4 clamped_history1 = history1;
+
+		clamped_history0.rgb = soft_color_clamp(Center.rgb, history0.rgb, ex.rgb, dev.rgb );
+		clamped_history1.rgb = soft_color_clamp(Center.rgb, history1.rgb, ex.rgb, dev.rgb );
+
+		// float4 clamped_history = clamp(history0 * h0_score + history1 * h1_score, nmin, nmax);
+		float4 clamped_history = clamped_history0 * h0_score + clamped_history1 * h1_score;
+		// float4 clamped_history = ColorLast[CurrentCoord];
+		// #if !USE_NEIGHBORHOOD_CLAMP
+		// 	clamped_history = history0 * h0_score + history1 * h1_score;
+		// #endif
+
+		float max_sample_count = 32;
+		float current_sample_count = moment1.a;
+
+		float4 filtered_center = Center;
+		float4 res = lerp(clamped_history, filtered_center, 1.0 / (1.0 + min(max_sample_count, current_sample_count)));
+    	res.w = min(current_sample_count, max_sample_count) + 1;
+		output_moments.a = res.a;
+		output_moments.xyz = clamped_history.xyz;
+    	ColorThis[CurrentCoord] = float4(max(0.0.xxx, res.xyz), Center.a);
+
+    }
+
+    MomentThis[CurrentCoord] = output_moments;
+    // ColorThis[CurrentCoord] = output_radiance;
+}
+
+// [numthreads(16, 16, 1)]
+// void TemporalFilter_CS(
+//     uint2 DispatchThreadId : SV_DispatchThreadID,
+// 	uint2 GroupThreadId : SV_GroupThreadID,
+// 	uint2 GroupId : SV_GroupID)
+// {
+//     // gShouldDenoise = 0;
+//     // GroupMemoryBarrierWithGroupSync();
+
+//     const uint2 ViewSize = uint2(TexBufferSize.xy);
+// 	const bool bValidThread = all(DispatchThreadId < ViewSize);
+
+// 	const float2 BufferUV = (float2(DispatchThreadId ) + 0.5) * TexBufferSize.zw;
+
+// 	const int2 CurrentCoord = int2(BufferUV * TexBufferSize.xy);
+
+// 	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+// 	GBuffer.Roughness = GetClearCoatApproximateRoughness(GBuffer);
+// 	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
+
+// 	const float SceneDepth = GBuffer.Depth;
+//     const float DeviceZ = ConvertToDeviceZ(SceneDepth);
+
+// 	const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+// 	const bool bValidPixel = RoughnessFade > 0;
+
+//     float4 output_radiance = 0.0f;
+//     float4 output_moments  = 0.0f;
+
+//     if (bValidPixel && bValidThread)
+//     {
+//         float3          Color          = ColorInput[CurrentCoord].xyz;
+//         const float     RayLength      = DistanceInput[CurrentCoord];
+
+//         float4  historyColor;
+//         float4  historyMoments;
+//         float   historyLength;
+//         bool success = LoadPrevData(CurrentCoord, historyColor, historyMoments, historyLength);
+
+//         historyLength = min(32.0f, success ? historyLength + 1.0f : 1.0f);
+
+//         if (success)
+//         {
+//             float3 std_dev;
+//             float3 mean;
+
+//             NeighborhoodStandardDeviation(CurrentCoord, mean, std_dev);
+
+//             float3 radiance_min = mean - std_dev;
+//             float3 radiance_max = mean + std_dev;
+
+//             historyColor.xyz = ClipAABB(radiance_min, radiance_max, historyColor.xyz);
+//         }
+
+//         // this adjusts the alpha for the case where insufficient history is available.
+//         // It boosts the temporal accumulation to give the samples equal weights in
+//         // the beginning.
+
+//         const float maxAccumulatedFrame = ComputeMaxAccumulatedFrame(historyLength);
+//         const float alpha                 = success ? max(BlendWeight, 1.0 / maxAccumulatedFrame) : 1.0;
+//         const float alpha_moments         = success ? max(MomentBlendWeight, 1.0 / maxAccumulatedFrame) : 1.0;
+
+//         // compute first two moments of luminance
+//         float2 moments = (0.0f);
+//         moments.r    = Luminance(Color);
+//         moments.g    = moments.r * moments.r;
+
+//         // temporal integration of the moments
+//         moments = lerp(historyMoments, moments, alpha_moments);
+
+//         float variance = max(0.0f, moments.g - moments.r * moments.r);
+
+//         // temporal integration of radiance
+//         float3 accumulatedColor = lerp(historyColor, Color, alpha);
+
+//         output_moments  = float4(moments, historyLength, 0.0f);
+//         output_radiance = float4(accumulatedColor, variance);
+//     }
+
+//     MomentThis[CurrentCoord] = output_moments;
+//     ColorThis[CurrentCoord] = output_radiance;
+
+//     // // If all the threads are in within the roughness range, skip the A-Trous filter.
+//     // if (bValidPixel && GBuffer.Roughness >= MIN_REFLECTIONS_ROUGHNESS_THRESHOLD)
+//     // {
+//     //     if (ApproximateWithGI == 1)
+//     //     {
+//     //         if (GBuffer.Roughness <= MAX_REFLECTIONS_ROUGHNESS_THRESHOLD)
+//     //             gShouldDenoise = 1;
+//     //     }
+//     //     else
+//     //         gShouldDenoise = 1;
+//     // }
+
+//     // GroupMemoryBarrierWithGroupSync();
+
+//     // if (GroupThreadId == 0 )
+//     // {
+//     //     if (gShouldDenoise == 1)
+//     //     {
+//     //         uint idx;
+//     //         InterlockedAdd(DenoiseTileDispatchArgs.num_groups_x, 1, idx);
+//     //         DenoiseTileData.coord[idx] = CurrentCoord;
+//     //     }
+//     //     else
+//     //     {
+//     //         uint idx;
+//     //         InterlockedAdd(CopyTileDispatchArgs.num_groups_x, 1, idx);
+//     //         CopyTileData.coord[idx] = CurrentCoord;
+//     //     }
+//     // }
+// }

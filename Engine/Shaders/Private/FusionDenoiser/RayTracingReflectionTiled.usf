@@ -1,0 +1,11 @@
+
+
+RWTexture2D RWReflectionColor;
+Texture2D   ReflectionColorInput;
+void CopyTile(uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 GroupId : SV_GroupID)
+{
+    int2 coord = CopyTileData.coord[GroupId.x] + int2(GroupThreadId.xy);
+    RWReflectionColor[coord] = ReflectionColorInput[coord];
+}

@@ -13,15 +13,15 @@
 #include "BlueNoise.h"
 #include "PostProcess/PostProcessing.h"
 
-#define GIDENOISE_VAR(type, name, value, comment) \
-	static type GRayTracingGIDenoise##name = value;\
-	static FAutoConsoleVariableRef CVarRayTracingGIDenoise##name(\
-		TEXT("r.Fusion.GIDenoise."#name),\
-		GRayTracingGIDenoise##name,\
-		TEXT(comment));
+#define GIDENOISE_VAR(type, name, value, comment)                 \
+    static type GRayTracingGIDenoise##name = value;               \
+    static FAutoConsoleVariableRef CVarRayTracingGIDenoise##name( \
+        TEXT("r.Fusion.GIDenoise." #name),                        \
+        GRayTracingGIDenoise##name,                               \
+        TEXT(comment));
 
 #define GET_GIDENOISE_CMD_VAR(Name) (GRayTracingGIDenoise##Name)
-#define GET_GIDENOISE_VAR(Name) ( GRayTracingGIDenoise##Name )
+#define GET_GIDENOISE_VAR(Name) (GRayTracingGIDenoise##Name)
 
 GIDENOISE_VAR(int32, EnableTemporal, 1, "Denoise")
 GIDENOISE_VAR(float, TemporalBlendWeight, 0.02, "Temporal Blend Weight")
@@ -44,230 +44,471 @@ GIDENOISE_VAR(int32, ATrousCopyIteration, 1, "Spatial Filter Copy Iteration")
 GIDENOISE_VAR(int32, ATrousSampleDepthAsNormal, 0, "Calculate normal from depth texture")
 GIDENOISE_VAR(float, ATrousFilterWidth, 2.0, "Spatial Filter Width")
 GIDENOISE_VAR(float, ATrousVarianceGain, 1, "Spatial Filter Variance Gain")
-GIDENOISE_VAR(float, ATrousNormalTolerance,1.0, "Spatial Filter Normal Tolerance")
+GIDENOISE_VAR(float, ATrousNormalTolerance, 1.0, "Spatial Filter Normal Tolerance")
 GIDENOISE_VAR(float, ATrousDepthTolerance, 1, "Spatial Filter Depth Tolerance")
 GIDENOISE_VAR(float, ATrousAOTolerance, 1, "Spatial Filter AO Tolerance")
 GIDENOISE_VAR(float, DiffuseBoost, 1, "Multiplier for diffuse GI")
 GIDENOISE_VAR(float, SHSharpness, 2, "Normal sharpness for SH mode")
+GIDENOISE_VAR(float, PhiColor,  10, "Color Strength for denoise")
+GIDENOISE_VAR(float, PhiDepth,  20, "Depth Strength for denoise")
+GIDENOISE_VAR(float, PhiNormal, 64, "Normal Strength for denoise")
+GIDENOISE_VAR(float, FilterRadius, 3, "Radius for Spatial Filter")
 
 GIDENOISE_VAR(int32, DebugType, 0, "Debug Type(0=disabled; 1=variance; 2=1st moment; 3=2nd moment; 4=history; 5=motion vector; 6=hit distance)")
 
 DECLARE_GPU_STAT_NAMED(FusionDiffuseDenoiser, TEXT("FusionGI Denoiser"));
+DECLARE_GPU_STAT_NAMED(FusionReflectionDenoiser, TEXT("FusionReflection Denoiser"));
 
 class FDenoiseTemporalFilterCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FDenoiseTemporalFilterCS);
-	SHADER_USE_PARAMETER_STRUCT(FDenoiseTemporalFilterCS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FDenoiseTemporalFilterCS);
+    SHADER_USE_PARAMETER_STRUCT(FDenoiseTemporalFilterCS, FGlobalShader);
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(FMatrix44f, ReprojectionMatrix)
-		SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrixThis)
-		SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrixLast)
-		SHADER_PARAMETER(FIntPoint, GBufferDim)
-		SHADER_PARAMETER(FIntPoint, DenoiseDim)
-		SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
-		SHADER_PARAMETER(float, BlendWeight)
-		SHADER_PARAMETER(float, MomentBlendWeight)
-		SHADER_PARAMETER(float, ColorKernel)
-		SHADER_PARAMETER(float, NormalKernel)
-		SHADER_PARAMETER(float, DepthKernel)
-		SHADER_PARAMETER(float, ColorClamp)
-		SHADER_PARAMETER(int, Enable)
-		SHADER_PARAMETER(int, UseSH)
-		SHADER_PARAMETER(int, HistoryLength)
-		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureLast)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureLast)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, ColorInput)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DistanceInput)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, ColorLast)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, MomentLast)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorThis)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, MomentThis)
-		SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
-		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-	END_SHADER_PARAMETER_STRUCT()
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+    SHADER_PARAMETER(FMatrix44f, ReprojectionMatrix)
+    SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrixThis)
+    SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrixLast)
+    SHADER_PARAMETER(FIntPoint, GBufferDim)
+    SHADER_PARAMETER(FIntPoint, DenoiseDim)
+    SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
+    SHADER_PARAMETER(float, BlendWeight)
+    SHADER_PARAMETER(float, MomentBlendWeight)
+    SHADER_PARAMETER(float, ColorKernel)
+    SHADER_PARAMETER(float, NormalKernel)
+    SHADER_PARAMETER(float, DepthKernel)
+    SHADER_PARAMETER(float, ColorClamp)
+    SHADER_PARAMETER(int, Enable)
+    SHADER_PARAMETER(int, UseSH)
+    SHADER_PARAMETER(int, HistoryLength)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureLast)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureLast)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, ColorInput)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DistanceInput)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, ColorLast)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<float4>, MomentLast)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorThis)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, MomentThis)
+    SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
+    SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+    END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+    {
+        return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+    }
 
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-	}
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
 };
 IMPLEMENT_GLOBAL_SHADER(FDenoiseTemporalFilterCS, "/Engine/Private/FusionDenoiser/RayTracingGIDenoiseTemporalFilter.usf", "TemporalFilter_CS", SF_Compute);
 
 class FDenoiseSpatialFilterCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FDenoiseSpatialFilterCS);
-	SHADER_USE_PARAMETER_STRUCT(FDenoiseSpatialFilterCS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FDenoiseSpatialFilterCS);
+    SHADER_USE_PARAMETER_STRUCT(FDenoiseSpatialFilterCS, FGlobalShader);
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(FMatrix44f, InverseWVPMatrix)
-		SHADER_PARAMETER(FMatrix44f, WVPMatrix)
-		SHADER_PARAMETER(FIntPoint, GBufferDim)
-		SHADER_PARAMETER(FIntPoint, DenoiseDim)
-		SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
-		SHADER_PARAMETER(float, BlendWeight)
-		SHADER_PARAMETER(float, MomentBlendWeight)
-		SHADER_PARAMETER(float, BaseRadius)
-		SHADER_PARAMETER(float, NormalKernel)
-		SHADER_PARAMETER(float, DepthKernel)
-		SHADER_PARAMETER(float, ColorKernel)
-		SHADER_PARAMETER(float, AOKernel)
-		SHADER_PARAMETER(float, RandomRotation)
-		SHADER_PARAMETER(int, Enable)
-		SHADER_PARAMETER(int, UseSH)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputMoment)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, InputColor)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint4>, OutputColor)
-		SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
-		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-	END_SHADER_PARAMETER_STRUCT()
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+    SHADER_PARAMETER(FMatrix44f, InverseWVPMatrix)
+    SHADER_PARAMETER(FMatrix44f, WVPMatrix)
+    SHADER_PARAMETER(FIntPoint, GBufferDim)
+    SHADER_PARAMETER(FIntPoint, DenoiseDim)
+    SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
+    SHADER_PARAMETER(float, BlendWeight)
+    SHADER_PARAMETER(float, MomentBlendWeight)
+    SHADER_PARAMETER(float, BaseRadius)
+    SHADER_PARAMETER(float, NormalKernel)
+    SHADER_PARAMETER(float, DepthKernel)
+    SHADER_PARAMETER(float, ColorKernel)
+    SHADER_PARAMETER(float, AOKernel)
+    SHADER_PARAMETER(float, RandomRotation)
+    SHADER_PARAMETER(int, Enable)
+    SHADER_PARAMETER(int, UseSH)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputMoment)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, InputColor)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint4>, OutputColor)
+    SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
+    SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+    END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+    {
+        return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+    }
 
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-	}
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
 };
 IMPLEMENT_GLOBAL_SHADER(FDenoiseSpatialFilterCS, "/Engine/Private/FusionDenoiser/RayTracingGIDenoiseSpatialFilter.usf", "SpatialFilter_CS", SF_Compute);
 
 class FDenoiseSpatialATrousFilterCS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FDenoiseSpatialATrousFilterCS);
-	SHADER_USE_PARAMETER_STRUCT(FDenoiseSpatialATrousFilterCS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FDenoiseSpatialATrousFilterCS);
+    SHADER_USE_PARAMETER_STRUCT(FDenoiseSpatialATrousFilterCS, FGlobalShader);
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(FMatrix44f, InverseWVPMatrix)
-		SHADER_PARAMETER(FMatrix44f, WVPMatrix)
-		SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrix)
-		SHADER_PARAMETER(FIntPoint, GBufferDim)
-		SHADER_PARAMETER(FIntPoint, DenoiseDim)
-		SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
-		SHADER_PARAMETER(float, NormalKernel)
-		SHADER_PARAMETER(float, VarianceGain)
-		SHADER_PARAMETER(float, DepthKernel)
-		SHADER_PARAMETER(float, AOKernel)
-		SHADER_PARAMETER(float, RandomRotation)
-		SHADER_PARAMETER(int, Enable)
-		SHADER_PARAMETER(int, UseSH)
-		SHADER_PARAMETER(int, Step)
-		SHADER_PARAMETER(int, FilterType)
-		SHADER_PARAMETER(float, FilterWidth)
-		SHADER_PARAMETER(int, SampleDepthAsNormal)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, InputColor)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputMoment)
-		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint4>, OutputColor)
-		SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
-		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-	END_SHADER_PARAMETER_STRUCT()
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+    SHADER_PARAMETER(FMatrix44f, InverseWVPMatrix)
+    SHADER_PARAMETER(FMatrix44f, WVPMatrix)
+    SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrix)
+    SHADER_PARAMETER(FIntPoint, GBufferDim)
+    SHADER_PARAMETER(FIntPoint, DenoiseDim)
+    SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
+    SHADER_PARAMETER(float, NormalKernel)
+    SHADER_PARAMETER(float, VarianceGain)
+    SHADER_PARAMETER(float, DepthKernel)
+    SHADER_PARAMETER(float, AOKernel)
+    SHADER_PARAMETER(float, RandomRotation)
+    SHADER_PARAMETER(int, Enable)
+    SHADER_PARAMETER(int, UseSH)
+    SHADER_PARAMETER(int, Step)
+    SHADER_PARAMETER(int, FilterType)
+    SHADER_PARAMETER(float, FilterWidth)
+    SHADER_PARAMETER(int, SampleDepthAsNormal)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTextureThis)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, InputColor)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, InputMoment)
+    SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint4>, OutputColor)
+    SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
+    SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+    END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+    {
+        return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+    }
 
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-	}
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
 };
 IMPLEMENT_GLOBAL_SHADER(FDenoiseSpatialATrousFilterCS, "/Engine/Private/FusionDenoiser/RayTracingGIDenoiseSpatialATrousFilter.usf", "AtrousFilter_CS", SF_Compute);
 
 class FCompositeDenoisePS : public FGlobalShader
 {
 public:
-	DECLARE_GLOBAL_SHADER(FCompositeDenoisePS);
-	SHADER_USE_PARAMETER_STRUCT(FCompositeDenoisePS, FGlobalShader);
+    DECLARE_GLOBAL_SHADER(FCompositeDenoisePS);
+    SHADER_USE_PARAMETER_STRUCT(FCompositeDenoisePS, FGlobalShader);
 
-	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-		SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrix)
-		SHADER_PARAMETER(FVector4f, ViewportInfo)
-		SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
-		SHADER_PARAMETER(FIntPoint, GBufferDim)
-		SHADER_PARAMETER(FIntPoint, DenoiseDim)
-		SHADER_PARAMETER(float, DenoiseBufferScale)
-		SHADER_PARAMETER(float, DiffuseBoost)
-		SHADER_PARAMETER(float, SHSharpness)
-		SHADER_PARAMETER(int, DebugMode)
-		SHADER_PARAMETER(int, UseSH)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, AlbedoTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, DenoiseTexture)
-		SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, MomentTexture)
-		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
-		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
-		RENDER_TARGET_BINDING_SLOTS()
-	END_SHADER_PARAMETER_STRUCT()
+    BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+    SHADER_PARAMETER(FMatrix44f, InverseProjectionMatrix)
+    SHADER_PARAMETER(FVector4f, ViewportInfo)
+    SHADER_PARAMETER(FIntPoint, UpscaleFactorBits)
+    SHADER_PARAMETER(FIntPoint, GBufferDim)
+    SHADER_PARAMETER(FIntPoint, DenoiseDim)
+    SHADER_PARAMETER(float, DenoiseBufferScale)
+    SHADER_PARAMETER(float, DiffuseBoost)
+    SHADER_PARAMETER(float, SHSharpness)
+    SHADER_PARAMETER(int, DebugMode)
+    SHADER_PARAMETER(int, UseSH)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, DepthTexture)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, NormalTexture)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, AlbedoTexture)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D<uint4>, DenoiseTexture)
+    SHADER_PARAMETER_RDG_TEXTURE_SRV(Texture2D, MomentTexture)
+    SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+    SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+    RENDER_TARGET_BINDING_SLOTS()
+    END_SHADER_PARAMETER_STRUCT()
 
-	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
-	{
-		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
-	}
+    static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+    {
+        return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+    }
 
-	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
-	{
-		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
-	}
+    static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+    {
+        FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    }
 };
 IMPLEMENT_GLOBAL_SHADER(FCompositeDenoisePS, "/Engine/Private/FusionDenoiser/RayTracingGIDenoiseComposite.usf", "Composite_PS", SF_Pixel);
 
+ class FReflectionTemporalFilterCS : public FGlobalShader
+ {
+ public:
+     DECLARE_GLOBAL_SHADER(FReflectionTemporalFilterCS);
+     SHADER_USE_PARAMETER_STRUCT(FReflectionTemporalFilterCS, FGlobalShader);
 
-FFusionDenoiser::FFusionDenoiser(const IScreenSpaceDenoiser* InWrappedDenoiser)
-	: WrappedDenoiser(InWrappedDenoiser)
+     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+ 		SHADER_PARAMETER(FIntPoint, GBufferDim)
+ 		SHADER_PARAMETER(float, BlendWeight)
+ 		SHADER_PARAMETER(float, MomentBlendWeight)
+ 		SHADER_PARAMETER(float, NormalKernel)
+ 		SHADER_PARAMETER(float, DepthKernel)
+ 		SHADER_PARAMETER(int, HistoryLength)
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthTextureThis)
+ 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DepthTextureLast)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTextureThis)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTextureLast)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ColorInput)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, DistanceInput)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ColorLast)
+		 SHADER_PARAMETER_RDG_TEXTURE(Texture2D, MomentLast)
+ 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorThis)
+ 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, MomentThis)
+        SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ReprojectionTex)
+
+		SHADER_PARAMETER_SAMPLER(SamplerState, PointClampSampler)
+ 		SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
+ 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+         SHADER_PARAMETER(FVector4f, TexBufferSize)
+ 		SHADER_PARAMETER(uint32, UpscaleFactor)
+ 		SHADER_PARAMETER(float, ReflectionMaxRoughness)
+ 		SHADER_PARAMETER(float, ReflectionSmoothBias)
+
+     END_SHADER_PARAMETER_STRUCT()
+
+     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+     {
+         return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+     }
+
+     static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+     {
+         FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+     }
+ };
+ IMPLEMENT_GLOBAL_SHADER(FReflectionTemporalFilterCS, "/Engine/Private/FusionDenoiser/RayTracingReflectionTemporalFilter.usf", "TemporalFilter_CS", SF_Compute);
+
+
+ class FReflectionSpatialFilterCS : public FGlobalShader
+ {
+ public:
+     DECLARE_GLOBAL_SHADER(FReflectionSpatialFilterCS);
+     SHADER_USE_PARAMETER_STRUCT(FReflectionSpatialFilterCS, FGlobalShader);
+
+     BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+        SHADER_PARAMETER(float, PhiColor)
+        SHADER_PARAMETER(float, PhiDepth)
+        SHADER_PARAMETER(float, PhiNormal)
+ 		SHADER_PARAMETER(int, AproximateWithGI)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ColorInput)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, NormalTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorOutput)
+ 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+		SHADER_PARAMETER_SAMPLER(SamplerState, LinearSampler)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+		SHADER_PARAMETER(FVector4f, TexBufferSize)
+ 		SHADER_PARAMETER(uint32, UpscaleFactor)
+ 		SHADER_PARAMETER(float, ReflectionMaxRoughness)
+ 		SHADER_PARAMETER(float, ReflectionSmoothBias)
+        SHADER_PARAMETER(uint32, FilterRadius)
+        SHADER_PARAMETER(int32,StepSize)
+     END_SHADER_PARAMETER_STRUCT()
+
+     static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+     {
+         return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+     }
+
+     static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters &Parameters, FShaderCompilerEnvironment &OutEnvironment)
+     {
+         FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+     }
+ };
+ IMPLEMENT_GLOBAL_SHADER(FReflectionSpatialFilterCS, "/Engine/Private/FusionDenoiser/RayTracingReflectionSpatialFilter.usf", "SpatialFilter_CS", SF_Compute);
+
+FFusionDenoiser::FFusionDenoiser(const IScreenSpaceDenoiser *InWrappedDenoiser)
+    : WrappedDenoiser(InWrappedDenoiser)
 {
-	check(WrappedDenoiser);
+    check(WrappedDenoiser);
 }
 
-IScreenSpaceDenoiser::EShadowRequirements FFusionDenoiser::GetShadowRequirements(const FViewInfo& View, const FLightSceneInfo& LightSceneInfo, const FShadowRayTracingConfig& RayTracingConfig) const
+IScreenSpaceDenoiser::EShadowRequirements FFusionDenoiser::GetShadowRequirements(const FViewInfo &View, const FLightSceneInfo &LightSceneInfo, const FShadowRayTracingConfig &RayTracingConfig) const
 {
-	return WrappedDenoiser->GetShadowRequirements(View, LightSceneInfo, RayTracingConfig);
+    return WrappedDenoiser->GetShadowRequirements(View, LightSceneInfo, RayTracingConfig);
 }
 
-void FFusionDenoiser::DenoiseShadowVisibilityMasks(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const TStaticArray<FShadowVisibilityParameters, IScreenSpaceDenoiser::kMaxBatchSize>& InputParameters, const int32 InputParameterCount, TStaticArray<FShadowVisibilityOutputs, IScreenSpaceDenoiser::kMaxBatchSize>& Outputs) const
+void FFusionDenoiser::DenoiseShadowVisibilityMasks(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const TStaticArray<FShadowVisibilityParameters, IScreenSpaceDenoiser::kMaxBatchSize> &InputParameters, const int32 InputParameterCount, TStaticArray<FShadowVisibilityOutputs, IScreenSpaceDenoiser::kMaxBatchSize> &Outputs) const
 {
-	WrappedDenoiser->DenoiseShadowVisibilityMasks(GraphBuilder, View, PreviousViewInfos, SceneTextures, InputParameters, InputParameterCount, Outputs);
+    WrappedDenoiser->DenoiseShadowVisibilityMasks(GraphBuilder, View, PreviousViewInfos, SceneTextures, InputParameters, InputParameterCount, Outputs);
 }
 
-IScreenSpaceDenoiser::FPolychromaticPenumbraOutputs FFusionDenoiser::DenoisePolychromaticPenumbraHarmonics(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FPolychromaticPenumbraHarmonics& Inputs) const
+IScreenSpaceDenoiser::FPolychromaticPenumbraOutputs FFusionDenoiser::DenoisePolychromaticPenumbraHarmonics(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FPolychromaticPenumbraHarmonics &Inputs) const
 {
-	return WrappedDenoiser->DenoisePolychromaticPenumbraHarmonics(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs);
+    return WrappedDenoiser->DenoisePolychromaticPenumbraHarmonics(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs);
 }
 
-IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseReflections(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FReflectionsInputs& Inputs, const FReflectionsRayTracingConfig Config) const
-{ 
-	return WrappedDenoiser->DenoiseReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
-}
-
-IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseWaterReflections(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FReflectionsInputs& Inputs, const FReflectionsRayTracingConfig Config) const
+extern TAutoConsoleVariable<float> CVarRayTracingReflectionsNormalBias;
+extern float GetRayTracingReflectionsMaxRoughness(const FViewInfo& View);
+IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseReflections(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FReflectionsInputs &Inputs, const FReflectionsRayTracingConfig Config) const
 {
-	return WrappedDenoiser->DenoiseWaterReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    //return WrappedDenoiser->DenoiseReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    RDG_GPU_STAT_SCOPE(GraphBuilder, FusionReflectionDenoiser);
+    RDG_EVENT_SCOPE(GraphBuilder, "FusionReflectionDenoiser");
+    
+    FRHICommandListImmediate &RHICmdList = GraphBuilder.RHICmdList;
+
+    FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+    FRDGTextureRef SceneNormalTexture = SceneTextures.GBufferATexture;
+    FRDGTextureRef SceneAlbedoTexture = SceneTextures.GBufferCTexture;
+    FRDGTextureRef DepthTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+    FRDGTextureRef NormalTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+
+    FIntPoint GBufferRes = View.ViewRect.Size();
+    //FIntPoint UpscaleFactor(1.0f / Config.ResolutionFraction, 1.0f / Config.ResolutionFraction);
+	int32 UpscaleFactor = int32(1.0f / Config.ResolutionFraction);
+    FIntPoint DenoiseBufferRes =  FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
+
+	FIntPoint TexSize = DenoiseBufferRes;//SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactor;
+	FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+
+    FRDGTextureRef DenoiseIntensity[2];
+    const TCHAR *DenoiseTextureNames[] = {TEXT("DenoiseReflection0"), TEXT("DenoiseReflection1")};
+    const bool bCreate = !PreviousViewInfos->FusionReflectionHistory.RT[0] || PreviousViewInfos->FusionReflectionHistory.RT[0]->GetDesc().Extent != DenoiseBufferRes;
+    if (!View.State || bCreate)
+    {
+        FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
+            TexSize,
+            PF_FloatRGBA,
+            FClearValueBinding::Black,
+            TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+        DenoiseIntensity[0] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[0], ERDGTextureFlags::MultiFrame);
+        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[0], FVector4f(0, 0, 0, 0));
+
+        RTDesc.Format = PF_FloatRGBA;
+        DenoiseIntensity[1] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[1], ERDGTextureFlags::MultiFrame);
+        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[1], FVector4f(0, 0, 0, 0));
+    }
+    else
+    {
+        DenoiseIntensity[0] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[0], DenoiseTextureNames[0]);
+        DenoiseIntensity[1] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[1], DenoiseTextureNames[1]);
+    }
+
+    FRDGTextureRef ColorLast = DenoiseIntensity[0];
+    FRDGTextureRef MomentLast = DenoiseIntensity[1];
+
+    FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
+        TexSize,
+        PF_FloatRGBA,
+        FClearValueBinding::Black,
+        TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+
+    FRDGTextureRef ColorThis = GraphBuilder.CreateTexture(RTDesc, TEXT("ColorThis"));
+    FRDGTextureRef DenoisedColor = GraphBuilder.CreateTexture(RTDesc, TEXT("DeonisedColor"));
+    RTDesc.Format = PF_FloatRGBA;
+    FRDGTextureRef MomentThis = GraphBuilder.CreateTexture(RTDesc, TEXT("MomentThis"));
+
+    FRDGTextureDesc OutputDesc = FRDGTextureDesc::Create2D(
+        SceneTextures.SceneDepthTexture->Desc.Extent,
+        PF_FloatRGBA,
+        FClearValueBinding::Black,
+        TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+    
+    {
+        // Temporal filtering
+        TShaderMapRef<FReflectionTemporalFilterCS> ComputeShader(View.ShaderMap);
+        FReflectionTemporalFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionTemporalFilterCS::FParameters>();
+        PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+        PassParameters->GBufferDim = GBufferRes;
+        PassParameters->UpscaleFactor = UpscaleFactor;
+        PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        PassParameters->BlendWeight = GET_GIDENOISE_VAR(TemporalBlendWeight);
+        PassParameters->MomentBlendWeight = GET_GIDENOISE_VAR(TemporalMomentBlendWeight);
+        PassParameters->NormalKernel = GET_GIDENOISE_VAR(TemporalNormalTolerance);
+        PassParameters->DepthKernel = GET_GIDENOISE_VAR(TemporalDepthTolerance);
+        PassParameters->HistoryLength = GET_GIDENOISE_VAR(HistoryLength);
+
+        PassParameters->SceneTextures = SceneTextures;
+        PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+
+        PassParameters->DepthTextureThis = SceneDepthTexture;
+        PassParameters->DepthTextureLast = DepthTexLast;
+        PassParameters->NormalTextureThis = SceneNormalTexture;
+        PassParameters->NormalTextureLast = NormalTexLast;
+        PassParameters->MomentLast = MomentLast;
+        PassParameters->ColorLast = ColorLast;
+        PassParameters->ColorInput = Inputs.Color;
+        PassParameters->DistanceInput = Inputs.RayHitDistance;
+        PassParameters->MomentThis = GraphBuilder.CreateUAV(MomentThis);
+        PassParameters->ColorThis = GraphBuilder.CreateUAV(ColorThis);
+        PassParameters->TexBufferSize = BufferTexSize;
+        PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
+        PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
+
+        PassParameters->ReprojectionTex = View.ProjectionMapTexture;
+
+        ClearUnusedGraphResources(ComputeShader, PassParameters);
+        FComputeShaderUtils::AddPass(
+            GraphBuilder,
+            RDG_EVENT_NAME("Reflection Denoise Temporal Filter"),
+            ComputeShader,
+            PassParameters,
+            FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
+
+        FRHICopyTextureInfo CopyInfo;
+        CopyInfo.Size = MomentThis->Desc.GetSize();
+        AddCopyTexturePass(GraphBuilder, MomentThis, MomentLast, CopyInfo);
+    }
+
+    {
+        TShaderMapRef<FReflectionSpatialFilterCS> ComputeShader(View.ShaderMap);
+        FReflectionSpatialFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionSpatialFilterCS::FParameters>();
+        PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+        PassParameters->ColorInput = ColorThis;
+        PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+        PassParameters->NormalTexture = SceneNormalTexture;
+        PassParameters->PhiColor = GET_GIDENOISE_VAR(PhiColor);
+        PassParameters->PhiNormal = GET_GIDENOISE_VAR(PhiNormal);
+        PassParameters->PhiDepth = GET_GIDENOISE_VAR(PhiDepth);
+        PassParameters->AproximateWithGI = 0;
+		   PassParameters->SceneTextures = SceneTextures;
+        PassParameters->ColorOutput = GraphBuilder.CreateUAV(DenoisedColor);
+        PassParameters->TexBufferSize = BufferTexSize;
+        PassParameters->UpscaleFactor = UpscaleFactor;
+        PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
+        PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
+        PassParameters->FilterRadius = GET_GIDENOISE_VAR(FilterRadius);
+        PassParameters->StepSize = 1;
+        ClearUnusedGraphResources(ComputeShader, PassParameters);
+        FComputeShaderUtils::AddPass(
+            GraphBuilder,
+            RDG_EVENT_NAME("Reflection Denoise Spatial Filter"),
+            ComputeShader,
+            PassParameters,
+            FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
+
+    }
+
+     if (!View.bStatePrevViewInfoIsReadOnly)
+     {
+         // Extract history feedback here
+         GraphBuilder.QueueTextureExtraction(ColorThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[0]);
+         GraphBuilder.QueueTextureExtraction(MomentThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[1]);
+     }
+
+    IScreenSpaceDenoiser::FReflectionsOutputs OutPuts;
+	OutPuts.Color = DenoisedColor;
+
+    return OutPuts;
 }
 
-IScreenSpaceDenoiser::FAmbientOcclusionOutputs FFusionDenoiser::DenoiseAmbientOcclusion(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FAmbientOcclusionInputs& Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseWaterReflections(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FReflectionsInputs &Inputs, const FReflectionsRayTracingConfig Config) const
 {
-	return WrappedDenoiser->DenoiseAmbientOcclusion(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    return WrappedDenoiser->DenoiseWaterReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
 }
 
-FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FDiffuseIndirectInputs& Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+IScreenSpaceDenoiser::FAmbientOcclusionOutputs FFusionDenoiser::DenoiseAmbientOcclusion(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FAmbientOcclusionInputs &Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+{
+    return WrappedDenoiser->DenoiseAmbientOcclusion(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+}
+
+FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FDiffuseIndirectInputs &Inputs, const FAmbientOcclusionRayTracingConfig Config) const
 #if RHI_RAYTRACING
 {
     // The new denoiser is a modified version of SVGF denoiser
@@ -278,9 +519,9 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
     // 4. Composite
     // For SH denoising, we perform filtering on SH coefs and finally reconstruct incoming radiance in composite pass.
     RDG_GPU_STAT_SCOPE(GraphBuilder, FusionDiffuseDenoiser);
-	RDG_EVENT_SCOPE(GraphBuilder, "FusionDiffuseDenoiser");
+    RDG_EVENT_SCOPE(GraphBuilder, "FusionDiffuseDenoiser");
 
-    FRHICommandListImmediate& RHICmdList = GraphBuilder.RHICmdList;
+    FRHICommandListImmediate &RHICmdList = GraphBuilder.RHICmdList;
 
     FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
     FRDGTextureRef SceneNormalTexture = SceneTextures.GBufferATexture;
@@ -295,11 +536,11 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
     bool UseSH = Config.UseSphericalHarmonicsGI;
     float BufferScale = float(DenoiseBufferRes.X) / GBufferRes.X;
     FRDGTextureRef DenoiseIntensity[2];
-    const TCHAR* DenoiseTextureNames[] = { TEXT("DenoiseIntensity0"), TEXT("DenoiseIntensity1")};
+    const TCHAR *DenoiseTextureNames[] = {TEXT("DenoiseIntensity0"), TEXT("DenoiseIntensity1")};
 
     if (!View.State ||
-        ((FSceneViewState*)View.State)->DenoiseTexture[0].GetReference() == nullptr ||
-        ((FSceneViewState*)View.State)->DenoiseTexture[0]->GetDesc().Extent != DenoiseBufferRes)
+        ((FSceneViewState *)View.State)->DenoiseTexture[0].GetReference() == nullptr ||
+        ((FSceneViewState *)View.State)->DenoiseTexture[0]->GetDesc().Extent != DenoiseBufferRes)
     {
         FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
             DenoiseBufferRes,
@@ -307,18 +548,18 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
             FClearValueBinding::Black,
             TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
         DenoiseIntensity[0] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[0], ERDGTextureFlags::MultiFrame);
-		AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[0], FVector4f(0, 0, 0, 0));
+        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[0], FVector4f(0, 0, 0, 0));
 
         RTDesc.Format = PF_FloatRGBA;
         DenoiseIntensity[1] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[1], ERDGTextureFlags::MultiFrame);
-		AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[1], FVector4f(0, 0, 0, 0));
+        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[1], FVector4f(0, 0, 0, 0));
     }
     else
     {
-        DenoiseIntensity[0] = GraphBuilder.RegisterExternalTexture(((FSceneViewState*)View.State)->DenoiseTexture[0], DenoiseTextureNames[0]);
-        DenoiseIntensity[1] = GraphBuilder.RegisterExternalTexture(((FSceneViewState*)View.State)->DenoiseTexture[1], DenoiseTextureNames[1]);
+        DenoiseIntensity[0] = GraphBuilder.RegisterExternalTexture(((FSceneViewState *)View.State)->DenoiseTexture[0], DenoiseTextureNames[0]);
+        DenoiseIntensity[1] = GraphBuilder.RegisterExternalTexture(((FSceneViewState *)View.State)->DenoiseTexture[1], DenoiseTextureNames[1]);
     }
-    int FrameCounter = ((FSceneViewState*)View.State)->FrameIndex;
+    int FrameCounter = ((FSceneViewState *)View.State)->FrameIndex;
     FRDGTextureRef ColorLast = DenoiseIntensity[0];
     FRDGTextureRef MomentLast = DenoiseIntensity[1];
 
@@ -331,7 +572,6 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
     FRDGTextureRef ColorThis = GraphBuilder.CreateTexture(RTDesc, TEXT("ColorThis"));
     RTDesc.Format = PF_FloatRGBA;
     FRDGTextureRef MomentThis = GraphBuilder.CreateTexture(RTDesc, TEXT("MomentThis"));
-
 
     FRDGTextureDesc OutputDesc = FRDGTextureDesc::Create2D(
         SceneTextures.SceneDepthTexture->Desc.Extent,
@@ -346,7 +586,7 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
     {
         // Temporal filtering
         TShaderMapRef<FDenoiseTemporalFilterCS> ComputeShader(View.ShaderMap);
-        FDenoiseTemporalFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDenoiseTemporalFilterCS::FParameters>();
+        FDenoiseTemporalFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FDenoiseTemporalFilterCS::FParameters>();
         FMatrix44f ReprojectMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix() * View.PrevViewInfo.ViewMatrices.GetViewProjectionMatrix());
         PassParameters->ReprojectionMatrix = ReprojectMatrix;
         PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
@@ -356,7 +596,7 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         PassParameters->DenoiseDim = DenoiseBufferRes;
         PassParameters->UpscaleFactorBits = UpscaleFactorBits;
         PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-		PassParameters->UseSH = UseSH;
+        PassParameters->UseSH = UseSH;
 
         PassParameters->Enable = GET_GIDENOISE_VAR(EnableTemporal);
         PassParameters->BlendWeight = GET_GIDENOISE_VAR(TemporalBlendWeight);
@@ -364,8 +604,8 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         PassParameters->ColorKernel = GET_GIDENOISE_CMD_VAR(TemporalColorTolerance);
         PassParameters->NormalKernel = GET_GIDENOISE_VAR(TemporalNormalTolerance);
         PassParameters->DepthKernel = GET_GIDENOISE_VAR(TemporalDepthTolerance);
-		PassParameters->HistoryLength = GET_GIDENOISE_VAR(HistoryLength);
-		PassParameters->ColorClamp = GET_GIDENOISE_VAR(ColorClamp);
+        PassParameters->HistoryLength = GET_GIDENOISE_VAR(HistoryLength);
+        PassParameters->ColorClamp = GET_GIDENOISE_VAR(ColorClamp);
 
         PassParameters->SceneTextures = SceneTextures;
         PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
@@ -401,7 +641,7 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         // Calculate variance
         TShaderMapRef<FDenoiseSpatialFilterCS> ComputeShader(View.ShaderMap);
 
-        FDenoiseSpatialFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialFilterCS::FParameters>();
+        FDenoiseSpatialFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialFilterCS::FParameters>();
 
         FMatrix44f ReprojectMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix() * View.PrevViewInfo.ViewMatrices.GetViewProjectionMatrix());
         PassParameters->InverseWVPMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix());
@@ -446,7 +686,6 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         DebugType = 0;
     }
 
-
     FRDGTextureRef InputColor = ColorAndVariance;
     RTDesc.Format = PF_R32G32B32A32_UINT;
     FRDGTextureRef OutputColor = GraphBuilder.CreateTexture(RTDesc, TEXT("OutputColor"));
@@ -456,22 +695,23 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         // Otherwise, a separable gaussian filter is used, which performs horizontal filtering
         // followed by vertical filtering.
         int FilterType = GET_GIDENOISE_CMD_VAR(SpatialFilterType);
-        if(FilterType == -1)
+        if (FilterType == -1)
             FilterType = 0;
 
         float FilterWidth = GET_GIDENOISE_VAR(ATrousFilterWidth) * 2 * (FilterType == 0 ? 1 : 8);
         int SampleDepthAsNormal = GET_GIDENOISE_VAR(ATrousSampleDepthAsNormal);
         int EnableATrous = GET_GIDENOISE_VAR(EnableATrous);
-        int nAdditionalIteration = ((FSceneViewState*)View.State)->CameraSwitchFrameCount > 0 ? GET_GIDENOISE_CMD_VAR(ATrousCameraSwitchIteration) : 0;
+        int nAdditionalIteration = ((FSceneViewState *)View.State)->CameraSwitchFrameCount > 0 ? GET_GIDENOISE_CMD_VAR(ATrousCameraSwitchIteration) : 0;
         int nIteration = EnableATrous ? GET_GIDENOISE_VAR(ATrousIteration) + nAdditionalIteration : 1;
-        if (nIteration <= 0) nIteration = 1;
+        if (nIteration <= 0)
+            nIteration = 1;
         int copyIteration = FMath::Min(nIteration - 1, GET_GIDENOISE_VAR(ATrousCopyIteration));
         TShaderMapRef<FDenoiseSpatialATrousFilterCS> ComputeShader(View.ShaderMap);
         FMatrix44f ReprojectMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix() * View.PrevViewInfo.ViewMatrices.GetViewProjectionMatrix());
         for (int i = 0; i < nIteration; i++)
         {
             {
-                FDenoiseSpatialATrousFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialATrousFilterCS::FParameters>();
+                FDenoiseSpatialATrousFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialATrousFilterCS::FParameters>();
                 PassParameters->InverseWVPMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix());
                 PassParameters->WVPMatrix = FMatrix44f(View.ViewMatrices.GetViewProjectionMatrix());
                 PassParameters->InverseProjectionMatrix = FMatrix44f(View.ViewMatrices.GetInvProjectionMatrix());
@@ -513,7 +753,7 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
                 OutputColor = InputColor;
                 InputColor = TempColor;
 
-                FDenoiseSpatialATrousFilterCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialATrousFilterCS::FParameters>();
+                FDenoiseSpatialATrousFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FDenoiseSpatialATrousFilterCS::FParameters>();
                 PassParameters->InverseWVPMatrix = FMatrix44f(View.ViewMatrices.GetInvViewProjectionMatrix());
                 PassParameters->WVPMatrix = FMatrix44f(View.ViewMatrices.GetViewProjectionMatrix());
                 PassParameters->InverseProjectionMatrix = FMatrix44f(View.ViewMatrices.GetInvProjectionMatrix());
@@ -565,7 +805,7 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
     {
         // Composite pass
         FIntPoint ViewRectSize = GBufferRes;
-        FCompositeDenoisePS::FParameters* PassParameters = GraphBuilder.AllocParameters<FCompositeDenoisePS::FParameters>();
+        FCompositeDenoisePS::FParameters *PassParameters = GraphBuilder.AllocParameters<FCompositeDenoisePS::FParameters>();
         PassParameters->InverseProjectionMatrix = FMatrix44f(View.ViewMatrices.GetInvProjectionMatrix());
         PassParameters->DenoiseBufferScale = BufferScale;
         PassParameters->DiffuseBoost = GET_GIDENOISE_CMD_VAR(DiffuseBoost);
@@ -580,18 +820,17 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
         PassParameters->DenoiseTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(OutputColor));
         PassParameters->MomentTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(MomentLast));
         PassParameters->SceneTextures = SceneTextures;
-		PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+        PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
         PassParameters->AlbedoTexture = GraphBuilder.CreateSRV(FRDGTextureSRVDesc::Create(SceneAlbedoTexture));
         PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
         PassParameters->ViewportInfo = FVector4f(GBufferRes.X, GBufferRes.Y, 1.0f / GBufferRes.X, 1.0f / GBufferRes.Y);
         PassParameters->RenderTargets[0] = FRenderTargetBinding(SignalOutput.Textures[0], ERenderTargetLoadAction::EClear);
 
-
         GraphBuilder.AddPass(
             RDG_EVENT_NAME("GI Denoise Composite"),
             PassParameters,
             ERDGPassFlags::Raster,
-            [PassParameters, &View, ViewRectSize](FRHICommandList& RHICmdList)
+            [PassParameters, &View, ViewRectSize](FRHICommandList &RHICmdList)
             {
                 TShaderMapRef<FPostProcessVS> VertexShader(View.ShaderMap);
                 TShaderMapRef<FCompositeDenoisePS> PixelShader(View.ShaderMap);
@@ -627,11 +866,11 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
 
     if (View.State)
     {
-        GraphBuilder.QueueTextureExtraction(DenoiseIntensity[0], &((FSceneViewState*)View.State)->DenoiseTexture[0]);
-        GraphBuilder.QueueTextureExtraction(DenoiseIntensity[1], &((FSceneViewState*)View.State)->DenoiseTexture[1]);
+        GraphBuilder.QueueTextureExtraction(DenoiseIntensity[0], &((FSceneViewState *)View.State)->DenoiseTexture[0]);
+        GraphBuilder.QueueTextureExtraction(DenoiseIntensity[1], &((FSceneViewState *)View.State)->DenoiseTexture[1]);
     }
 
-	return SignalOutput;
+    return SignalOutput;
 }
 #else
 {
@@ -640,49 +879,49 @@ FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirect(FRDGBuilder& GraphBui
 }
 #endif
 
-IScreenSpaceDenoiser::FDiffuseIndirectOutputs FFusionDenoiser::DenoiseSkyLight(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FDiffuseIndirectInputs& Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+IScreenSpaceDenoiser::FDiffuseIndirectOutputs FFusionDenoiser::DenoiseSkyLight(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FDiffuseIndirectInputs &Inputs, const FAmbientOcclusionRayTracingConfig Config) const
 {
     FSSDSignalTextures SignalTexture = DenoiseDiffuseIndirect(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
-	IScreenSpaceDenoiser::FDiffuseIndirectOutputs DiffuseIndirectOutputs;
+    IScreenSpaceDenoiser::FDiffuseIndirectOutputs DiffuseIndirectOutputs;
     DiffuseIndirectOutputs.Color = SignalTexture.Textures[0];
-	return DiffuseIndirectOutputs;
+    return DiffuseIndirectOutputs;
     // return WrappedDenoiser->DenoiseSkyLight(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
 }
 
-IScreenSpaceDenoiser::FDiffuseIndirectOutputs FFusionDenoiser::DenoiseReflectedSkyLight(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FDiffuseIndirectInputs& Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+IScreenSpaceDenoiser::FDiffuseIndirectOutputs FFusionDenoiser::DenoiseReflectedSkyLight(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FDiffuseIndirectInputs &Inputs, const FAmbientOcclusionRayTracingConfig Config) const
 {
-	return WrappedDenoiser->DenoiseReflectedSkyLight(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    return WrappedDenoiser->DenoiseReflectedSkyLight(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
 }
 
-FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirectHarmonic(FRDGBuilder& GraphBuilder,
-		const FViewInfo& View,
-		FPreviousViewInfo* PreviousViewInfos,
-		const FSceneTextureParameters& SceneTextures,
-		const FDiffuseIndirectHarmonic& Inputs,
-		const HybridIndirectLighting::FCommonParameters& CommonDiffuseParameters) const
+FSSDSignalTextures FFusionDenoiser::DenoiseDiffuseIndirectHarmonic(FRDGBuilder &GraphBuilder,
+                                                                   const FViewInfo &View,
+                                                                   FPreviousViewInfo *PreviousViewInfos,
+                                                                   const FSceneTextureParameters &SceneTextures,
+                                                                   const FDiffuseIndirectHarmonic &Inputs,
+                                                                   const HybridIndirectLighting::FCommonParameters &CommonDiffuseParameters) const
 {
-	return WrappedDenoiser->DenoiseDiffuseIndirectHarmonic(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, CommonDiffuseParameters);
+    return WrappedDenoiser->DenoiseDiffuseIndirectHarmonic(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, CommonDiffuseParameters);
 }
 
 bool FFusionDenoiser::SupportsScreenSpaceDiffuseIndirectDenoiser(EShaderPlatform Platform) const
 {
-	return WrappedDenoiser->SupportsScreenSpaceDiffuseIndirectDenoiser(Platform);
+    return WrappedDenoiser->SupportsScreenSpaceDiffuseIndirectDenoiser(Platform);
 }
 
-FSSDSignalTextures FFusionDenoiser::DenoiseScreenSpaceDiffuseIndirect(FRDGBuilder& GraphBuilder, const FViewInfo& View, FPreviousViewInfo* PreviousViewInfos, const FSceneTextureParameters& SceneTextures, const FDiffuseIndirectInputs& Inputs, const FAmbientOcclusionRayTracingConfig Config) const
+FSSDSignalTextures FFusionDenoiser::DenoiseScreenSpaceDiffuseIndirect(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FDiffuseIndirectInputs &Inputs, const FAmbientOcclusionRayTracingConfig Config) const
 {
-	return WrappedDenoiser->DenoiseScreenSpaceDiffuseIndirect(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    return WrappedDenoiser->DenoiseScreenSpaceDiffuseIndirect(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
 }
 
-const IScreenSpaceDenoiser* FFusionDenoiser::GetWrappedDenoiser() const
+const IScreenSpaceDenoiser *FFusionDenoiser::GetWrappedDenoiser() const
 {
-	return WrappedDenoiser;
+    return WrappedDenoiser;
 }
 
-IScreenSpaceDenoiser* FFusionDenoiser::GetDenoiser()
+IScreenSpaceDenoiser *FFusionDenoiser::GetDenoiser()
 {
-    const IScreenSpaceDenoiser* DenoiserToWrap = GScreenSpaceDenoiser ? GScreenSpaceDenoiser : IScreenSpaceDenoiser::GetDefaultDenoiser();
+    const IScreenSpaceDenoiser *DenoiserToWrap = GScreenSpaceDenoiser ? GScreenSpaceDenoiser : IScreenSpaceDenoiser::GetDefaultDenoiser();
 
-   static FFusionDenoiser denoiser(DenoiserToWrap);
-   return &denoiser;
+    static FFusionDenoiser denoiser(DenoiserToWrap);
+    return &denoiser;
 }

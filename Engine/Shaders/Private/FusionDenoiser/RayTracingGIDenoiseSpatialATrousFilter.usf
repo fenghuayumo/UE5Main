@@ -2,7 +2,7 @@
 #include "../DeferredShadingCommon.ush"
 #include "../MonteCarlo.ush"
 #include "RayTracingUpscaleCommon.ush"
-#include "RayTracingGIDenoiseCommon.ush"
+#include "RayTracingDenoiseCommon.ush"
 
 float4x4 InverseWVPMatrix;
 float4x4 WVPMatrix;

@@ -115,26 +115,26 @@ static TAutoConsoleVariable<int32> CVarRestirRTRTemporalMaxHistory(
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarRestirRTAppoxVisibility(
-	TEXT("r.Fusion.RestirRTR.AppoxVisibility"),
-	1,
+static TAutoConsoleVariable<int32> CVarRestirRTRTemporalAppoxVisibility(
+	TEXT("r.Fusion.RestirRTR.Temporal.AppoxVisibility"),
+	0,
 	TEXT("Whether to use visibility ray in temporal resampling  (default: 1)"),
 	ECVF_RenderThreadSafe
 );
 
 
 static TAutoConsoleVariable<float> CVarRestirRTRSpatialSamplingRadius(
-	TEXT("r.Fusion.RestirRTR.Spatial.SamplingRadius"), 16.0f,
-	TEXT("Spatial radius for sampling in pixels (Default 16.0)"),
+	TEXT("r.Fusion.RestirRTR.Spatial.SamplingRadius"), 4.0f,
+	TEXT("Spatial radius for sampling in pixels (Default 4.0)"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirRTRSpatialSamples(
-	TEXT("r.Fusion.RestirRTR.Spatial.Samples"), 6,
+	TEXT("r.Fusion.RestirRTR.Spatial.Samples"), 1,
 	TEXT("Spatial samples per pixel"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarRestirRTRSpatialSamplesBoost(
-	TEXT("r.Fusion.RestirRTR.Spatial.SamplesBoost"), 8,
+	TEXT("r.Fusion.RestirRTR.Spatial.SamplesBoost"), 1,
 	TEXT("Spatial samples per pixel when invalid history is detected"),
 	ECVF_RenderThreadSafe);
 
@@ -161,6 +161,11 @@ static TAutoConsoleVariable<int32> CVarRestirRTREvalApplyApproxVisibility(
 static TAutoConsoleVariable<int32> CVarRestirRTRFeedBackVisility(
 	TEXT("r.Fusion.RestirRTR.FeedBackVisility"), 1,
 	TEXT("Apply an approximate visibility test on sample selected during evaluate phase"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarRestirRTRResolve(
+	TEXT("r.Fusion.RestirRTR.Resolve"), 1,
+	TEXT("Whether Use Fusion Restir Reflection Resolve"),
 	ECVF_RenderThreadSafe);
 
 extern TAutoConsoleVariable<int32> CVarRayTracingReflectionsUseSurfel;;
@@ -192,7 +197,7 @@ struct  PackedReservoir
 	FIntVector4		CreationGeometry;
 	FIntVector4		HitGeometry;
 	FIntVector4		LightInfo;
-    // FVector4f        PdfInfo;
+    FVector4f        PdfInfo;
 };
 
 class FFusionReflectionRGS : public FGlobalShader
@@ -327,7 +332,7 @@ class FReflectionTemporalSamplingRGS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
-
+		        SHADER_PARAMETER(FIntPoint, RayTracingBufferSize)
         //restir
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<PackedReservoir>, RWRTReservoirUAV)
         SHADER_PARAMETER(FIntVector, ReservoirBufferDim)
@@ -382,7 +387,7 @@ class FReflectionSpatialSamplingRGS : public FGlobalShader
 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 		
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
-
+		        SHADER_PARAMETER(FIntPoint, RayTracingBufferSize)
         //restir
         SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<PackedReservoir>, RWRTReservoirUAV)
         SHADER_PARAMETER(FIntVector, ReservoirBufferDim)
@@ -440,10 +445,13 @@ class FEvaluateRestirReflectionRGS : public FGlobalShader
         SHADER_PARAMETER(FIntVector, ReservoirHistoryBufferDim)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<PackedReservoir>, RWRTReservoirHistoryUAV)
         SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorOutput)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugTex)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, RawReflectionColor)
      	SHADER_PARAMETER(float, ReflectionMaxNormalBias)
 
 		SHADER_PARAMETER(FVector2f, UpscaleFactor)
 		SHADER_PARAMETER(float, ReflectionMaxRoughness)
+		SHADER_PARAMETER(float, ReflectionSmoothBias)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
 		SHADER_PARAMETER_SRV(RaytracingAccelerationStructure, TLAS)
@@ -508,7 +516,9 @@ class FFusionReflectionResovleCS : public FGlobalShader
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, RawReflectionColor)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, ReflectionDenoiserData)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, ColorOutput)
-
+		SHADER_PARAMETER(int, InputSlice)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, DebugTex)
+		
 	END_SHADER_PARAMETER_STRUCT()
 };
 IMPLEMENT_GLOBAL_SHADER(FFusionReflectionResovleCS, "/Engine/Private/RestirRTR/RestirReflectionResolve.usf", "ReflectionResolveCS", SF_Compute);
@@ -637,6 +647,7 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 	const float ResolutionFraction = Options.ResolutionFraction;
 
 	FVector2f UpscaleFactor = FVector2f(1.0f);
+	int32  UpscaleFactorInt = int32(1.0f / ResolutionFraction);
 	FIntPoint RayTracingResolution = View.ViewRect.Size();
 	FIntPoint RayTracingBufferSize = SceneTextures.SceneDepthTexture->Desc.Extent;
     const bool bSpatialResolve = true;
@@ -655,7 +666,6 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 	}
 	else
 	{
-		int32 UpscaleFactorInt = int32(1.0f / ResolutionFraction);
 		RayTracingResolution = FIntPoint::DivideAndRoundUp(RayTracingResolution, UpscaleFactorInt);
 		RayTracingBufferSize = RayTracingBufferSize / UpscaleFactorInt;
 		UpscaleFactor = FVector2f((float)UpscaleFactorInt);
@@ -857,8 +867,10 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 		PassParameters->InputSlice = 0;
 		PassParameters->OutputSlice = 0;
 		PassParameters->ReflectionMaxNormalBias		= GetRaytracingMaxNormalBias();
+		PassParameters->RayTracingBufferSize	= RayTracingBufferSize;
+
 		PassParameters->TLAS = View.GetRayTracingSceneViewChecked();
-		PassParameters->ApproxVisibility = CVarRestirRTAppoxVisibility.GetValueOnRenderThread();
+		PassParameters->ApproxVisibility = CVarRestirRTRTemporalAppoxVisibility.GetValueOnRenderThread();
         ClearUnusedGraphResources(RayGenShader, PassParameters);
         // FComputeShaderUtils::AddPass(
         //     GraphBuilder,
@@ -867,7 +879,7 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
         //     PassParameters,
         //     FComputeShaderUtils::GetGroupCount(RayTracingResolution, FReflectionTemporalSpatialSamplingCS::GetThreadBlockSize()));
 		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("ReflectionTemporalSpatialSamplingRGS %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
+			RDG_EVENT_NAME("ReflectionTemporalSamplingRGS %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
 			PassParameters,
 			ERDGPassFlags::Compute,
 			[PassParameters,&View, RayGenShader, RayTracingResolution](FRHIRayTracingCommandList& RHICmdList)
@@ -885,7 +897,7 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 	{
 		TShaderMapRef<FReflectionSpatialSamplingRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5));
         FReflectionSpatialSamplingRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FReflectionSpatialSamplingRGS::FParameters>();
-       
+		PassParameters->RayTracingBufferSize           = RayTracingBufferSize;
         PassParameters->NormalHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
 		PassParameters->DepthHistory = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
         PassParameters->SceneTextures     = CommonParameters.SceneTextures;
@@ -899,7 +911,7 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 
 		PassParameters->ReflectionMaxNormalBias		= GetRaytracingMaxNormalBias();
 		PassParameters->TLAS = View.GetRayTracingSceneViewChecked();
-		PassParameters->ApproxVisibility = CVarRestirRTAppoxVisibility.GetValueOnRenderThread();
+		PassParameters->ApproxVisibility = CVarRestirRTRSpatialApplyApproxVisibility.GetValueOnRenderThread();
 		PassParameters->InputSlice = 0;
 		PassParameters->OutputSlice = 1;
 		PassParameters->SpatialDepthRejectionThreshold = CVarRestirRTRSpatialDepthRejectionThreshold.GetValueOnRenderThread();
@@ -925,14 +937,16 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 	}
     //Evaluate 
     {
+		FIntPoint OutputSize = CVarRestirRTRResolve.GetValueOnRenderThread() == 1? SceneTextures.SceneDepthTexture->Desc.Extent : (SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactorInt);
         FRDGTextureDesc ResolvedOutputDesc = FRDGTextureDesc::Create2D(
-			SceneTextures.SceneDepthTexture->Desc.Extent, // full res buffer
+			OutputSize, // full res buffer
 			PF_FloatRGBA, FClearValueBinding(FLinearColor(0, 0, 0, 0)), 
 			TexCreate_ShaderResource | TexCreate_UAV);
-
+		
 		FRDGTextureRef RawReflectionColor = OutDenoiserInputs->Color;
 		OutDenoiserInputs->Color = GraphBuilder.CreateTexture(ResolvedOutputDesc, TEXT("RayTracingReflections"));
-
+		auto DebugTex = GraphBuilder.CreateTexture(ResolvedOutputDesc, TEXT("DebugReflectionTex"));
+		
 		const FScreenSpaceDenoiserHistory& ReflectionsHistory = View.PrevViewInfo.ReflectionsHistory;
 
 		const bool bValidHistory = ReflectionsHistory.IsValid() && !View.bCameraCut;
@@ -970,87 +984,95 @@ void FDeferredShadingSceneRenderer::RenderFusionReflections(
 			(ViewportExtent.X * 0.5f + ViewportOffset.X) * InvBufferSize.X,
 			(ViewportExtent.Y * 0.5f + ViewportOffset.Y) * InvBufferSize.Y);
 
-        // auto* PassParameters = GraphBuilder.AllocParameters<FFusionReflectionResovleCS::FParameters>();
-        // PassParameters->RayTracingBufferSize           = RayTracingBufferSize;
-        // PassParameters->UpscaleFactor                  = CommonParameters.UpscaleFactor;
-        // PassParameters->SpatialResolveMaxRadius        = FMath::Clamp<float>(CVarRayTracingReflectionsSpatialResolveMaxRadius.GetValueOnRenderThread(), 0.0f, 32.0f);
-        // PassParameters->SpatialResolveNumSamples       = FMath::Clamp<int32>(CVarRayTracingReflectionsSpatialResolveNumSamples.GetValueOnRenderThread(), 1, 32);
-        // PassParameters->ReflectionMaxRoughness         = CommonParameters.ReflectionMaxRoughness;
-        // PassParameters->ReflectionSmoothBias           = CommonParameters.ReflectionSmoothBias;
-        // PassParameters->ReflectionHistoryWeight        = HistoryWeight;
-        // PassParameters->HistoryScreenPositionScaleBias = HistoryScreenPositionScaleBias;
-        // PassParameters->ViewUniformBuffer              = CommonParameters.ViewUniformBuffer;
-        // PassParameters->SceneTextures                  = CommonParameters.SceneTextures;
-        // PassParameters->DepthBufferHistory             = DepthBufferHistoryTexture;
-        // PassParameters->ReflectionHistory              = ReflectionHistoryTexture;
-        // PassParameters->RawReflectionColor             = RawReflectionColor;
-        // PassParameters->ReflectionDenoiserData         = ReflectionDenoiserData;
-        // PassParameters->ColorOutput                    = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
-        // PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
-        // PassParameters->RWRTReservoirHistoryUAV = GraphBuilder.CreateUAV(RTReservoirsHistory);
-		// PassParameters->ReservoirBufferDim = ReservoirBufferDim;
-		// PassParameters->RWRTReservoirUAV       = GraphBuilder.CreateUAV(RTReservoirs);
-        // // 
-        // const uint32 FrameIndex = View.ViewState ? View.ViewState->GetFrameIndex() : 0;
-        // static const uint32 Offsets[8] = { 7, 2, 0, 5, 3, 1, 4, 6 }; // Just a randomized list of offsets (added to DispatchThreadId in the shader)
-        // PassParameters->ThreadIdOffset = HistoryWeight > 0 && CVarRayTracingReflectionsTemporalQuality.GetValueOnRenderThread() == 2
-        //     ? Offsets[FrameIndex % UE_ARRAY_COUNT(Offsets)] : 0;
+		if (CVarRestirRTRResolve.GetValueOnRenderThread())
+		{
+			 auto* PassParameters = GraphBuilder.AllocParameters<FFusionReflectionResovleCS::FParameters>();
+			 PassParameters->RayTracingBufferSize           = RayTracingBufferSize;
+			 PassParameters->UpscaleFactor                  = CommonParameters.UpscaleFactor;
+			 PassParameters->SpatialResolveMaxRadius        = FMath::Clamp<float>(CVarRayTracingReflectionsSpatialResolveMaxRadius.GetValueOnRenderThread(), 0.0f, 32.0f);
+			 PassParameters->SpatialResolveNumSamples       = FMath::Clamp<int32>(CVarRayTracingReflectionsSpatialResolveNumSamples.GetValueOnRenderThread(), 1, 32);
+			 PassParameters->ReflectionMaxRoughness         = CommonParameters.ReflectionMaxRoughness;
+			 PassParameters->ReflectionSmoothBias           = CommonParameters.ReflectionSmoothBias;
+			 PassParameters->ReflectionHistoryWeight        = HistoryWeight;
+			 PassParameters->HistoryScreenPositionScaleBias = HistoryScreenPositionScaleBias;
+			 PassParameters->ViewUniformBuffer              = CommonParameters.ViewUniformBuffer;
+			 PassParameters->SceneTextures                  = CommonParameters.SceneTextures;
+			 PassParameters->DepthBufferHistory             = DepthBufferHistoryTexture;
+			 PassParameters->ReflectionHistory              = ReflectionHistoryTexture;
+			 PassParameters->RawReflectionColor             = RawReflectionColor;
+			 PassParameters->ReflectionDenoiserData         = ReflectionDenoiserData;
+			 PassParameters->ColorOutput                    = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
+			 PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
+			 PassParameters->RWRTReservoirHistoryUAV = GraphBuilder.CreateUAV(RTReservoirsHistory);
+			 PassParameters->ReservoirBufferDim = ReservoirBufferDim;
+			 PassParameters->RWRTReservoirUAV       = GraphBuilder.CreateUAV(RTReservoirs);
+			 PassParameters->InputSlice = InitialSlice;
+			 PassParameters->DebugTex = GraphBuilder.CreateUAV(DebugTex);
+			 // 
+			 const uint32 FrameIndex = View.ViewState ? View.ViewState->GetFrameIndex() : 0;
+			 static const uint32 Offsets[8] = { 7, 2, 0, 5, 3, 1, 4, 6 }; // Just a randomized list of offsets (added to DispatchThreadId in the shader)
+			 PassParameters->ThreadIdOffset = HistoryWeight > 0 && CVarRayTracingReflectionsTemporalQuality.GetValueOnRenderThread() == 2
+			     ? Offsets[FrameIndex % UE_ARRAY_COUNT(Offsets)] : 0;
 
-        // FFusionReflectionResovleCS::FPermutationDomain PermutationVector;
-        // if ((PassParameters->SpatialResolveNumSamples % 4 == 0) && PassParameters->SpatialResolveNumSamples <= 16)
-        // {
-        //     // Static unrolled loop
-        //     PermutationVector.Set<FFusionReflectionResovleCS::FNumSamples>(PassParameters->SpatialResolveNumSamples);
-        // }
-        // else
-        // {
-        //     // Dynamic loop
-        //     PermutationVector.Set<FFusionReflectionResovleCS::FNumSamples>(0);
-        // }
+			 FFusionReflectionResovleCS::FPermutationDomain PermutationVector;
+			 if ((PassParameters->SpatialResolveNumSamples % 4 == 0) && PassParameters->SpatialResolveNumSamples <= 16)
+			 {
+			     // Static unrolled loop
+			     PermutationVector.Set<FFusionReflectionResovleCS::FNumSamples>(PassParameters->SpatialResolveNumSamples);
+			 }
+			 else
+			 {
+			     // Dynamic loop
+			     PermutationVector.Set<FFusionReflectionResovleCS::FNumSamples>(0);
+			 }
 
-        // auto ComputeShader = View.ShaderMap->GetShader<FFusionReflectionResovleCS>(PermutationVector);
-        // ClearUnusedGraphResources(ComputeShader, PassParameters);
+			 auto ComputeShader = View.ShaderMap->GetShader<FFusionReflectionResovleCS>(PermutationVector);
+			 ClearUnusedGraphResources(ComputeShader, PassParameters);
 
-        // FIntVector GroupCount;
-        // GroupCount.X = FMath::DivideAndRoundUp(View.ViewRect.Size().X, FFusionReflectionResovleCS::GetGroupSize().X);
-        // GroupCount.Y = FMath::DivideAndRoundUp(View.ViewRect.Size().Y, FFusionReflectionResovleCS::GetGroupSize().Y);
-        // GroupCount.Z = 1;
-        // FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("RayTracingReflectionResolve"), ComputeShader, PassParameters, GroupCount);
+			 FIntVector GroupCount;
+			 GroupCount.X = FMath::DivideAndRoundUp(View.ViewRect.Size().X, FFusionReflectionResovleCS::GetGroupSize().X);
+			 GroupCount.Y = FMath::DivideAndRoundUp(View.ViewRect.Size().Y, FFusionReflectionResovleCS::GetGroupSize().Y);
+			 GroupCount.Z = 1;
+			 FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("RayTracingReflectionResolve"), ComputeShader, PassParameters, GroupCount);
+		}
+		else
+		{
+			FEvaluateRestirReflectionRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FEvaluateRestirReflectionRGS::FParameters>();
+			PassParameters->RWRTReservoirUAV = GraphBuilder.CreateUAV(RTReservoirs);
+			PassParameters->ReservoirBufferDim = ReservoirBufferDim;
+			PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
+			PassParameters->RWRTReservoirHistoryUAV = GraphBuilder.CreateUAV(RTReservoirsHistory);
+			PassParameters->UpscaleFactor = CommonParameters.UpscaleFactor;
+			PassParameters->ReflectionMaxRoughness = CommonParameters.ReflectionMaxRoughness;
+			PassParameters->ViewUniformBuffer = CommonParameters.ViewUniformBuffer;
+			PassParameters->SceneTextures = CommonParameters.SceneTextures;
+			PassParameters->ReflectionMaxNormalBias = GetRaytracingMaxNormalBias();
+			PassParameters->ColorOutput = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
+			PassParameters->DebugTex = GraphBuilder.CreateUAV(DebugTex);
+			PassParameters->TLAS = CommonParameters.TLAS;
+			PassParameters->InputSlice = InitialSlice;
+			PassParameters->FeedbackVisibility = CVarRestirRTRFeedBackVisility.GetValueOnRenderThread();
+			PassParameters->ApproxVisibility = CVarRestirRTREvalApplyApproxVisibility.GetValueOnRenderThread();
+			PassParameters->RawReflectionColor = RawReflectionColor;
+			PassParameters->ReflectionSmoothBias = CommonParameters.ReflectionSmoothBias;
+			FEvaluateRestirReflectionRGS::FPermutationDomain PermutationVector;
+			//auto RayGenShader = View.ShaderMap->GetShader<FEvaluateRestirReflectionRGS>(PermutationVector);
+			TShaderMapRef<FEvaluateRestirReflectionRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
+			ClearUnusedGraphResources(RayGenShader, PassParameters);
 
-		FEvaluateRestirReflectionRGS::FParameters* PassParameters = GraphBuilder.AllocParameters<FEvaluateRestirReflectionRGS::FParameters>();
+			GraphBuilder.AddPass(
+				RDG_EVENT_NAME("FusionReflectionEValuate %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
+				PassParameters,
+				ERDGPassFlags::Compute,
+				[PassParameters, &View, RayGenShader, RayTracingResolution](FRHIRayTracingCommandList& RHICmdList)
+				{
+					FRayTracingShaderBindingsWriter GlobalResources;
+					SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
 
-		PassParameters->RWRTReservoirUAV = GraphBuilder.CreateUAV(RTReservoirs);
-		PassParameters->ReservoirBufferDim = ReservoirBufferDim;
-		PassParameters->ReservoirHistoryBufferDim = ReservoirHistoryBufferDim;
-		PassParameters->RWRTReservoirHistoryUAV = GraphBuilder.CreateUAV(RTReservoirsHistory);
-
-		PassParameters->UpscaleFactor =  CommonParameters.UpscaleFactor;
-		PassParameters->ReflectionMaxRoughness = CommonParameters.ReflectionMaxRoughness;
-		PassParameters->ViewUniformBuffer = CommonParameters.ViewUniformBuffer;
-		PassParameters->SceneTextures = CommonParameters.SceneTextures;
-		PassParameters->ReflectionMaxNormalBias = GetRaytracingMaxNormalBias();
-		PassParameters->ColorOutput    = GraphBuilder.CreateUAV(OutDenoiserInputs->Color);
-		PassParameters->TLAS = CommonParameters.TLAS;
-		PassParameters->InputSlice = InitialSlice;
-		PassParameters->FeedbackVisibility = CVarRestirRTRFeedBackVisility.GetValueOnRenderThread();
-		PassParameters->ApproxVisibility = CVarRestirRTREvalApplyApproxVisibility.GetValueOnRenderThread();
-		FEvaluateRestirReflectionRGS::FPermutationDomain PermutationVector;
-		//auto RayGenShader = View.ShaderMap->GetShader<FEvaluateRestirReflectionRGS>(PermutationVector);
-		TShaderMapRef<FEvaluateRestirReflectionRGS> RayGenShader(GetGlobalShaderMap(ERHIFeatureLevel::SM5), PermutationVector);
-		ClearUnusedGraphResources(RayGenShader, PassParameters);
-
-		GraphBuilder.AddPass(
-			RDG_EVENT_NAME("FusionReflectionEValuate %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
-			PassParameters,
-			ERDGPassFlags::Compute,
-			[PassParameters,&View, RayGenShader, RayTracingResolution](FRHIRayTracingCommandList& RHICmdList)
-			{
-				FRayTracingShaderBindingsWriter GlobalResources;
-				SetShaderParameters(GlobalResources, RayGenShader, *PassParameters);
-
-				FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
-				RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, RayTracingResolution.X, RayTracingResolution.Y);
-			});
+					FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
+					RHICmdList.RayTraceDispatch(View.RayTracingMaterialPipeline, RayGenShader.GetRayTracingShader(), RayTracingSceneRHI, GlobalResources, RayTracingResolution.X, RayTracingResolution.Y);
+				});
+		}
 
 		if ( View.ViewState)
 		{

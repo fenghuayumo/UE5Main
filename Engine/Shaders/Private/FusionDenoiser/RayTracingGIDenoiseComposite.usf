@@ -3,7 +3,7 @@
 #include "../SceneTextureParameters.ush"
 #include "RayTracingUpscaleCommon.ush"
 #include "/Engine/Public/Platform.ush"
-#include "RayTracingGIDenoiseCommon.ush"
+#include "RayTracingDenoiseCommon.ush"
 
 
 float4 		ViewportInfo;

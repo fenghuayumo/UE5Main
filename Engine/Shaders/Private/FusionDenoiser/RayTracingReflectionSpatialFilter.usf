@@ -1,0 +1,192 @@
+#include "../Common.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../SceneTextureParameters.ush"
+#include "RayTracingUpscaleCommon.ush"
+
+Texture2D       ColorInput;
+Texture2D       NormalTexture;
+SamplerState    LinearSampler;
+RWTexture2D<float4>     ColorOutput;
+
+int				FilterRadius;
+int				StepSize;
+float           PhiColor;
+float           PhiDepth;
+float           PhiNormal;
+int             AproximateWithGI;
+float4      TexBufferSize;
+uint        UpscaleFactor;
+float       ReflectionMaxRoughness;
+float       ReflectionSmoothBias;
+
+
+#define MIN_REFLECTIONS_ROUGHNESS_THRESHOLD 0.05
+#define MAX_REFLECTIONS_ROUGHNESS_THRESHOLD 0.75
+// computes a 3x3 gaussian blur of the variance, centered around
+// the current pixel
+float ComputeVarianceCenter(int2 ipos)
+{
+    float sum = 0.0f;
+
+    const float kernel[2][2] = {
+        { 1.0 / 4.0, 1.0 / 8.0 },
+        { 1.0 / 8.0, 1.0 / 16.0 }
+    };
+
+    const int radius = 1;
+    for (int yy = -radius; yy <= radius; yy++)
+    {
+        for (int xx = -radius; xx <= radius; xx++)
+        {
+            int2 p = ipos + int2(xx, yy);
+
+            float k = kernel[abs(xx)][abs(yy)];
+
+            sum += ColorInput.SampleLevel(LinearSampler, p, 0).a * k;
+        }
+    }
+
+    return sum;
+}
+
+float GetClearCoatApproximateRoughness(FGBufferData GBuffer)
+{
+	// Use the similar clearcoat approximation as SSR: simply blend base and clear coat roughness
+	// #todo: stochastic clearcoat
+	if (GBuffer.ShadingModelID == SHADINGMODELID_CLEAR_COAT)
+	{
+		const float ClearCoat = GBuffer.CustomData.x;
+		const float ClearCoatRoughness = GBuffer.CustomData.y;
+
+		// Combined reflection roughness is biased towards clear coat. 
+		// The approximation is quite arbitrary, based on empirical results.
+		return lerp(ClearCoatRoughness, GBuffer.Roughness, pow(1.0 - ClearCoat, 4.0));
+	}
+	else
+	{
+		return GBuffer.Roughness;
+	}
+}
+
+float ApplySmoothBias(float Roughness, float SmoothBias)
+{
+	if (SmoothBias >= 0)
+	{
+		// SmoothStep-like function up to SmoothBias, original value above
+		float X = saturate(Roughness / SmoothBias);
+		return Roughness * X * X * (3.0 - 2.0 * X);
+	}
+	else
+	{
+		// Negative value forces mirror-like reflections
+		return 0;
+	}
+}
+
+
+float GetRoughnessFade(float Roughness, float MaxRoughness)
+{
+	float RoughnessMaskScale = -2.0 / MaxRoughness;
+	return saturate(Roughness * RoughnessMaskScale + 2.0);
+}
+float NormalDistanceCos(float3 n1, float3 n2, float power)
+{
+	return pow( saturate(dot(n1,n2)), power);
+}
+
+float NormalDistanceExp(float3 n1, float3 n2, float power)
+{
+	float x = max(0, 1 - dot(n1, n2));
+	return saturate(exp(-x * power));
+}
+
+float NormalDistanceTan(float3 a, float3 b)
+{
+	const float d = max(1e-8, dot(a, b));
+	return sqrt(max(0.0, 1.0 - d * d)) / d;
+}
+
+[numthreads(16, 16, 1)]
+void SpatialFilter_CS(
+    uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 GroupId : SV_GroupID)
+{
+
+    const int2 ipos = DispatchThreadId.xy;//DenoiseTileData.coord[GroupId.x] + int2(GroupThreadId.xy);
+
+    const float eps_variance      = 1e-10;
+    const float kernel_weights[3] = { 1.0, 2.0 / 3.0, 1.0 / 6.0 };
+
+    // constant samplers to prevent the compiler from generating code which
+    // fetches the sampler descriptor from memory for each texture access
+    const float4  colorCenter      = ColorInput[ipos];
+    const float   centerColorLuma = Luminance(colorCenter.rgb);
+
+    // variance for direct and indirect, filtered using 3x3 gaussin blur
+    const float var = ComputeVarianceCenter(ipos);
+    
+    const uint2 ViewSize = uint2(TexBufferSize.xy);
+	const bool bValidThread = all(DispatchThreadId < ViewSize);
+
+	const float2 BufferUV = (float2(DispatchThreadId ) + 0.5) * TexBufferSize.zw;
+
+	FGBufferData GBuffer = GetGBufferDataFromSceneTextures(BufferUV);
+	GBuffer.Roughness = GetClearCoatApproximateRoughness(GBuffer);
+	GBuffer.Roughness = ApplySmoothBias(GBuffer.Roughness, ReflectionSmoothBias);
+    float CenterDepth = ConvertToDeviceZ(GBuffer.Depth);;
+    float3 CenterNormal = GBuffer.WorldNormal;
+	const float RoughnessFade = GetRoughnessFade(GBuffer.Roughness, ReflectionMaxRoughness);
+	const bool bValidPixel = RoughnessFade > 0;
+
+    if (!bValidPixel && !bValidThread)
+    {
+        ColorOutput[ipos] = 0.0;
+        return;
+    }
+    else if ((GBuffer.Roughness < MIN_REFLECTIONS_ROUGHNESS_THRESHOLD) || (AproximateWithGI == 1 && (GBuffer.Roughness > MAX_REFLECTIONS_ROUGHNESS_THRESHOLD)))
+    {
+        ColorOutput[ipos] = 0.0;
+        return;
+    }
+
+    const float phi_color = PhiColor * sqrt(max(0.0, eps_variance + var.r));
+
+    // explicitly store/accumulate center pixel with weight 1 to prevent issues
+    // with the edge-stopping functions
+    float4 CenterColor =  ColorInput[ipos];
+    float sum_w_color = 1.0;
+    float4  sum_color   = CenterColor;
+
+    for (int yy = -FilterRadius; yy <= FilterRadius; yy++)
+    {
+        for (int xx = -FilterRadius; xx <= FilterRadius; xx++)
+        {
+            int2 p      = ipos + int2(xx, yy) * StepSize;
+            p = clamp(p, int2(0, 0), int2(TexBufferSize.xy));
+            const float kernel = kernel_weights[abs(xx)] * kernel_weights[abs(yy)];
+            if ( (xx != 0 || yy != 0)) // skip center pixel, it is already accumulated
+            {
+                const float4  SampledColor      = ColorInput[p];
+                float3 SampledNormal = DecodeNormal(NormalTexture[p].xyz);
+                float  SampledDepth =  SceneDepthTexture[p].r;
+                // compute the edge-stopping functions
+                const float wNormal = NormalDistanceExp(CenterNormal, SampledNormal, PhiNormal);
+                const float wZ = (PhiDepth == 0) ? 0.0f : abs(CenterDepth - SampledDepth) / PhiDepth;
+                const float wLindirect = abs(Luminance(CenterColor) - Luminance(SampledColor)) / PhiColor;
+                const float kernel = exp(0.0 - max(wLindirect, 0.0) - max(wZ, 0.0) ) * wNormal;
+                const float w_color = kernel;
+
+                // alpha channel contains the variance, therefore the weights need to be squared, see paper for the formula
+                sum_w_color += w_color;
+                sum_color += float4(w_color, w_color, w_color, w_color * w_color) * SampledColor;
+            }
+        }
+    }
+
+    // renormalization is different for variance, check paper for the formula
+    float4 out_color = sum_color / float4(sum_w_color, sum_w_color, sum_w_color, sum_w_color * sum_w_color);
+
+    // temporal integration
+    ColorOutput[ipos] = out_color;
+}

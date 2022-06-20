@@ -2,7 +2,7 @@
 #include "../DeferredShadingCommon.ush"
 #include "../SceneTextureParameters.ush"
 #include "RayTracingUpscaleCommon.ush"
-#include "RayTracingGIDenoiseCommon.ush"
+#include "RayTracingDenoiseCommon.ush"
 
 float4x4 ReprojectionMatrix;
 float4x4 InverseProjectionMatrixThis;
