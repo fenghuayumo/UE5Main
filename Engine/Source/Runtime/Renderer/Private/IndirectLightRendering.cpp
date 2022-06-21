@@ -1506,7 +1506,9 @@ static void AddSkyReflectionPass(
 void FDeferredShadingSceneRenderer::RenderDeferredReflectionsAndSkyLighting(
 	FRDGBuilder& GraphBuilder,
 	const FSceneTextures& SceneTextures,
-	FRDGTextureRef DynamicBentNormalAOTexture)
+	FRDGTextureRef DynamicBentNormalAOTexture,
+	FSurfelBufResources* SurfelResource,
+	FRadianceVolumeProbeConfigs* ProbeConfig)
 {
 	extern int32 GLumenVisualizeIndirectDiffuse;
 	if (ActiveViewFamily->EngineShowFlags.VisualizeLightCulling 
@@ -1628,7 +1630,9 @@ void FDeferredShadingSceneRenderer::RenderDeferredReflectionsAndSkyLighting(
 					View,
 					DenoiserMode,
 					RayTracingReflectionOptions,
-					&DenoiserInputs);
+					&DenoiserInputs,
+					SurfelResource,
+					ProbeConfig);
 			}
 			else if (
 				ViewPipelineState.ReflectionsMethod == EReflectionsMethod::SSR)

@@ -110,7 +110,7 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
         // float2 SampleOffset = DiskSample * FilterSize;
 
         const float Angle = (SampleIndex + RandAngleOffset) * GOLDEN_ANGLE + (RaySubPixelId / float(SubPixelCount) ) * 2 * PI;
-        const float Radius = pow(float(SampleIndex), 0.666) * 2;
+        const float Radius = pow(float(SampleIndex), 0.666) * 4;
         const float2 SampleOffset = float2(cos(Angle), sin(Angle)) * Radius;
 
         const int2   Px = int2(floor(float2(DispatchID.xy) * ResolutionFraction + SampleOffset));
@@ -172,7 +172,7 @@ void SpatialFilter(in uint2 DispatchID : SV_DispatchThreadID)
     // Must be constants, so the `pow` can be const-folded.
     const float KERNEL_SHARPNESS = 0.666;
 
-    const uint Spp = clamp(uint(exp2(4.0 * (1.0 - NormalizedSpp))), 2, MAX_SAMPLE_COUNT);
+    const uint Spp = clamp(uint(exp2(4.0 * (1.0 - NormalizedSpp))), 3, MAX_SAMPLE_COUNT);
     float3 CenterNormalVS = normalize(mul(CenterNormal, (float3x3)View.TranslatedWorldToView));
     
     {

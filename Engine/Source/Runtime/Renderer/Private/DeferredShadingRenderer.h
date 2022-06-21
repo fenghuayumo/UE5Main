@@ -572,7 +572,9 @@ private:
 	void RenderDeferredReflectionsAndSkyLighting(
 		FRDGBuilder& GraphBuilder,
 		const FSceneTextures& SceneTextures,
-		FRDGTextureRef DynamicBentNormalAOTexture);
+		FRDGTextureRef DynamicBentNormalAOTexture,
+		FSurfelBufResources* SurfelResource,
+		FRadianceVolumeProbeConfigs* ProbeConfig);
 
 	void RenderDeferredReflectionsAndSkyLightingHair(FRDGBuilder& GraphBuilder);
 

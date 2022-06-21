@@ -1315,7 +1315,7 @@ RAY_TRACING_ENTRY_RAYGEN(EvaluateRestirGILightingRGS)
 		// for (int Reservoir = 0; Reservoir < NumReservoirs; Reservoir++)
 		{
 			WriteReservoirHistoryData(DispatchThreadId, 0, risSample.Store());
-			//WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0 + 0));
+			// WriteReservoirHistoryData(DispatchThreadId, 0, ReadReservoirData(DispatchThreadId, 0 + 0));
 		}
 	}
 

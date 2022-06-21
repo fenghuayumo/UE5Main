@@ -346,156 +346,156 @@ extern TAutoConsoleVariable<float> CVarRayTracingReflectionsNormalBias;
 extern float GetRayTracingReflectionsMaxRoughness(const FViewInfo& View);
 IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseReflections(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FReflectionsInputs &Inputs, const FReflectionsRayTracingConfig Config) const
 {
-    //return WrappedDenoiser->DenoiseReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
-    RDG_GPU_STAT_SCOPE(GraphBuilder, FusionReflectionDenoiser);
-    RDG_EVENT_SCOPE(GraphBuilder, "FusionReflectionDenoiser");
+    return WrappedDenoiser->DenoiseReflections(GraphBuilder, View, PreviousViewInfos, SceneTextures, Inputs, Config);
+    // RDG_GPU_STAT_SCOPE(GraphBuilder, FusionReflectionDenoiser);
+    // RDG_EVENT_SCOPE(GraphBuilder, "FusionReflectionDenoiser");
     
-    FRHICommandListImmediate &RHICmdList = GraphBuilder.RHICmdList;
+    // FRHICommandListImmediate &RHICmdList = GraphBuilder.RHICmdList;
 
-    FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
-    FRDGTextureRef SceneNormalTexture = SceneTextures.GBufferATexture;
-    FRDGTextureRef SceneAlbedoTexture = SceneTextures.GBufferCTexture;
-    FRDGTextureRef DepthTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
-    FRDGTextureRef NormalTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
+    // FRDGTextureRef SceneDepthTexture = SceneTextures.SceneDepthTexture;
+    // FRDGTextureRef SceneNormalTexture = SceneTextures.GBufferATexture;
+    // FRDGTextureRef SceneAlbedoTexture = SceneTextures.GBufferCTexture;
+    // FRDGTextureRef DepthTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.DepthBuffer, GSystemTextures.BlackDummy);
+    // FRDGTextureRef NormalTexLast = RegisterExternalTextureWithFallback(GraphBuilder, View.PrevViewInfo.GBufferA, GSystemTextures.BlackDummy);
 
-    FIntPoint GBufferRes = View.ViewRect.Size();
-    //FIntPoint UpscaleFactor(1.0f / Config.ResolutionFraction, 1.0f / Config.ResolutionFraction);
-	int32 UpscaleFactor = int32(1.0f / Config.ResolutionFraction);
-    FIntPoint DenoiseBufferRes =  FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
+    // FIntPoint GBufferRes = View.ViewRect.Size();
+    // //FIntPoint UpscaleFactor(1.0f / Config.ResolutionFraction, 1.0f / Config.ResolutionFraction);
+	// int32 UpscaleFactor = int32(1.0f / Config.ResolutionFraction);
+    // FIntPoint DenoiseBufferRes =  FIntPoint::DivideAndRoundUp(View.ViewRect.Size(), UpscaleFactor);
 
-	FIntPoint TexSize = DenoiseBufferRes;//SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactor;
-	FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
+	// FIntPoint TexSize = DenoiseBufferRes;//SceneTextures.SceneDepthTexture->Desc.Extent / UpscaleFactor;
+	// FVector4f BufferTexSize = FVector4f(TexSize.X, TexSize.Y, 1.0 / TexSize.X, 1.0 / TexSize.Y);
 
-    FRDGTextureRef DenoiseIntensity[2];
-    const TCHAR *DenoiseTextureNames[] = {TEXT("DenoiseReflection0"), TEXT("DenoiseReflection1")};
-    const bool bCreate = !PreviousViewInfos->FusionReflectionHistory.RT[0] || PreviousViewInfos->FusionReflectionHistory.RT[0]->GetDesc().Extent != DenoiseBufferRes;
-    if (!View.State || bCreate)
-    {
-        FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
-            TexSize,
-            PF_FloatRGBA,
-            FClearValueBinding::Black,
-            TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
-        DenoiseIntensity[0] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[0], ERDGTextureFlags::MultiFrame);
-        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[0], FVector4f(0, 0, 0, 0));
+    // FRDGTextureRef DenoiseIntensity[2];
+    // const TCHAR *DenoiseTextureNames[] = {TEXT("DenoiseReflection0"), TEXT("DenoiseReflection1")};
+    // const bool bCreate = !PreviousViewInfos->FusionReflectionHistory.RT[0] || PreviousViewInfos->FusionReflectionHistory.RT[0]->GetDesc().Extent != DenoiseBufferRes;
+    // if (!View.State || bCreate)
+    // {
+    //     FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
+    //         TexSize,
+    //         PF_FloatRGBA,
+    //         FClearValueBinding::Black,
+    //         TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+    //     DenoiseIntensity[0] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[0], ERDGTextureFlags::MultiFrame);
+    //     AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[0], FVector4f(0, 0, 0, 0));
 
-        RTDesc.Format = PF_FloatRGBA;
-        DenoiseIntensity[1] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[1], ERDGTextureFlags::MultiFrame);
-        AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[1], FVector4f(0, 0, 0, 0));
-    }
-    else
-    {
-        DenoiseIntensity[0] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[0], DenoiseTextureNames[0]);
-        DenoiseIntensity[1] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[1], DenoiseTextureNames[1]);
-    }
+    //     RTDesc.Format = PF_FloatRGBA;
+    //     DenoiseIntensity[1] = GraphBuilder.CreateTexture(RTDesc, DenoiseTextureNames[1], ERDGTextureFlags::MultiFrame);
+    //     AddClearRenderTargetPass(GraphBuilder, DenoiseIntensity[1], FVector4f(0, 0, 0, 0));
+    // }
+    // else
+    // {
+    //     DenoiseIntensity[0] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[0], DenoiseTextureNames[0]);
+    //     DenoiseIntensity[1] = GraphBuilder.RegisterExternalTexture(PreviousViewInfos->FusionReflectionHistory.RT[1], DenoiseTextureNames[1]);
+    // }
 
-    FRDGTextureRef ColorLast = DenoiseIntensity[0];
-    FRDGTextureRef MomentLast = DenoiseIntensity[1];
+    // FRDGTextureRef ColorLast = DenoiseIntensity[0];
+    // FRDGTextureRef MomentLast = DenoiseIntensity[1];
 
-    FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
-        TexSize,
-        PF_FloatRGBA,
-        FClearValueBinding::Black,
-        TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+    // FRDGTextureDesc RTDesc = FRDGTextureDesc::Create2D(
+    //     TexSize,
+    //     PF_FloatRGBA,
+    //     FClearValueBinding::Black,
+    //     TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
 
-    FRDGTextureRef ColorThis = GraphBuilder.CreateTexture(RTDesc, TEXT("ColorThis"));
-    FRDGTextureRef DenoisedColor = GraphBuilder.CreateTexture(RTDesc, TEXT("DeonisedColor"));
-    RTDesc.Format = PF_FloatRGBA;
-    FRDGTextureRef MomentThis = GraphBuilder.CreateTexture(RTDesc, TEXT("MomentThis"));
+    // FRDGTextureRef ColorThis = GraphBuilder.CreateTexture(RTDesc, TEXT("ColorThis"));
+    // FRDGTextureRef DenoisedColor = GraphBuilder.CreateTexture(RTDesc, TEXT("DeonisedColor"));
+    // RTDesc.Format = PF_FloatRGBA;
+    // FRDGTextureRef MomentThis = GraphBuilder.CreateTexture(RTDesc, TEXT("MomentThis"));
 
-    FRDGTextureDesc OutputDesc = FRDGTextureDesc::Create2D(
-        SceneTextures.SceneDepthTexture->Desc.Extent,
-        PF_FloatRGBA,
-        FClearValueBinding::Black,
-        TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
+    // FRDGTextureDesc OutputDesc = FRDGTextureDesc::Create2D(
+    //     SceneTextures.SceneDepthTexture->Desc.Extent,
+    //     PF_FloatRGBA,
+    //     FClearValueBinding::Black,
+    //     TexCreate_ShaderResource | TexCreate_UAV | TexCreate_RenderTargetable);
     
-    {
-        // Temporal filtering
-        TShaderMapRef<FReflectionTemporalFilterCS> ComputeShader(View.ShaderMap);
-        FReflectionTemporalFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionTemporalFilterCS::FParameters>();
-        PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-        PassParameters->GBufferDim = GBufferRes;
-        PassParameters->UpscaleFactor = UpscaleFactor;
-        PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-        PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-        PassParameters->BlendWeight = GET_GIDENOISE_VAR(TemporalBlendWeight);
-        PassParameters->MomentBlendWeight = GET_GIDENOISE_VAR(TemporalMomentBlendWeight);
-        PassParameters->NormalKernel = GET_GIDENOISE_VAR(TemporalNormalTolerance);
-        PassParameters->DepthKernel = GET_GIDENOISE_VAR(TemporalDepthTolerance);
-        PassParameters->HistoryLength = GET_GIDENOISE_VAR(HistoryLength);
+    // {
+    //     // Temporal filtering
+    //     TShaderMapRef<FReflectionTemporalFilterCS> ComputeShader(View.ShaderMap);
+    //     FReflectionTemporalFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionTemporalFilterCS::FParameters>();
+    //     PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+    //     PassParameters->GBufferDim = GBufferRes;
+    //     PassParameters->UpscaleFactor = UpscaleFactor;
+    //     PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    //     PassParameters->PointClampSampler = TStaticSamplerState<SF_Point, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    //     PassParameters->BlendWeight = GET_GIDENOISE_VAR(TemporalBlendWeight);
+    //     PassParameters->MomentBlendWeight = GET_GIDENOISE_VAR(TemporalMomentBlendWeight);
+    //     PassParameters->NormalKernel = GET_GIDENOISE_VAR(TemporalNormalTolerance);
+    //     PassParameters->DepthKernel = GET_GIDENOISE_VAR(TemporalDepthTolerance);
+    //     PassParameters->HistoryLength = GET_GIDENOISE_VAR(HistoryLength);
 
-        PassParameters->SceneTextures = SceneTextures;
-        PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
+    //     PassParameters->SceneTextures = SceneTextures;
+    //     PassParameters->SceneTextures.GBufferVelocityTexture = SceneTextures.GBufferVelocityTexture ? SceneTextures.GBufferVelocityTexture : GraphBuilder.RegisterExternalTexture(GSystemTextures.BlackDummy);
 
-        PassParameters->DepthTextureThis = SceneDepthTexture;
-        PassParameters->DepthTextureLast = DepthTexLast;
-        PassParameters->NormalTextureThis = SceneNormalTexture;
-        PassParameters->NormalTextureLast = NormalTexLast;
-        PassParameters->MomentLast = MomentLast;
-        PassParameters->ColorLast = ColorLast;
-        PassParameters->ColorInput = Inputs.Color;
-        PassParameters->DistanceInput = Inputs.RayHitDistance;
-        PassParameters->MomentThis = GraphBuilder.CreateUAV(MomentThis);
-        PassParameters->ColorThis = GraphBuilder.CreateUAV(ColorThis);
-        PassParameters->TexBufferSize = BufferTexSize;
-        PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
-        PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
+    //     PassParameters->DepthTextureThis = SceneDepthTexture;
+    //     PassParameters->DepthTextureLast = DepthTexLast;
+    //     PassParameters->NormalTextureThis = SceneNormalTexture;
+    //     PassParameters->NormalTextureLast = NormalTexLast;
+    //     PassParameters->MomentLast = MomentLast;
+    //     PassParameters->ColorLast = ColorLast;
+    //     PassParameters->ColorInput = Inputs.Color;
+    //     PassParameters->DistanceInput = Inputs.RayHitDistance;
+    //     PassParameters->MomentThis = GraphBuilder.CreateUAV(MomentThis);
+    //     PassParameters->ColorThis = GraphBuilder.CreateUAV(ColorThis);
+    //     PassParameters->TexBufferSize = BufferTexSize;
+    //     PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
+    //     PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
 
-        PassParameters->ReprojectionTex = View.ProjectionMapTexture;
+    //     PassParameters->ReprojectionTex = View.ProjectionMapTexture;
 
-        ClearUnusedGraphResources(ComputeShader, PassParameters);
-        FComputeShaderUtils::AddPass(
-            GraphBuilder,
-            RDG_EVENT_NAME("Reflection Denoise Temporal Filter"),
-            ComputeShader,
-            PassParameters,
-            FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
+    //     ClearUnusedGraphResources(ComputeShader, PassParameters);
+    //     FComputeShaderUtils::AddPass(
+    //         GraphBuilder,
+    //         RDG_EVENT_NAME("Reflection Denoise Temporal Filter"),
+    //         ComputeShader,
+    //         PassParameters,
+    //         FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
 
-        FRHICopyTextureInfo CopyInfo;
-        CopyInfo.Size = MomentThis->Desc.GetSize();
-        AddCopyTexturePass(GraphBuilder, MomentThis, MomentLast, CopyInfo);
-    }
+    //     FRHICopyTextureInfo CopyInfo;
+    //     CopyInfo.Size = MomentThis->Desc.GetSize();
+    //     AddCopyTexturePass(GraphBuilder, MomentThis, MomentLast, CopyInfo);
+    // }
 
-    {
-        TShaderMapRef<FReflectionSpatialFilterCS> ComputeShader(View.ShaderMap);
-        FReflectionSpatialFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionSpatialFilterCS::FParameters>();
-        PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
-        PassParameters->ColorInput = ColorThis;
-        PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
-        PassParameters->NormalTexture = SceneNormalTexture;
-        PassParameters->PhiColor = GET_GIDENOISE_VAR(PhiColor);
-        PassParameters->PhiNormal = GET_GIDENOISE_VAR(PhiNormal);
-        PassParameters->PhiDepth = GET_GIDENOISE_VAR(PhiDepth);
-        PassParameters->AproximateWithGI = 0;
-		   PassParameters->SceneTextures = SceneTextures;
-        PassParameters->ColorOutput = GraphBuilder.CreateUAV(DenoisedColor);
-        PassParameters->TexBufferSize = BufferTexSize;
-        PassParameters->UpscaleFactor = UpscaleFactor;
-        PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
-        PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
-        PassParameters->FilterRadius = GET_GIDENOISE_VAR(FilterRadius);
-        PassParameters->StepSize = 1;
-        ClearUnusedGraphResources(ComputeShader, PassParameters);
-        FComputeShaderUtils::AddPass(
-            GraphBuilder,
-            RDG_EVENT_NAME("Reflection Denoise Spatial Filter"),
-            ComputeShader,
-            PassParameters,
-            FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
+    // {
+    //     TShaderMapRef<FReflectionSpatialFilterCS> ComputeShader(View.ShaderMap);
+    //     FReflectionSpatialFilterCS::FParameters *PassParameters = GraphBuilder.AllocParameters<FReflectionSpatialFilterCS::FParameters>();
+    //     PassParameters->ViewUniformBuffer = View.ViewUniformBuffer;
+    //     PassParameters->ColorInput = ColorThis;
+    //     PassParameters->LinearSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
+    //     PassParameters->NormalTexture = SceneNormalTexture;
+    //     PassParameters->PhiColor = GET_GIDENOISE_VAR(PhiColor);
+    //     PassParameters->PhiNormal = GET_GIDENOISE_VAR(PhiNormal);
+    //     PassParameters->PhiDepth = GET_GIDENOISE_VAR(PhiDepth);
+    //     PassParameters->AproximateWithGI = 0;
+	// 	   PassParameters->SceneTextures = SceneTextures;
+    //     PassParameters->ColorOutput = GraphBuilder.CreateUAV(DenoisedColor);
+    //     PassParameters->TexBufferSize = BufferTexSize;
+    //     PassParameters->UpscaleFactor = UpscaleFactor;
+    //     PassParameters->ReflectionMaxRoughness = GetRayTracingReflectionsMaxRoughness(View);
+    //     PassParameters->ReflectionSmoothBias = CVarRayTracingReflectionsNormalBias.GetValueOnRenderThread();
+    //     PassParameters->FilterRadius = GET_GIDENOISE_VAR(FilterRadius);
+    //     PassParameters->StepSize = 1;
+    //     ClearUnusedGraphResources(ComputeShader, PassParameters);
+    //     FComputeShaderUtils::AddPass(
+    //         GraphBuilder,
+    //         RDG_EVENT_NAME("Reflection Denoise Spatial Filter"),
+    //         ComputeShader,
+    //         PassParameters,
+    //         FIntVector((DenoiseBufferRes.X + 15) / 16, (DenoiseBufferRes.Y + 15) / 16, 1));
 
-    }
+    // }
 
-     if (!View.bStatePrevViewInfoIsReadOnly)
-     {
-         // Extract history feedback here
-         GraphBuilder.QueueTextureExtraction(ColorThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[0]);
-         GraphBuilder.QueueTextureExtraction(MomentThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[1]);
-     }
+    //  if (!View.bStatePrevViewInfoIsReadOnly)
+    //  {
+    //      // Extract history feedback here
+    //      GraphBuilder.QueueTextureExtraction(ColorThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[0]);
+    //      GraphBuilder.QueueTextureExtraction(MomentThis, &View.ViewState->PrevFrameViewInfo.FusionReflectionHistory.RT[1]);
+    //  }
 
-    IScreenSpaceDenoiser::FReflectionsOutputs OutPuts;
-	OutPuts.Color = DenoisedColor;
+    // IScreenSpaceDenoiser::FReflectionsOutputs OutPuts;
+	// OutPuts.Color = DenoisedColor;
 
-    return OutPuts;
+    // return OutPuts;
 }
 
 IScreenSpaceDenoiser::FReflectionsOutputs FFusionDenoiser::DenoiseWaterReflections(FRDGBuilder &GraphBuilder, const FViewInfo &View, FPreviousViewInfo *PreviousViewInfos, const FSceneTextureParameters &SceneTextures, const FReflectionsInputs &Inputs, const FReflectionsRayTracingConfig Config) const

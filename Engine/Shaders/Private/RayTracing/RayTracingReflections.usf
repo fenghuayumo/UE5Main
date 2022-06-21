@@ -106,6 +106,22 @@ RWStructuredBuffer<FImaginaryReflectionGBufferData> ImaginaryReflectionGBuffer;
 // Material buffer and sort tile size are used for sorted materials.
 RWStructuredBuffer<FDeferredMaterialPayload> MaterialBuffer;
 
+#if USE_SURFEL
+#include "../SurfelGI/SurfelCommon.ush"
+RWByteAddressBuffer SurfelMetaBuf;
+RWByteAddressBuffer SurfelGridMetaBuf;
+
+RWStructuredBuffer<uint> SurfelLifeBuf;
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelRePositionBuf;
+RWStructuredBuffer<uint> SurfelRePositionCountBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelVertexBuf;
+RWStructuredBuffer<float4> SurfelIrradianceBuf;
+RWStructuredBuffer<uint> SurfelEntryCellBuf;
+
+#include "../SurfelGI/SurfelLookUp.ush"
+#endif
+
 float3x3 GetHouseholderTransform(in float3 PlaneNormal)
 {
 	const float MinusTwoXY = -2.0f * PlaneNormal.x * PlaneNormal.y;
@@ -693,7 +709,12 @@ RAY_TRACING_ENTRY_RAYGEN(RayTracingReflectionsRGS)
 						bDecoupleSampleGeneration,
 						RayCone,
 						Radiance);
-					TopLayerRadiance += Radiance * Transmission;
+						
+					float3 SurfelLighting = 0.0;
+#if USE_SURFEL
+					SurfelLighting += PackedPayload.GetDiffuseColor() * GetSurfelGI(RayHitTranslatedWorldPos - LWCHackToFloat(PrimaryView.PreViewTranslation), PackedPayload.GetWorldNormal(),0, RandSequence );
+#endif
+					TopLayerRadiance += (SurfelLighting + Radiance) * Transmission;
 				}
 
 				bool isTopLayerRayValid = PackedPayload.IsHit() || (bAllowSkySampling && bSkyLightAffectReflection && ReflectionStruct.SkyLightParameters.y > 0);
