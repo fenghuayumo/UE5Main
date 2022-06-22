@@ -21,10 +21,10 @@ SHADER_PARAMETER(int, InterleaveRate)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FMeshLightCommonParameter,)
-	SHADER_PARAMETER_SRV(StructuredBuffer<FVector3f>, MeshLightVertexBuffer)
-	SHADER_PARAMETER_SRV(StructuredBuffer<uint32>, MeshLightIndexBuffer)
-	SHADER_PARAMETER_SRV(StructuredBuffer<MeshLightInstanceTriangle>, MeshLightInstancePrimitiveBuffer)
-	SHADER_PARAMETER_SRV(StructuredBuffer<MeshLightInstance>, MeshLightInstanceBuffer)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<FVector3f>, MeshLightVertexBuffer)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint32>, MeshLightIndexBuffer)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<MeshLightInstanceTriangle>, MeshLightInstancePrimitiveBuffer)
+	SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<MeshLightInstance>, MeshLightInstanceBuffer)
 	SHADER_PARAMETER(uint32, NumLightTriangles)
 END_SHADER_PARAMETER_STRUCT()
 class LightTree
@@ -123,20 +123,20 @@ public:
 		int TriLightCount,
 		const FVector3f& SceneLightBoundMin,
 		const FVector3f& SceneLightBoundMax,
-		FShaderResourceViewRHIRef MeshLightIndexBuffer,
-		FShaderResourceViewRHIRef MeshLightVertexBuffer,
-		FShaderResourceViewRHIRef MeshLightInstanceBuffer,
-		FShaderResourceViewRHIRef MeshLightInstancePrimitiveBuffer);
+		FRDGBufferRef MeshLightIndexBuffer,
+		FRDGBufferRef MeshLightVertexBuffer,
+		FRDGBufferRef MeshLightInstanceBuffer,
+		FRDGBufferRef MeshLightInstancePrimitiveBuffer);
 
 	void Sort(FRDGBuilder& GraphBuilder,
 		const FVector3f& SceneLightBoundMin,
 		const FVector3f& SceneLightBoundMax);
 
 	void GenerateLeafNodes(FRDGBuilder& GraphBuilder, 
-		FShaderResourceViewRHIRef MeshLightIndexBuffer,
-		FShaderResourceViewRHIRef MeshLightVertexBuffer,
-		FShaderResourceViewRHIRef MeshLightInstanceBuffer,
-		FShaderResourceViewRHIRef MeshLightInstancePrimitiveBuffer);
+		FRDGBufferRef MeshLightIndexBuffer,
+		FRDGBufferRef MeshLightVertexBuffer,
+		FRDGBufferRef MeshLightInstanceBuffer,
+		FRDGBufferRef MeshLightInstancePrimitiveBuffer);
 
 	void GenerateInternalNodes(FRDGBuilder& GraphBuilder);
 	void GenerateMultipleLevels(FRDGBuilder& GraphBuilder, int srcLevel, int dstLevelStart, int dstLevelEnd);

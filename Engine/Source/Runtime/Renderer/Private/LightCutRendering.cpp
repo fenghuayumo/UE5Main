@@ -378,10 +378,10 @@ class FGenerateLevelMeshLightLeafNodesCS : public FGlobalShader
 
 		SHADER_PARAMETER(uint32, NumTriangleLights)
 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FLightNode>, LeafNodes)
-		SHADER_PARAMETER_SRV(StructuredBuffer<float3>, MeshLightVertexBuffer)
-		SHADER_PARAMETER_SRV(StructuredBuffer<uint>, MeshLightIndexBuffer)
-		SHADER_PARAMETER_SRV(StructuredBuffer<MeshLightInstanceTriangle>, MeshLightInstancePrimitiveBuffer)
-		SHADER_PARAMETER_SRV(StructuredBuffer<MeshLightInstance>, MeshLightInstanceBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float3>, MeshLightVertexBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, MeshLightIndexBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<MeshLightInstanceTriangle>, MeshLightInstancePrimitiveBuffer)
+		SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<MeshLightInstance>, MeshLightInstanceBuffer)
 
 	END_SHADER_PARAMETER_STRUCT()
 };
@@ -705,10 +705,10 @@ void MeshLightTree::Build(FRDGBuilder& GraphBuilder,
 	int TriLightCount,
 	const FVector3f& SceneLightBoundMin,
 	const FVector3f& SceneLightBoundMax,
-	FShaderResourceViewRHIRef MeshLightIndexBuffer,
-	FShaderResourceViewRHIRef MeshLightVertexBuffer,
-	FShaderResourceViewRHIRef MeshLightInstanceBuffer,
-	FShaderResourceViewRHIRef MeshLightInstancePrimitiveBuffer)
+	FRDGBufferRef MeshLightIndexBuffer,
+	FRDGBufferRef MeshLightVertexBuffer,
+	FRDGBufferRef MeshLightInstanceBuffer,
+	FRDGBufferRef MeshLightInstancePrimitiveBuffer)
 {
 	RDG_GPU_STAT_SCOPE(GraphBuilder, MeshLightTreeBuild);
 	RDG_EVENT_SCOPE(GraphBuilder, "Build Mesh Ligh Tree");
@@ -796,10 +796,10 @@ void MeshLightTree::Sort(FRDGBuilder& GraphBuilder,
 }
 
 void MeshLightTree::GenerateLeafNodes(FRDGBuilder& GraphBuilder, 
-	FShaderResourceViewRHIRef MeshLightIndexBuffer,
-	FShaderResourceViewRHIRef MeshLightVertexBuffer,
-	FShaderResourceViewRHIRef MeshLightInstanceBuffer,
-	FShaderResourceViewRHIRef MeshLightInstancePrimitiveBuffer)
+	FRDGBufferRef MeshLightIndexBuffer,
+	FRDGBufferRef MeshLightVertexBuffer,
+	FRDGBufferRef MeshLightInstanceBuffer,
+	FRDGBufferRef MeshLightInstancePrimitiveBuffer)
 {
 	RDG_GPU_STAT_SCOPE(GraphBuilder, MeshLightTreeGenerateLeafeNodes);
 	RDG_EVENT_SCOPE(GraphBuilder, "MeshLightGenerateLeafNodes");
@@ -807,10 +807,10 @@ void MeshLightTree::GenerateLeafNodes(FRDGBuilder& GraphBuilder,
 	FGenerateLevelMeshLightLeafNodesCS::FParameters* PassParameters = GraphBuilder.AllocParameters<FGenerateLevelMeshLightLeafNodesCS::FParameters>();
 	PassParameters->NumTriangleLights = NumTriLights;
 	PassParameters->LeafNodes = GraphBuilder.CreateUAV(LeafNodesBuffer);
-	PassParameters->MeshLightIndexBuffer = MeshLightIndexBuffer;
-	PassParameters->MeshLightVertexBuffer = MeshLightVertexBuffer;
-	PassParameters->MeshLightInstanceBuffer = MeshLightInstanceBuffer;
-	PassParameters->MeshLightInstancePrimitiveBuffer = MeshLightInstancePrimitiveBuffer;
+	PassParameters->MeshLightIndexBuffer = GraphBuilder.CreateSRV(MeshLightIndexBuffer);
+	PassParameters->MeshLightVertexBuffer = GraphBuilder.CreateSRV(MeshLightVertexBuffer);
+	PassParameters->MeshLightInstanceBuffer = GraphBuilder.CreateSRV(MeshLightInstanceBuffer);
+	PassParameters->MeshLightInstancePrimitiveBuffer =  GraphBuilder.CreateSRV(MeshLightInstancePrimitiveBuffer);
 	FComputeShaderUtils::AddPass(
 		GraphBuilder,
 		RDG_EVENT_NAME("MeshLightGenerateLeafNodes"),
