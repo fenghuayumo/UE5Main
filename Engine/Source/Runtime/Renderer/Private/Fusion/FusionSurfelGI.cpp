@@ -31,13 +31,13 @@ static FAutoConsoleVariableRef CVarSurfelGISamplesPerPixel(
 	ECVF_RenderThreadSafe
 );
 
-static TAutoConsoleVariable<int32> CVarSurfelGIUseSurfel(
+ TAutoConsoleVariable<int32> CVarSurfelGIUseSurfel(
 	TEXT("r.Fusion.SurfelGI.UseSurfel"),
 	1,
 	TEXT("Whether to Use Surfel"),
 	ECVF_RenderThreadSafe);
 
-static TAutoConsoleVariable<int32> CVarFusionSurfelAccumulateEmissive(
+ TAutoConsoleVariable<int32> CVarFusionSurfelAccumulateEmissive(
   	TEXT("r.Fusion.SurfelGI.AccumulateEmissive"),
 	1,
 	TEXT("Whether to Use AccumulateEmissive"),
@@ -54,8 +54,8 @@ DECLARE_GPU_STAT_NAMED(SurfelInclusivePrefixScan, TEXT("Surfel GI: InclusivePref
 
 struct FSurfelVertexPacked
 {
-	FVector4   data0;
-	FVector4   data1;
+	FVector4f   data0;
+	FVector4f   data1;
 };
 
 class FAllocateSurfelCS : public FGlobalShader
@@ -416,17 +416,21 @@ void FDeferredShadingSceneRenderer::FusionAllocateSurfels(FRDGBuilder& GraphBuil
 	else
 	{
 		SurfelMetaBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(uint32) * 3), TEXT("SurfelMetaBuf"), ERDGBufferFlags::MultiFrame);
-		SurfelGridMetaBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(FVector4) * MAX_SURFEL_CELLS), TEXT("SurfelGridMetaBuf"), ERDGBufferFlags::MultiFrame);
+		SurfelGridMetaBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(FVector4f) * MAX_SURFEL_CELLS), TEXT("SurfelGridMetaBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelPoolBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(uint32) * MAX_SURFELS), TEXT("SurfelPoolBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelLifeBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(uint32) * MAX_SURFELS), TEXT("SurfelLifeBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelEntryCellBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateByteAddressDesc(sizeof(uint32) * MAX_SURFELS * MAX_SURFELS_PER_CELL), TEXT("SurfelEntryCellBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelVertexBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FSurfelVertexPacked), MAX_SURFELS), TEXT("SurfelVertexBuf"), ERDGBufferFlags::MultiFrame);
 
-		SurfelIrradianceBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4), MAX_SURFELS), TEXT("SurfelIrradianceBuf"), ERDGBufferFlags::MultiFrame);
+		SurfelIrradianceBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f), MAX_SURFELS), TEXT("SurfelIrradianceBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelRePositionBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FSurfelVertexPacked), MAX_SURFELS), TEXT("SurfelRePositionBuf"), ERDGBufferFlags::MultiFrame);
 		SurfelRePositionCountBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) , MAX_SURFELS), TEXT("SurfelRePositionCountBuf"), ERDGBufferFlags::MultiFrame);
-		SurfelAuxiBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4) * 2 , MAX_SURFELS), TEXT("SurfelAuxiBuf"), ERDGBufferFlags::MultiFrame);
+		SurfelAuxiBuf = GraphBuilder.CreateBuffer(FRDGBufferDesc::CreateStructuredDesc(sizeof(FVector4f) * 2 , MAX_SURFELS), TEXT("SurfelAuxiBuf"), ERDGBufferFlags::MultiFrame);
 
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelAuxiBuf), 0);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelIrradianceBuf), 0);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelVertexBuf), 0);
+		
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelMetaBuf), 0);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelGridMetaBuf), 0);
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SurfelPoolBuf), 0);
@@ -635,7 +639,7 @@ bool FDeferredShadingSceneRenderer::FusionSurfelTrace(FRDGBuilder& GraphBuilder,
 				RDG_EVENT_NAME("GlobalIlluminationRayTracing %dx%d", RayTracingResolution.X, RayTracingResolution.Y),
 				PassParameters,
 				ERDGPassFlags::Compute,
-				[PassParameters, this, &View, RayGenerationShader, RayTracingResolution](FRHICommandList& RHICmdList)
+				[PassParameters, this, &View, RayGenerationShader, RayTracingResolution](FRHIRayTracingCommandList& RHICmdList)
 				{
 					FRHIRayTracingScene* RayTracingSceneRHI = View.GetRayTracingSceneChecked();
 

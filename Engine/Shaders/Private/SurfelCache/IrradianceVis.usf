@@ -1,0 +1,153 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "../PositionReconstructionCommon.ush" 
+
+#define VISUALIZE_ENTRIES 1
+#define VISUALIZE_CASCADES 0
+#define USE_GEOMETRIC_NORMALS 1
+#define USE_DEBUG_OUT 1
+
+Texture2D<float4>   NormalTexture;
+Texture2D<float>    DepthTexture;
+SamplerState        PointClampSampler;
+SamplerState        LinearClampSampler;
+
+
+#include "HashUtils.ush"
+#include "PackUtils.ush"
+#include "SurfelConstant.ush"
+RWByteAddressBuffer SurfelMetaBuf;
+RWByteAddressBuffer SurfelGridMetaBuf;
+RWStructuredBuffer<uint> SurfelEntryCellBuf;
+StructuredBuffer<SurfelVertexPacked> SurfelVertexBuf;
+StructuredBuffer<float4> SurfelIrradianceBuf;
+RWTexture2D<float4> RWDebugOutTex;
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<uint> SurfelLifeBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelRePositionBuf;
+RWStructuredBuffer<uint> SurfelRePositionCountBuf;
+float4 TexBufferSize;
+
+#define IRCACHE_LOOKUP_DONT_KEEP_ALIVE
+
+#include "SurfelLookup.ush"
+
+groupshared uint gs_px_min_score_loc_packed;
+groupshared uint gs_px_max_score_loc_packed;
+
+float3 tricolor_ramp(float3 a, float3 b, float3 c, float x) {
+    x = saturate(x);
+
+    #if 0
+        float x2 = x * x;
+        float x3 = x * x * x;
+        float x4 = x2 * x2;
+
+        float cw = 3*x2 - 2*x3;
+        float aw = 1 - cw;
+        float bw = 16*x4 - 32*x3 + 16*x2;
+        float ws = aw + bw + cw;
+        aw /= ws;
+        bw /= ws;
+        cw /= ws;
+    #else
+        const float lobe = pow(smoothstep(1, 0, 2 * abs(x - 0.5)), 2.5254);
+        float aw = x < 0.5 ? 1 - lobe : 0;
+        float bw = lobe;
+        float cw = x > 0.5 ? 1 - lobe : 0;
+    #endif
+
+    return aw * a + bw * b + cw * c;
+}
+
+float3 cost_color_map(float x) {
+    return tricolor_ramp(
+        float3(0.05, 0.2, 1),
+        float3(0.02, 1, 0.2),
+        float3(1, 0.01, 0.1),
+        x
+    );
+}
+
+uint pack_score_and_px_within_group(float score, uint2 px_within_group) {
+    return (asuint(score) & (0xffffffffu - 63)) | (px_within_group.y * 8 + px_within_group.x);
+}
+
+[numthreads(8, 8, 1)]
+void VisIrradianceCS(
+    uint2 px: SV_DispatchThreadID,
+    uint idx_within_group: SV_GroupIndex,
+    uint2 group_id: SV_GroupID,
+    uint2 px_within_group: SV_GroupThreadID
+) {
+               
+    // if (USE_DEBUG_OUT && px.y < 50) {
+    //     const uint entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+    //     const uint entry_alloc_count = SurfelMetaBuf.Load(IRCACHE_META_ALLOC_COUNT);
+        
+    //     const float u = float(px.x + 0.5) * TexBufferSize.z;
+
+    //     if (px.y < 25) {
+    //         if (entry_alloc_count > u * 256 * 1024) {
+    //             RWDebugOutTex[px] = float4(0.05, 1, .2, 1);
+    //             return;
+    //         }
+    //     } else {
+    //         if (entry_count > u * 256 * 1024) {
+    //             RWDebugOutTex[px] = float4(1, 0.1, 0.05, 1);
+    //             return;
+    //         }
+    //     }
+    // }
+
+    // GroupMemoryBarrierWithGroupSync();
+
+    uint rng = hash_combine2(hash_combine2(px.x, hash1(px.y)), View.StateFrameIndex);
+    const float2 BufferUV = (px + 0.5) /  TexBufferSize.xy;
+
+    #if USE_DEBUG_OUT
+        RWDebugOutTex[px] = 0.0.xxxx;
+    #endif
+
+    float DeviceZ = DepthTexture.SampleLevel(PointClampSampler, BufferUV, 0).r;
+    const bool bIsValidPixel = DeviceZ > 1e-3 && DeviceZ < 0.999;
+    if ( !bIsValidPixel) return;
+
+    float SceneDepth = ConvertFromDeviceZ(DeviceZ);
+	float3 WorldPosition = ReconstructTranslatedWorldPositionFromDepth(BufferUV, SceneDepth) - LWCHackToFloat(PrimaryView.PreViewTranslation);
+    float3 WorldNormal = normalize(DecodeNormal(NormalTexture.SampleLevel(LinearClampSampler, BufferUV, 0).xyz));
+
+    const float3 EyePos = View.TranslatedWorldCameraOrigin - LWCHackToFloat(PrimaryView.PreViewTranslation);
+    // float3 debug_color = lookup_irradiance_cache(EyePos, WorldPosition, WorldNormal, 0, rng);
+
+    // #if USE_DEBUG_OUT
+    //     RWDebugOutTex[px] = float4(debug_color, 1);
+    // #endif
+    float3 debug_color = 0.0;
+    // debug_color += lookup_irradiance_cache(EyePos, WorldPosition.xyz, WorldNormal, 0, rng);
+    // debug_color *= View.PreExposure;
+    if (px.y < 50) {
+        const uint entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+        const uint entry_alloc_count = SurfelMetaBuf.Load(IRCACHE_META_ALLOC_COUNT);
+        
+        const float u = float(px.x + 0.5) * TexBufferSize.z;
+
+        const uint MAX_ENTRY_COUNT = 64 * 1024;
+        
+        if (px.y < 25) {
+            if (entry_alloc_count > u * MAX_ENTRY_COUNT) {
+                debug_color = float3(0.05, 1, .2) * 4;
+            }
+        } else {
+            if (entry_count > u * MAX_ENTRY_COUNT) {
+                debug_color = float3(1, 0.1, 0.05) * 4;
+            }
+        }
+
+        // Ticks every 16k
+        if (frac(u * 16) < TexBufferSize.z * 32) {
+            debug_color = float3(1, 1, 0) * 10;
+        }
+    }
+    RWDebugOutTex[px] = float4(debug_color, 1);
+}

@@ -1466,6 +1466,7 @@ bool FDeferredShadingSceneRenderer::SetupRayTracingPipelineStates(FRHICommandLis
 					PrepareRayTracingTranslucency(View, RayGenShaders);
 
 					// PrepareRayTracingSampledDirectLighting(View, RayGenShaders);
+					PrepareFusionSurfelIrradiance(View, RayGenShaders);
 					PrepareFusionRestirGI(View, RayGenShaders);
 					PrepareFusionSurfelGI(View, RayGenShaders);
 					// PrepareFusionWRCGI(View, RayGenShaders);

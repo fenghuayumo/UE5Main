@@ -1,0 +1,108 @@
+#ifndef _PACK_UTILS_USH_
+#define _PACK_UTILS_USH_
+float unpack_unorm(uint pckd, uint bitCount) {
+	uint maxVal = (1u << bitCount) - 1;
+	return float(pckd & maxVal) / maxVal;
+}
+
+uint pack_unorm(float val, uint bitCount) {
+	uint maxVal = (1u << bitCount) - 1;
+	return uint(clamp(val, 0.0, 1.0) * maxVal);
+}
+
+float pack_normal_11_10_11(float3 n) {
+	uint pckd = 0;
+	pckd += pack_unorm(n.x * 0.5 + 0.5, 11);
+	pckd += pack_unorm(n.y * 0.5 + 0.5, 10) << 11;
+	pckd += pack_unorm(n.z * 0.5 + 0.5, 11) << 21;
+	return asfloat(pckd);
+}
+
+float3 unpack_normal_11_10_11(float pckd) {
+	uint p = asuint(pckd);
+	return normalize(float3(
+		unpack_unorm(p, 11),
+		unpack_unorm(p >> 11, 10),
+		unpack_unorm(p >> 21, 11)
+	) * 2.0 - 1.0);
+}
+
+float3 unpack_normal_11_10_11_no_normalize(float pckd) {
+	uint p = asuint(pckd);
+	return float3(
+		unpack_unorm(p, 11),
+		unpack_unorm(p >> 11, 10),
+		unpack_unorm(p >> 21, 11)
+	) * 2.0 - 1.0;
+}
+
+float3 unpack_normal_11_10_11_uint_no_normalize(uint p) {
+	return float3(
+		unpack_unorm(p, 11),
+		unpack_unorm(p >> 11, 10),
+		unpack_unorm(p >> 21, 11)
+	) * 2.0 - 1.0;
+}
+
+uint pack_color_888(float3 color) {
+    color = sqrt(color);
+	uint pckd = 0;
+	pckd += pack_unorm(color.x, 8);
+	pckd += pack_unorm(color.y, 8) << 8;
+	pckd += pack_unorm(color.z, 8) << 16;
+    return pckd;
+}
+
+float3 unpack_color_888(uint p) {
+	float3 color = float3(
+		unpack_unorm(p, 8),
+		unpack_unorm(p >> 8, 8),
+		unpack_unorm(p >> 16, 8)
+	);
+    return color * color;
+}
+
+float2 octa_wrap( float2 v ) {
+    return (1.0 - abs(v.yx)) * (step(0.0.xx, v.xy) * 2.0 - 1.0);
+}
+ 
+float2 octa_encode(float3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.z < 0.0) {
+        n.xy = octa_wrap(n.xy);
+    }
+    n.xy = n.xy * 0.5 + 0.5;
+    return n.xy;
+}
+
+float3 octa_decode(float2 f) {
+    f = f * 2.0 - 1.0;
+ 
+    // https://twitter.com/Stubbesaurus/status/937994790553227264
+    float3 n = float3( f.x, f.y, 1.0 - abs( f.x ) - abs( f.y ) );
+    float t = clamp(-n.z, 0.0, 1.0);
+    //n.xy += n.xy >= 0.0 ? -t : t;
+    n.xy -= (step(0.0, n.xy) * 2 - 1) * t;
+    return normalize(n);
+}
+
+uint pack_2x16f_uint(float2 f) {
+    return f32tof16(f.x) | (f32tof16(f.y) << 16u);
+}
+
+float2 unpack_2x16f_uint(uint u) {
+    return float2(
+    	f16tof32(u & 0xffff),
+    	f16tof32((u >> 16) & 0xffff)
+    );
+}
+
+float3 unpack_unit_direction_11_10_11(uint pck) {
+    return float3(
+        float(pck & ((1u << 11u)-1u)) * (2.0f / float((1u << 11u)-1u)) - 1.0f,
+        float((pck >> 11u) & ((1u << 10u)-1u)) * (2.0f / float((1u << 10u)-1u)) - 1.0f,
+        float((pck >> 21u)) * (2.0f / float((1u << 11u)-1u)) - 1.0f
+    );
+}
+
+#endif

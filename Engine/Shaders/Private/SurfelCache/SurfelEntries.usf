@@ -1,0 +1,164 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "../PositionReconstructionCommon.ush" 
+#include "HashUtils.ush"
+#include "PackUtils.ush"
+#include "SurfelConstant.ush"
+#ifdef AGE_ENTRIES
+
+RWByteAddressBuffer SurfelMetaBuf;
+RWByteAddressBuffer SurfelGridMetaBuf;
+RWStructuredBuffer<uint> SurfelEntryCellBuf;
+RWStructuredBuffer<uint> SurfelLifeBuf;
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelVertexBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelRePositionBuf;
+RWStructuredBuffer<uint> SurfelRePositionCountBuf;
+RWStructuredBuffer<float4> SurfelIrradianceBuf;
+RWStructuredBuffer<uint> SurfelEntryOccupancyBuf;
+
+void AgeIrcacheEntry(uint entry_idx) 
+{
+    const uint prev_age = SurfelLifeBuf[entry_idx];
+    const uint new_age = prev_age + 1;
+
+    if (is_ircache_entry_life_valid(new_age)) {
+        SurfelLifeBuf[entry_idx] = new_age;
+
+        // TODO: just `Store` it (AMD doesn't like it unless it's a byte address buffer)
+        const uint cell_idx = SurfelEntryCellBuf[entry_idx];
+        SurfelGridMetaBuf.InterlockedAnd(
+            sizeof(uint2) * cell_idx + sizeof(uint),
+            ~IRCACHE_ENTRY_META_JUST_ALLOCATED);
+    } else {
+        SurfelLifeBuf[entry_idx] = IRCACHE_ENTRY_LIFE_RECYCLED;
+        // onoz, we killed it!
+        // deallocate.
+
+        for (uint i = 0; i < IRCACHE_IRRADIANCE_STRIDE; ++i) {
+            SurfelIrradianceBuf[entry_idx * IRCACHE_IRRADIANCE_STRIDE + i] = 0.0.xxxx;
+        }
+
+        uint entry_alloc_count = 0;
+        SurfelMetaBuf.InterlockedAdd(IRCACHE_META_ALLOC_COUNT, -1, entry_alloc_count);
+        SurfelPoolBuf[entry_alloc_count - 1] = entry_idx;
+
+        // TODO: just `Store` it (AMD doesn't like it unless it's a byte address buffer)
+        const uint cell_idx = SurfelEntryCellBuf[entry_idx];
+        SurfelGridMetaBuf.InterlockedAnd(
+            sizeof(uint2) * cell_idx + sizeof(uint),
+            ~(IRCACHE_ENTRY_META_OCCUPIED | IRCACHE_ENTRY_META_JUST_ALLOCATED));
+    }
+}
+
+bool ircache_entry_life_needs_aging(uint life) {
+    return life != IRCACHE_ENTRY_LIFE_RECYCLED;
+}
+
+[numthreads(64, 1, 1)]
+void AgeEntriesCS(uint entry_idx: SV_DispatchThreadID) 
+{
+    const uint total_entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+
+    if (!IRCACHE_FREEZE) 
+    {
+        if (entry_idx < total_entry_count) 
+        {
+            const uint life = SurfelLifeBuf[entry_idx];
+
+            if (ircache_entry_life_needs_aging(life)) 
+                AgeIrcacheEntry(entry_idx);
+
+            #if IRCACHE_USE_POSITION_VOTING
+                {
+
+                    // Flush the reposition proposal
+                    SurfelVertexPacked proposal = SurfelRePositionBuf[entry_idx];
+                    SurfelVertexBuf[entry_idx] = proposal;
+                }
+            #endif
+
+            SurfelRePositionCountBuf[entry_idx] = 0;
+        } 
+        else 
+        {
+            SurfelVertexPacked invalid;
+            invalid.data0 = asfloat(0);
+            //invalid.data1 = asfloat(0);
+            SurfelVertexBuf[entry_idx] = invalid;
+        }
+    }
+
+    const uint life = SurfelLifeBuf[entry_idx];
+    uint valid = entry_idx < total_entry_count && is_ircache_entry_life_valid(life);
+    SurfelEntryOccupancyBuf[entry_idx] = valid;
+}
+
+#endif
+
+#if COMPACT_ENTRIES
+
+RWByteAddressBuffer SurfelMetaBuf;
+RWStructuredBuffer<uint> SurfelLifeBuf;
+StructuredBuffer<uint> SurfelEntryOccupancyBuf;
+RWStructuredBuffer<uint> SurfelEntryIndirectionBuf;
+
+[numthreads(64, 1, 1)]
+void CompactEntriesCS(uint entry_idx: SV_DispatchThreadID) 
+{
+    const uint total_entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+
+    const uint life = SurfelLifeBuf[entry_idx];
+    if (entry_idx < total_entry_count && is_ircache_entry_life_valid(life)) 
+        SurfelEntryIndirectionBuf[SurfelEntryOccupancyBuf[entry_idx]] = entry_idx;
+}
+
+#endif
+
+#if CLEAR_ENTRIES
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<uint> SurfelLifeBuf;
+[numthreads(64, 1, 1)]
+void ClearEntriesPoolCS(uint idx: SV_DispatchThreadID) 
+{
+    SurfelPoolBuf[idx] = idx;
+    SurfelLifeBuf[idx] = IRCACHE_ENTRY_LIFE_RECYCLED;
+}
+
+#endif
+
+#ifdef RESET_ENTRIES
+
+#include "SphereHarmonic.ush"
+#include "SurfelConstant.ush"
+
+StructuredBuffer<uint> SurfelLifeBuf;
+ByteAddressBuffer SurfelMetaBuf;
+StructuredBuffer<float4> SurfelIrradianceBuf;
+RWStructuredBuffer<float4> SurfelAuxiBuf;
+StructuredBuffer<uint> SurfelEntryIndirectionBuf;
+
+[numthreads(64, 1, 1)]
+void ResetEntriesCS(uint dispatch_idx: SV_DispatchThreadID) {
+    if (IRCACHE_FREEZE) {
+        return;
+    }
+
+    const uint total_alloc_count = SurfelMetaBuf.Load(IRCACHE_META_TRACING_ALLOC_COUNT);
+    if (dispatch_idx >= total_alloc_count) {
+        return;
+    }
+
+    const uint entry_idx = SurfelEntryIndirectionBuf[dispatch_idx];
+
+    const bool should_reset = all(0.0 == SurfelIrradianceBuf[entry_idx * IRCACHE_IRRADIANCE_STRIDE]);
+
+    if (should_reset) {
+        for (uint i = 0; i < IRCACHE_AUX_STRIDE; ++i) {
+            SurfelAuxiBuf[entry_idx * IRCACHE_AUX_STRIDE + i] = 0.0.xxxx;
+        }
+    }
+}
+
+
+#endif

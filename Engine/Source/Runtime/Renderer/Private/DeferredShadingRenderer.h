@@ -174,10 +174,26 @@ public:
 };
 
 
+// struct FSurfelBufResources
+// {
+// 	FRDGBufferRef SurfelMetaBuf;
+// 	FRDGBufferRef SurfelGridMetaBuf;
+// 	FRDGBufferRef SurfelEntryCellBuf;
+// 	FRDGBufferRef SurfelPoolBuf;
+// 	FRDGBufferRef SurfelLifeBuf;
+// 	FRDGBufferRef SurfelVertexBuf;
+// 	FRDGBufferRef SurfelIrradianceBuf;
+// 	FRDGBufferRef SurfelRePositionBuf;
+// 	FRDGBufferRef SurfelRePositionCountBuf;
+
+// 	FRDGBufferRef SurfelAuxiBuf;
+// };
+#define IRCACHE_CASCADE_COUNT 12
 struct FSurfelBufResources
 {
 	FRDGBufferRef SurfelMetaBuf;
 	FRDGBufferRef SurfelGridMetaBuf;
+	FRDGBufferRef SurfelGridMetaBuf2;
 	FRDGBufferRef SurfelEntryCellBuf;
 	FRDGBufferRef SurfelPoolBuf;
 	FRDGBufferRef SurfelLifeBuf;
@@ -185,7 +201,7 @@ struct FSurfelBufResources
 	FRDGBufferRef SurfelIrradianceBuf;
 	FRDGBufferRef SurfelRePositionBuf;
 	FRDGBufferRef SurfelRePositionCountBuf;
-
+	FRDGBufferRef SurfelEntryIndirectionBuf;
 	FRDGBufferRef SurfelAuxiBuf;
 };
 
@@ -1046,6 +1062,14 @@ private:
 		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
 		FSurfelBufResources& SurfelResource);
 
+	void RenderFusionIrradianceCache(FRDGBuilder& GraphBuilder,
+		FSceneTextureParameters& SceneTextures,
+		FViewInfo& View,
+		const IScreenSpaceDenoiser::FAmbientOcclusionRayTracingConfig& RayTracingConfig,
+		int32 UpscaleFactor,
+		IScreenSpaceDenoiser::FDiffuseIndirectInputs* OutDenoiserInputs,
+		FSurfelBufResources& SurfelResource);
+
 	void RenderFusionSkyLight(
 		FRDGBuilder& GraphBuilder,
 		FRDGTextureRef SceneColorTexture,
@@ -1123,6 +1147,7 @@ private:
 	void SetupLumenHardwareRayTracingHitGroupBuffer(FViewInfo& View);
 
 	//
+	static void PrepareFusionSurfelIrradiance(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionRestirGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionSurfelGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);
 	static void PrepareFusionWRCGI(const FViewInfo& View, TArray<FRHIRayTracingShader*>& OutRayGenShaders);

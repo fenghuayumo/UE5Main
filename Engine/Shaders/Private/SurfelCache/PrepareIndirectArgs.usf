@@ -1,0 +1,52 @@
+#include "/Engine/Public/Platform.ush"
+#include "HashUtils.ush"
+#include "PackUtils.ush"
+RWByteAddressBuffer SurfelMetaBuf;
+RWByteAddressBuffer RWDispatchArgs;
+
+#include "SurfelConstant.ush"
+[numthreads(1, 1, 1)]
+void PrepareAgeArgsCS() {
+    // Aging ags
+    {
+        const uint entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+
+        static const uint threads_per_group = 64;
+        static const uint entries_per_thread = 1;
+        static const uint divisor = threads_per_group * entries_per_thread;
+
+        RWDispatchArgs.Store3(0 * sizeof(uint3), uint3((entry_count + divisor - 1) / divisor, 1, 1));
+    }
+}
+
+[numthreads(1, 1, 1)]
+void PrepareTraceArgsCS() {
+    const uint entry_count = SurfelMetaBuf.Load(IRCACHE_META_ENTRY_COUNT);
+    const uint alloc_count = SurfelMetaBuf.Load(IRCACHE_META_ALLOC_COUNT);
+
+    SurfelMetaBuf.Store(IRCACHE_META_TRACING_ALLOC_COUNT, alloc_count);
+
+    // Reset, sum up irradiance
+    RWDispatchArgs.Store3(12 * 2, uint3((alloc_count + 63) / 64, 1, 1));
+
+    uint main_rt_samples = alloc_count * IRCACHE_SAMPLES_PER_FRAME;
+    uint accessibility_rt_samples = alloc_count * IRCACHE_OCTA_DIMS2;
+    uint validity_rt_samples = alloc_count * IRCACHE_VALIDATION_SAMPLES_PER_FRAME;
+
+
+    const uint max_rt_samples =
+        max(main_rt_samples, max(accessibility_rt_samples, validity_rt_samples));
+
+    main_rt_samples = max_rt_samples;
+    accessibility_rt_samples = max_rt_samples;
+    validity_rt_samples = max_rt_samples;
+
+    // Main ray tracing
+    RWDispatchArgs.Store3(12 * 0, uint3(main_rt_samples, 1, 1));
+
+    // Accessibility tracing
+    RWDispatchArgs.Store3(12 * 1, uint3(accessibility_rt_samples, 1, 1));
+
+    // Validity check
+    RWDispatchArgs.Store3(12 * 3, uint3(validity_rt_samples, 1, 1));
+}

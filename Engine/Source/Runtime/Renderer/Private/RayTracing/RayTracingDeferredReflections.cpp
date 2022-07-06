@@ -27,8 +27,9 @@
 #include "GlobalShader.h"
 #include "DeferredShadingRenderer.h"
 #include "SceneTextureParameters.h"
+#include "RayTracing/RayTracingSkyLight.h"
 #include "ReflectionEnvironment.h"
-
+#include "PathTracing.h"
 #if RHI_RAYTRACING
 
 static TAutoConsoleVariable<int32> CVarRayTracingReflectionsGenerateRaysWithRGS(
@@ -269,6 +270,9 @@ class FRayTracingDeferredReflectionsRGS : public FGlobalShader
 		SHADER_PARAMETER_STRUCT_REF(FRaytracingLightDataPacked, LightDataPacked)
 		SHADER_PARAMETER_STRUCT_REF(FReflectionCaptureShaderData, ReflectionCapture)
 		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FForwardLightData, Forward)
+		SHADER_PARAMETER_STRUCT_REF(FSkyLightData, SkyLightData)
+		SHADER_PARAMETER_STRUCT_INCLUDE(FPathTracingSkylight, SkylightParameters)
+
 	END_SHADER_PARAMETER_STRUCT()
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
@@ -542,6 +546,10 @@ void FDeferredShadingSceneRenderer::RenderRayTracingDeferredReflections(
 	CommonParameters.ReflectionCapture       = View.ReflectionCaptureUniformBuffer;
 	CommonParameters.Forward                 = View.ForwardLightingResources.ForwardLightUniformBuffer;
 	CommonParameters.ReflectionMaxNormalBias = GetRaytracingMaxNormalBias();
+	// Fill Sky Light parameters
+	FSkyLightData SkyLightData;
+	SetupSkyLightParameters(GraphBuilder, Scene, View, true, &CommonParameters.SkylightParameters, &SkyLightData);
+	CommonParameters.SkyLightData = CreateUniformBufferImmediate(SkyLightData, EUniformBufferUsage::UniformBuffer_SingleDraw);
 
 	if (!CommonParameters.SceneTextures.GBufferVelocityTexture)
 	{

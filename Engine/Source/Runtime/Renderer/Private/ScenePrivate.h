@@ -746,6 +746,8 @@ public:
 	TRefCountPtr<FRDGPooledBuffer> SurfelRePositionBuf;
 	TRefCountPtr<FRDGPooledBuffer> SurfelRePositionCountBuf;
 	TRefCountPtr<FRDGPooledBuffer> SurfelAuxiBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelIndirectionBuf;
+	TRefCountPtr<FRDGPooledBuffer> SurfelGridMetaBuf2;
 #endif
 
 	// A counter incremented once each time this view is rendered.
@@ -3026,6 +3028,12 @@ public:
 
 	FSpanAllocator PersistentPrimitiveIdAllocator;
 
+	//surfel related flag
+	uint32 	SurfelParity = 0;
+	bool 	SurfelInitialized = false;
+	FVector3f 	  SurfelGridCenter;
+	FIntVector3   SurfelCurScroll[12];
+	FIntVector3   SurfelPrevScroll[12];
 #if WITH_EDITOR
 	/** Editor Pixel inspector */
 	FPixelInspectorData PixelInspectorData;

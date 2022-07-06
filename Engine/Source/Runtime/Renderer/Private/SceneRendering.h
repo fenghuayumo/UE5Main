@@ -1507,7 +1507,6 @@ public:
 	FRDGTextureRef ProjectedRestirGITexture = nullptr;
 	FRDGTextureRef	ProjectionMapTexture = nullptr;
 	FRDGTextureRef	ScreenSpaceAO = nullptr;
-
 	int32 NumBoxReflectionCaptures;
 	int32 NumSphereReflectionCaptures;
 	float FurthestReflectionCaptureDistance;

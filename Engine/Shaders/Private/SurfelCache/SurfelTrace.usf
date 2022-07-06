@@ -1,0 +1,694 @@
+
+
+#define USE_IES_TERM 0 // this shader doesn't bind the IES atlas, so disable the IES term from path tracer lights
+#include "../Common.ush"
+
+#include "../RectLight.ush"
+//#include "../MonteCarlo.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../ShadingModels.ush"
+#include "../SceneTextureParameters.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "../RayTracing/RayTracingHitGroupCommon.ush"
+
+// #define LIGHT_GRID 1
+// #define LIGHT_TREE 2
+// #define LIGHT_CUT  3
+// #define LIGHT_UNIFROM 4
+
+// // #define LIGHT_SAMPLING_TYPE 2
+
+// #ifndef LIGHT_SAMPLING_TYPE
+// #define LIGHT_SAMPLING_TYPE 1
+// #endif
+
+// #if LIGHT_SAMPLING_TYPE == LIGHT_UNIFROM
+// #define UNIFORM_LIGHT_SELECTION
+// #endif
+// #if LIGHT_SAMPLING_TYPE == LIGHT_GRID
+// #define USE_PATH_TRACING_LIGHT_GRID 1
+// #else
+// #define USE_PATH_TRACING_LIGHT_GRID 0
+// #endif
+
+#include "../PathTracing/Material/PathTracingMaterialSampling.ush"
+#include "../PathTracing/Utilities/PathTracingRandomSequence.ush"
+#include "../PathTracing/Light/PathTracingLightGrid.ush"
+// #if LIGHT_SAMPLING_TYPE > LIGHT_GRID
+// #define MESH_LIGHT_SAMPLING     1
+// #include "../LightCut/LightTreeSampling.ush"
+// #endif
+
+#include "../PathTracing/Light/PathTracingLightSampling.ush"
+
+RaytracingAccelerationStructure TLAS;
+
+uint SamplesPerPixel;
+uint MaxBounces;
+uint UpscaleFactor;
+float MaxRayDistanceForGI;
+float MaxRayDistanceForAO;
+float MaxShadowDistance;
+float NextEventEstimationSamples;
+float DiffuseThreshold;
+uint EvalSkyLight;
+uint UseRussianRoulette;
+uint UseFireflySuppression;
+float MaxNormalBias;
+uint RenderTileOffsetX;
+uint RenderTileOffsetY;
+uint AccumulateEmissive;
+#include "PackUtils.ush"
+#include "HashUtils.ush"
+#include "SurfelConstant.ush"
+#include "Reservoir.ush"
+
+StructuredBuffer<SurfelVertexPacked> SurfelVertexBuf;
+
+RWByteAddressBuffer SurfelGridMetaBuf;
+RWByteAddressBuffer SurfelLifeBuf;
+RWStructuredBuffer<SurfelVertexPacked> SurfelRePositionBuf;
+RWStructuredBuffer<uint> SurfelRePositionCountBuf;
+
+RWByteAddressBuffer SurfelMetaBuf;
+RWStructuredBuffer<float4> SurfelAuxiBuf;
+RWStructuredBuffer<uint> SurfelPoolBuf;
+RWStructuredBuffer<uint> SurfelEntryCellBuf;
+StructuredBuffer<uint> SurfelEntryIndirectionBuf;
+
+#define IRCACHE_LOOKUP_PRECISE
+#include "SurfelLookup.ush"
+
+#include "SurfelSampler.ush"
+
+#define USE_SELF_LIGHTING_LIMITER 1
+
+RAY_TRACING_ENTRY_RAYGEN(SurfelTraceRGS) 
+{
+    if (IRCACHE_FREEZE) 
+        return;
+
+    const uint dispatch_idx = DispatchRaysIndex().x;
+
+    const uint alloc_count = SurfelMetaBuf.Load(IRCACHE_META_TRACING_ALLOC_COUNT);
+    if (dispatch_idx >= alloc_count * IRCACHE_SAMPLES_PER_FRAME) 
+        return;
+
+    const uint entry_idx = SurfelEntryIndirectionBuf[dispatch_idx / IRCACHE_SAMPLES_PER_FRAME];
+    const uint sample_idx = dispatch_idx % IRCACHE_SAMPLES_PER_FRAME;
+    const uint life = SurfelLifeBuf.Load(entry_idx * 4);
+    const uint rank = ircache_entry_life_to_rank(life);
+
+    SurfelVertexPacked packed_entry = SurfelVertexBuf[entry_idx];
+    const SurfelVertex entry = UnPackVertex(packed_entry);
+
+    // Allocate fewer samples for further bounces
+    const uint sample_count_divisor = 1;
+
+    
+    uint rng = hash1(hash1(entry_idx) + View.StateFrameIndex);
+
+    const SampleParams sample_params = SampleParams::from_spf_entry_sample_frame(
+        IRCACHE_SAMPLES_PER_FRAME,
+        entry_idx,
+        sample_idx,
+        View.StateFrameIndex);
+
+    // IrcacheTraceResult traced = ircache_trace(entry, brdf, sample_params, life);
+        uint2 PixelCoord = uint2(entry_idx % 2048, entry_idx / 2048 ); //not useful?
+        uint rng_sample = sample_params.rng();
+		// RandomSequence RandSequence;
+		// RandomSequence_Initialize(RandSequence, PixelCoord, SampleIndex, View.StateFrameIndex, SamplesPerPixel);
+
+		float3 RayThroughput = 1.0;
+        float3 Irradiance = 0.0;
+		// float3 RandSample = RandomSequence_GenerateSample3D(RandSequence);
+		
+		// if (UseRussianRoulette)
+		// {
+		// 	float RRSample = RandSample.x;
+		// 	float ProbabilityOfSuccess = Luminance(DiffuseColor);
+		// 	float ProbabilityOfTermination = 1.0 - ProbabilityOfSuccess;
+		// 	if (RRSample < ProbabilityOfTermination) continue;
+		// 	RayThroughput /= ProbabilityOfSuccess;
+		// }
+
+    	// const uint SequenceIdx = hash1(entry_idx) + SampleIndex + View.StateFrameIndex * SamplesPerPixel;
+		// const float2 Rand2 = r2_sequence(SequenceIdx % max(128, TARGET_SAMPLE_COUNT));
+		
+		RayDesc Ray;
+		float RayPdf = 1.0;
+		float3 TranslatedWorldPosition = entry.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+		// GenerateCosineNormalRay(TranslatedWorldPosition, surfel.Normal, Rand2, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+		Ray.Origin = TranslatedWorldPosition;
+        Ray.Direction = sample_params.direction();
+        Ray.TMin = 0.0;
+ 	    Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+        //RayThroughput *=  saturate(dot(surfel.Normal, Ray.Direction)) / PI;
+		//RayPdf = 1.0;
+		
+		float MaterialPdf = 0.0;
+		uint Bounce = 0;
+		while (Bounce < 1)
+		{
+			// Cast ray
+			uint RayFlags = 0;
+			const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+			const bool bEnableSkyLightContribution = true;
+			const bool bIgnoreTranslucentMaterials = false;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+			RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+			FRayCone RayCone = (FRayCone)0;
+			FMaterialClosestHitPayload Payload = TraceMaterialRay(
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				Ray,
+				RayCone,
+				PixelCoord,
+				bEnableSkyLightContribution,
+				bIgnoreTranslucentMaterials);
+
+			// Environment hit
+			if (Payload.IsMiss())
+			{
+				// Optional multi-bounce SkyLight contribution
+				if (EvalSkyLight )
+				{
+					uint SkyLightId = 0;
+					RayDesc LightRay = Ray;
+					LightRay.TMax = POSITIVE_INFINITY;
+					float3 EnvironmentRadiance = SkyLight_TraceLight(Ray, SkyLightId).Radiance;
+					Irradiance += EnvironmentRadiance * RayThroughput / RayPdf;
+				}
+				break;
+			}
+
+			// if (Bounce == 0)
+			// {
+			// }
+			if (Payload.HitT > MaxRayDistanceForGI) break;
+
+			// Update intersection
+			Ray.Origin += Ray.Direction * Payload.HitT;
+
+			// Create faux GBuffer to use with EvaluateBxDF
+			FGBufferData GBufferData = (FGBufferData)0;
+			GBufferData.Depth = 1.f; // Do not use depth
+			GBufferData.WorldNormal = Payload.WorldNormal;
+			GBufferData.BaseColor = Payload.BaseColor;
+			GBufferData.CustomData = Payload.CustomData;
+			GBufferData.GBufferAO = Payload.GBufferAO;
+			GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+			GBufferData.SpecularColor = Payload.SpecularColor;
+			GBufferData.DiffuseColor = Payload.DiffuseColor;			
+			GBufferData.Metallic = Payload.Metallic;
+			GBufferData.Specular = Payload.Specular;
+			GBufferData.Roughness = Payload.Roughness;
+			GBufferData.ShadingModelID = Payload.ShadingModelID;
+			GBufferData.CustomData = Payload.CustomData;
+
+            float SplitFactor = 1.0 / NextEventEstimationSamples;
+			for (uint NeeID = 0; NeeID < NextEventEstimationSamples; ++NeeID)
+			{
+				// Light selection
+				int LightId;
+				float3 LightRadianceOverPdf = 0;
+				float NeePdf = 0.0;
+
+				// float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+                const float3 RandSample3 = float3(
+                uint_to_u01_float(hash1_mut(rng_sample)),
+                uint_to_u01_float(hash1_mut(rng_sample)),
+                uint_to_u01_float(hash1_mut(rng_sample))
+                );
+				RayDesc LightRay;
+
+				bool bLit = SampleLight(RandSample3,
+						Ray.Origin,
+						Payload.WorldNormal,
+						Payload.PrimitiveLightingChannelMask,
+						ENABLE_TRANSMISSION,
+						LightId,
+						LightRay.Direction,
+						LightRay.TMax,
+						LightRadianceOverPdf,
+						NeePdf);
+
+				if (bLit)
+				{
+					LightRay.Origin = Ray.Origin;
+					LightRay.TMin = 0;
+					LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+					bool bTransmission = HasTransmission(LightId);
+					float3 BiasNormal = Payload.WorldNormal;
+					if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+					{
+						BiasNormal = -BiasNormal;
+					}
+					ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+					// Trace visibility ray
+					uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+					const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+					NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+					FMinimalPayload NeePayload = TraceVisibilityRay(
+						TLAS,
+						NeeRayFlags,
+						NeeInstanceInclusionMask,
+						PixelCoord,
+						LightRay);
+
+					// No hit indicates successful next-event connection
+					if (NeePayload.IsMiss())
+					{
+						// Evaluate material
+						float3 MaterialThroughput;
+
+						half3 N = Payload.WorldNormal;
+						half3 V = -Ray.Direction;
+						half3 L = LightRay.Direction;
+						float NoL = saturate(dot(N, L));
+						FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+						FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+						MaterialThroughput = LightingSample.Diffuse;
+						if (bTransmission)
+						{
+							MaterialThroughput += LightingSample.Transmission;
+						}
+
+						// Record the contribution
+						float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * RayThroughput * SplitFactor / RayPdf;
+
+						// Tonemap for firefly suppression
+						if (UseFireflySuppression)
+						{
+							ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+						}
+
+						Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+					}
+				}
+			}
+#if USE_SURFEL
+			{
+                //Irradiance += GetSurfelGI(Ray.Origin - LWCHackToFloat(PrimaryView.PreViewTranslation), Payload.WorldNormal, 1 + SurfelLifeToRank(life), RandSequence) * GBufferData.DiffuseColor;
+                Irradiance += GBufferData.DiffuseColor * lookup_irradiance_cache(entry.Position, Ray.Origin - LWCHackToFloat(PrimaryView.PreViewTranslation), Payload.WorldNormal, 1 + ircache_entry_life_to_rank(life), rng_sample);
+            }
+#endif
+			Bounce++;
+        }
+
+    const float self_lighting_limiter = 
+        USE_SELF_LIGHTING_LIMITER
+        ? lerp(0.5, 1, smoothstep(-0.1, 0, dot(Ray.Direction, entry.Normal)))
+        : 1.0;
+
+    const float3 new_value = Irradiance * self_lighting_limiter;
+    const float new_lum = Luminance(new_value);
+
+    Reservoir1sppStreamState stream_state = Reservoir1sppStreamState::create();
+    Reservoir1spp reservoir = Reservoir1spp::create();
+    reservoir.init_with_stream(new_lum, 1.0, stream_state, sample_params.raw());
+
+    const uint octa_idx = sample_params.octa_idx();
+    const uint output_idx = entry_idx * IRCACHE_AUX_STRIDE + octa_idx;
+
+    float4 prev_value_and_count =
+        SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2];
+
+    float3 val_sel = new_value;
+    bool selected_new = true;
+
+    {
+        const uint M_CLAMP = 30;
+
+        Reservoir1spp r = Reservoir1spp::from_raw(asuint(SurfelAuxiBuf[output_idx].xy));
+        if (r.M > 0) {
+            r.M = min(r.M, M_CLAMP);
+
+            SurfelVertex prev_entry = UnPackVertex(SurfelVertexPacked(SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2 * 2]));
+            //prev_entry.Position = entry.Position;
+
+            if (reservoir.update_with_stream(
+                r, Luminance(prev_value_and_count.rgb), 1.0,
+                stream_state, r.payload, rng
+            )) {
+                val_sel = prev_value_and_count.rgb;
+                selected_new = false;
+            }
+        }
+    }
+
+    reservoir.finish_stream(stream_state);
+
+    SurfelAuxiBuf[output_idx].xy = asfloat(reservoir.as_raw());
+    SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2] = float4(val_sel, reservoir.W);
+    if (selected_new) {
+        SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2 * 2] = packed_entry.data0;
+    }
+
+}
+
+RAY_TRACING_ENTRY_RAYGEN(SurfelValidationRGS) 
+{
+     if (IRCACHE_FREEZE) 
+        return;
+
+    const uint dispatch_idx = DispatchRaysIndex().x;
+
+    const uint alloc_count = SurfelMetaBuf.Load(IRCACHE_META_TRACING_ALLOC_COUNT);
+    if (dispatch_idx >= alloc_count * IRCACHE_VALIDATION_SAMPLES_PER_FRAME) 
+        return;
+
+    const uint entry_idx = SurfelEntryIndirectionBuf[dispatch_idx / IRCACHE_VALIDATION_SAMPLES_PER_FRAME];
+    const uint sample_idx = dispatch_idx % IRCACHE_VALIDATION_SAMPLES_PER_FRAME;
+    const uint life = SurfelLifeBuf.Load(entry_idx * 4);
+
+    const SampleParams sample_params = SampleParams::from_spf_entry_sample_frame(
+        IRCACHE_VALIDATION_SAMPLES_PER_FRAME,
+        entry_idx,
+        sample_idx,
+        View.StateFrameIndex);
+
+    const uint octa_idx = sample_params.octa_idx();
+    const uint output_idx = entry_idx * IRCACHE_AUX_STRIDE + octa_idx;
+
+    float invalidity = 0;
+
+    {
+        // TODO: wz not used. slim down.
+        Reservoir1spp r = Reservoir1spp::from_raw(asuint(SurfelAuxiBuf[output_idx].xy));
+
+        if (r.M > 0) 
+        {
+            float4 prev_value_and_count =
+                SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2];
+                //* float4((frame_constants.pre_exposure_delta).xxx, 1);
+
+            SurfelVertex prev_entry = UnPackVertex(SurfelVertexPacked(SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2 * 2]));
+
+            // Validate the previous sample
+            // IrcacheTraceResult prev_traced = ircache_trace(prev_entry, brdf, SampleParams::from_raw(r.payload), life);
+            
+            uint2 PixelCoord = uint2(entry_idx % 2048, entry_idx / 2048 ); //not useful?
+            uint rng_sample = sample_params.rng();
+            // RandomSequence RandSequence;
+            // RandomSequence_Initialize(RandSequence, PixelCoord, SampleIndex, View.StateFrameIndex, SamplesPerPixel);
+
+            float3 RayThroughput = 1.0;
+            float3 Irradiance = 0.0;
+            // float3 RandSample = RandomSequence_GenerateSample3D(RandSequence);
+            const float3  RandSample = float3(
+                        uint_to_u01_float(hash1_mut(rng_sample)),
+                        uint_to_u01_float(hash1_mut(rng_sample)),
+                        uint_to_u01_float(hash1_mut(rng_sample))
+                        );
+            // if (UseRussianRoulette)
+            // {
+            // 	float RRSample = RandSample.x;
+            // 	float ProbabilityOfSuccess = Luminance(DiffuseColor);
+            // 	float ProbabilityOfTermination = 1.0 - ProbabilityOfSuccess;
+            // 	if (RRSample < ProbabilityOfTermination) continue;
+            // 	RayThroughput /= ProbabilityOfSuccess;
+            // }
+
+            //const uint SequenceIdx = hash1(SurfelIndex) + SampleIndex + View.StateFrameIndex * SamplesPerPixel;
+            //const float2 Rand2 = r2_sequence(SequenceIdx % max(128, TARGET_SAMPLE_COUNT));
+            
+            RayDesc Ray;
+            float RayPdf = 1.0;
+            float3 TranslatedWorldPosition = prev_entry.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+            // GenerateCosineNormalRay(TranslatedWorldPosition, surfel.Normal, Rand2, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax, RayPdf);
+            Ray.Origin = TranslatedWorldPosition;
+            Ray.Direction = sample_params.direction();
+            Ray.TMin = 0.0;
+            Ray.TMax = max(MaxRayDistanceForGI, MaxRayDistanceForAO);
+            //RayThroughput *=  saturate(dot(surfel.Normal, Ray.Direction)) / PI;
+            //RayPdf = 1.0;
+            
+            float MaterialPdf = 0.0;
+            // Cast ray
+            uint RayFlags = 0;
+            const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+            const bool bEnableSkyLightContribution = true;
+            const bool bIgnoreTranslucentMaterials = false;
+
+        #if !ENABLE_TWO_SIDED_GEOMETRY
+            RayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+        #endif
+
+            FRayCone RayCone = (FRayCone)0;
+            FMaterialClosestHitPayload Payload = TraceMaterialRay(
+                TLAS,
+                RayFlags,
+                InstanceInclusionMask,
+                Ray,
+                RayCone,
+                PixelCoord,
+                bEnableSkyLightContribution,
+                bIgnoreTranslucentMaterials);
+
+                // Environment hit
+            if (!Payload.IsMiss())
+            {
+                // if (Payload.HitT > MaxRayDistanceForGI) break;
+                if( Payload.HitT > MaxRayDistanceForGI )
+                {
+                    // Update intersection
+                    Ray.Origin += Ray.Direction * Payload.HitT;
+
+                    // Create faux GBuffer to use with EvaluateBxDF
+                    FGBufferData GBufferData = (FGBufferData)0;
+                    GBufferData.Depth = 1.f; // Do not use depth
+                    GBufferData.WorldNormal = Payload.WorldNormal;
+                    GBufferData.BaseColor = Payload.BaseColor;
+                    GBufferData.CustomData = Payload.CustomData;
+                    GBufferData.GBufferAO = Payload.GBufferAO;
+                    GBufferData.IndirectIrradiance = (Payload.IndirectIrradiance.x + Payload.IndirectIrradiance.y + Payload.IndirectIrradiance.z) / 3.f;
+                    GBufferData.SpecularColor = Payload.SpecularColor;
+                    GBufferData.DiffuseColor = Payload.DiffuseColor;			
+                    GBufferData.Metallic = Payload.Metallic;
+                    GBufferData.Specular = Payload.Specular;
+                    GBufferData.Roughness = Payload.Roughness;
+                    GBufferData.ShadingModelID = Payload.ShadingModelID;
+                    GBufferData.CustomData = Payload.CustomData;
+
+                    float SplitFactor = 1.0 / NextEventEstimationSamples;
+                    for (uint NeeID = 0; NeeID < NextEventEstimationSamples; ++NeeID)
+                    {
+                        // Light selection
+                        int LightId;
+                        float3 LightRadianceOverPdf = 0;
+                        float NeePdf = 0.0;
+
+                        // float3 RandSample3 = RandomSequence_GenerateSample3D(RandSequence);
+                        const float3 RandSample3 = float3(
+                        uint_to_u01_float(hash1_mut(rng_sample)),
+                        uint_to_u01_float(hash1_mut(rng_sample)),
+                        uint_to_u01_float(hash1_mut(rng_sample))
+                        );
+
+                        RayDesc LightRay;
+
+                        bool bLit = SampleLight(RandSample3,
+                                Ray.Origin,
+                                Payload.WorldNormal,
+                                Payload.PrimitiveLightingChannelMask,
+                                ENABLE_TRANSMISSION,
+                                LightId,
+                                LightRay.Direction,
+                                LightRay.TMax,
+                                LightRadianceOverPdf,
+                                NeePdf);
+
+                        if (bLit)
+                        {
+                            LightRay.Origin = Ray.Origin;
+                            LightRay.TMin = 0;
+                            LightRay.TMax = min(LightRay.TMax, MaxShadowDistance);
+                            bool bTransmission = HasTransmission(LightId);
+                            float3 BiasNormal = Payload.WorldNormal;
+                            if (bTransmission && dot(BiasNormal, LightRay.Direction) < 0.0)
+                            {
+                                BiasNormal = -BiasNormal;
+                            }
+                            ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+                            // Trace visibility ray
+                            uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+                            const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+        #if !ENABLE_TWO_SIDED_GEOMETRY
+                            NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+        #endif
+
+                            FMinimalPayload NeePayload = TraceVisibilityRay(
+                                TLAS,
+                                NeeRayFlags,
+                                NeeInstanceInclusionMask,
+                                PixelCoord,
+                                LightRay);
+
+                            // No hit indicates successful next-event connection
+                            if (NeePayload.IsMiss())
+                            {
+                                // Evaluate material
+                                float3 MaterialThroughput;
+
+                                half3 N = Payload.WorldNormal;
+                                half3 V = -Ray.Direction;
+                                half3 L = LightRay.Direction;
+                                float NoL = saturate(dot(N, L));
+                                FShadowTerms ShadowTerms = { 0.0, 0.0, 0.0, InitHairTransmittanceData() };
+                                FDirectLighting LightingSample = EvaluateBxDF(GBufferData, N, V, L, NoL, ShadowTerms);
+                                MaterialThroughput = LightingSample.Diffuse;
+                                if (bTransmission)
+                                {
+                                    MaterialThroughput += LightingSample.Transmission;
+                                }
+
+                                // Record the contribution
+                                float3 ExitantRadianceSample = LightRadianceOverPdf * MaterialThroughput * RayThroughput * SplitFactor / RayPdf;
+
+                                // Tonemap for firefly suppression
+                                if (UseFireflySuppression)
+                                {
+                                    ExitantRadianceSample *= rcp(1.0 + Luminance(ExitantRadianceSample));
+                                }
+
+                                Irradiance += isfinite(ExitantRadianceSample) ? ExitantRadianceSample : 0.0;
+                            }
+                        }
+                    }
+        #if USE_SURFEL
+                    {
+                        //Irradiance += GetSurfelGI(Ray.Origin - LWCHackToFloat(PrimaryView.PreViewTranslation), Payload.WorldNormal, 1 + SurfelLifeToRank(life), RandSequence) * GBufferData.DiffuseColor;
+                        Irradiance += GBufferData.DiffuseColor * lookup_irradiance_cache(prev_entry.Position, Ray.Origin - LWCHackToFloat(PrimaryView.PreViewTranslation), Payload.WorldNormal, 1 + ircache_entry_life_to_rank(life), rng_sample);
+                    }
+        #endif
+                }
+            }
+            else
+            {
+                // Optional multi-bounce SkyLight contribution
+                if (EvalSkyLight )
+                {
+                    uint SkyLightId = 0;
+                    RayDesc LightRay = Ray;
+                    LightRay.TMax = POSITIVE_INFINITY;
+                    float3 EnvironmentRadiance = SkyLight_TraceLight(Ray, SkyLightId).Radiance;
+                    Irradiance += EnvironmentRadiance * RayThroughput / RayPdf;
+                }
+            }
+
+            const float prev_self_lighting_limiter = 
+                USE_SELF_LIGHTING_LIMITER
+                ? lerp(0.5, 1, smoothstep(-0.1, 0, dot(Ray.Direction, prev_entry.Normal)))
+                : 1.0;
+
+            const float3 a = Irradiance * prev_self_lighting_limiter;
+            const float3 b = prev_value_and_count.rgb;
+            const float3 dist3 = abs(a - b) / (a + b);
+            const float dist = max(dist3.r, max(dist3.g, dist3.b));
+            invalidity = smoothstep(0.1, 0.5, dist);
+            r.M = max(0, min(r.M, exp2(log2(float(IRCACHE_RESTIR_M_CLAMP)) * (1.0 - invalidity))));
+
+            // Update the stored value too.
+            // TODO: try the update heuristics from the diffuse trace
+            prev_value_and_count.rgb = a;
+
+            SurfelAuxiBuf[output_idx].xy = asfloat(r.as_raw());
+            SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2] = prev_value_and_count;
+        }  
+    }
+
+    // Also reduce M of the neighbors in case we have fewer validation rays than irradiance rays.
+
+    if (IRCACHE_VALIDATION_SAMPLES_PER_FRAME < IRCACHE_SAMPLES_PER_FRAME) {
+        if (invalidity > 0) {
+            const uint PERIOD = IRCACHE_OCTA_DIMS2 / IRCACHE_VALIDATION_SAMPLES_PER_FRAME;
+            const uint OTHER_PERIOD = IRCACHE_OCTA_DIMS2 / IRCACHE_SAMPLES_PER_FRAME;
+
+            for (uint xor = OTHER_PERIOD; xor < PERIOD; xor *= 2) {
+                const uint idx = output_idx ^ xor;
+                Reservoir1spp r = Reservoir1spp::from_raw(asuint(SurfelAuxiBuf[idx].xy));
+                r.M = max(0, min(r.M, exp2(log2(float(IRCACHE_RESTIR_M_CLAMP)) * (1.0 - invalidity))));
+                SurfelAuxiBuf[idx].xy = asfloat(r.as_raw());
+            }
+        }
+    }
+}
+
+RAY_TRACING_ENTRY_RAYGEN(AccessiblityRGS) {
+    if (IRCACHE_FREEZE) {
+        return;
+    }
+
+    const uint dispatch_idx = DispatchRaysIndex().x;
+
+    const uint alloc_count = SurfelMetaBuf.Load(IRCACHE_META_TRACING_ALLOC_COUNT);
+    if (dispatch_idx >= alloc_count * IRCACHE_OCTA_DIMS2) {
+        return;
+    }
+    const uint entry_idx = SurfelEntryIndirectionBuf[dispatch_idx / IRCACHE_OCTA_DIMS2];
+    const uint octa_idx = dispatch_idx % IRCACHE_OCTA_DIMS2;
+    const uint life = SurfelLifeBuf.Load(entry_idx * 4);
+
+    if (!is_ircache_entry_life_valid(life)) {
+        return;
+    }
+
+    const SurfelVertex entry = UnPackVertex(SurfelVertexBuf[entry_idx]);
+
+    const uint output_idx = entry_idx * IRCACHE_AUX_STRIDE + octa_idx;
+
+    Reservoir1spp r = Reservoir1spp::from_raw(asuint(SurfelAuxiBuf[output_idx].xy));
+    SurfelVertex prev_entry = UnPackVertex(SurfelVertexPacked(SurfelAuxiBuf[output_idx + IRCACHE_OCTA_DIMS2 * 2]));
+
+    // Reduce weight of samples whose trace origins are not accessible now
+    uint2 PixelCoord = uint2(entry_idx % 2048, entry_idx / 2048 ); //not useful?
+    RayDesc LightRay;
+    LightRay.Origin =  entry.Position + LWCHackToFloat(PrimaryView.PreViewTranslation);
+    LightRay.Direction = normalize(prev_entry.Position - entry.Position);
+    LightRay.TMin = 0;
+    LightRay.TMax = min(LightRay.TMax, MaxShadowDistance); //         0.999
+
+    float3 BiasNormal = entry.Normal;
+    if (dot(BiasNormal, LightRay.Direction) < 0.0)
+    {
+        BiasNormal = -BiasNormal;
+    }
+    ApplyPositionBias(LightRay, BiasNormal, MaxNormalBias);
+
+    // Trace visibility ray
+    uint NeeRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
+    const uint NeeInstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+#if !ENABLE_TWO_SIDED_GEOMETRY
+    NeeRayFlags |= RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+#endif
+
+    FMinimalPayload NeePayload = TraceVisibilityRay(
+        TLAS,
+        NeeRayFlags,
+        NeeInstanceInclusionMask,
+        PixelCoord,
+        LightRay);
+
+    // No hit indicates successful next-event connection
+    if (!NeePayload.IsMiss()) 
+    {
+        r.M *= 0.8;
+        SurfelAuxiBuf[output_idx].xy = asfloat(r.as_raw());
+    }
+}

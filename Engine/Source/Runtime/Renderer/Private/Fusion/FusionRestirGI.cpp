@@ -583,7 +583,7 @@ IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesForDeferedRGS, "/Engine/Private/R
     	DECLARE_GLOBAL_SHADER(FEvaluateRestirGIRGS)
     	SHADER_USE_ROOT_PARAMETER_STRUCT(FEvaluateRestirGIRGS, FGlobalShader)
 
-    		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     	{
     		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
     	}
@@ -616,7 +616,7 @@ IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesForDeferedRGS, "/Engine/Private/R
 
     		SHADER_PARAMETER_RDG_UNIFORM_BUFFER(FVirtualVoxelParameters, VirtualVoxel)
 
-    		END_SHADER_PARAMETER_STRUCT()
+    	END_SHADER_PARAMETER_STRUCT()
     };
 
     IMPLEMENT_GLOBAL_SHADER(FEvaluateRestirGIRGS, "/Engine/Private/RestirGI/RayTracingRestirGILighting.usf", "EvaluateRestirGILightingRGS", SF_RayGen);
@@ -673,7 +673,7 @@ IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesForDeferedRGS, "/Engine/Private/R
     	DECLARE_GLOBAL_SHADER(FRestirGIApplyBoilingFilterCS)
     	SHADER_USE_PARAMETER_STRUCT(FRestirGIApplyBoilingFilterCS, FGlobalShader)
 
-    		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
     	{
     		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
     	}
@@ -700,6 +700,43 @@ IMPLEMENT_GLOBAL_SHADER(FRestirGIInitialSamplesForDeferedRGS, "/Engine/Private/R
     };
 
     IMPLEMENT_GLOBAL_SHADER(FRestirGIApplyBoilingFilterCS, "/Engine/Private/RestirGI/BoilingFilter.usf", "BoilingFilterCS", SF_Compute);
+
+	
+    // class FRestirGIResolveCS : public FGlobalShader
+    // {
+    // 	DECLARE_GLOBAL_SHADER(FRestirGIResolveCS)
+    // 	SHADER_USE_PARAMETER_STRUCT(FRestirGIResolveCS, FGlobalShader)
+
+    // 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+    // 	{
+    // 		return ShouldCompileRayTracingShadersForProject(Parameters.Platform);
+    // 	}
+
+    // 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters, FShaderCompilerEnvironment& OutEnvironment)
+    // 	{
+    // 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+    // 		OutEnvironment.CompilerFlags.Add(CFLAG_ForceDXC);
+    // 		ApplyRestirGIGlobalSettings(OutEnvironment);
+    // 	}
+
+    // 	BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+	// 		SHADER_PARAMETER(int32, InputSlice)
+    // 		SHADER_PARAMETER(int32, NumReservoirs)
+  
+    // 		SHADER_PARAMETER(int32, FeedbackVisibility)
+			
+    // 		SHADER_PARAMETER_STRUCT_INCLUDE(FSceneTextureParameters, SceneTextures)
+
+    // 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, RWDiffuseUAV)
+    // 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float2>, RWRayDistanceUAV)
+    // 		SHADER_PARAMETER(FIntVector, ReservoirHistoryBufferDim)
+    // 		SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<RTXGI_PackedReservoir>, RWGIReservoirHistoryUAV)
+    // 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, ViewUniformBuffer)
+    // 		SHADER_PARAMETER_STRUCT_INCLUDE(FRestirGICommonParameters, RestirGICommonParameters)
+    // 	END_SHADER_PARAMETER_STRUCT()
+    // };
+
+    // IMPLEMENT_GLOBAL_SHADER(FRestirGIResolveCS, "/Engine/Private/RestirGI/RestirGIResolve.usf", "ResolveCS", SF_Compute);
 
     /**
      * This buffer provides a table with a low discrepency sequence
